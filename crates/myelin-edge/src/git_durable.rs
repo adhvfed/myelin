@@ -3894,7 +3894,7 @@ pub use check_projection::GitDatabaseProviders;
 pub use http::register_git_durable;
 use http::{cross_pr_before_key, mint_pr_list_cursors, BlobViewOptions, RawResponseOptions};
 pub use merge_queue::{
-    merge_queue_interval_from_env, spawn_merge_queue, MergeQueueHandle, QueueStep,
+    merge_queue_interval_from_env, spawn_merge_queue, MergeQueueHandle, QueueStep, QueueTenants,
 };
 pub use recovery::{recover_placed_git_at_boot, GitBootRecoveryReport, GitCellBootRecoveryReport};
 pub(crate) use update_branch::describe_conflicts;

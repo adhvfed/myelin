@@ -1160,11 +1160,6 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 eprintln!("edge: Issues authorization reconciler refused to start: {error}");
                 std::process::exit(1);
             });
-    let cell_tenants: Vec<String> = issue_reconciliation_config
-        .tenants()
-        .iter()
-        .map(|tenant| tenant.0.clone())
-        .collect();
     let issue_reconciler = spawn_issue_authorization_reconciler(
         issue_store.clone(),
         check.clone(),
@@ -1232,7 +1227,10 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     );
     let merge_queue = spawn_merge_queue(
         git_backend.clone(),
-        cell_tenants,
+        myelin_edge::QueueTenants::Placed {
+            placements: myelin_storage::DurablePlacementBacking::new(provider.db_pool().clone()),
+            cell_id: cell_id.clone(),
+        },
         provider.config().region.clone(),
         merge_queue_interval_from_env().unwrap_or_else(|error| {
             eprintln!("edge: the merge queue refused to start: {error}");

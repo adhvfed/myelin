@@ -593,9 +593,42 @@ impl MergeQueueHandle {
     }
 }
 
+/// The tenants a cell runs merge queues and branch sweeps for.
+pub enum QueueTenants {
+    /// Every active tenant placed in this cell, read again for each pass, so a tenant placed
+    /// later joins without a restart.
+    Placed {
+        placements: myelin_storage::DurablePlacementBacking,
+        cell_id: String,
+    },
+    Fixed(Vec<String>),
+}
+
+impl QueueTenants {
+    async fn current(&self) -> Vec<String> {
+        match self {
+            Self::Fixed(tenants) => tenants.clone(),
+            Self::Placed {
+                placements,
+                cell_id,
+            } => match placements.local_tenants(cell_id).await {
+                Ok(local) => local
+                    .into_iter()
+                    .filter(|entry| entry.active && entry.cell_id == *cell_id)
+                    .map(|entry| entry.tenant_id)
+                    .collect(),
+                Err(error) => {
+                    eprintln!("edge: the merge queue could not read this cell's tenants: {error}");
+                    Vec::new()
+                }
+            },
+        }
+    }
+}
+
 pub fn spawn_merge_queue(
     backend: Arc<DurableGitBackend>,
-    tenants: Vec<String>,
+    tenants: QueueTenants,
     region: String,
     interval: std::time::Duration,
 ) -> MergeQueueHandle {
@@ -614,7 +647,7 @@ pub fn spawn_merge_queue(
             }
             let (pass_backend, pass_tenants, pass_region, halt) = (
                 backend.clone(),
-                tenants.clone(),
+                tenants.current().await,
                 region.clone(),
                 pass_halt.clone(),
             );

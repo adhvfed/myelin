@@ -4,6 +4,24 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — The merge queue serves every tenant the cell hosts
+
+The merge queue and branch-follow sweep borrowed their tenant list from the Issues reconciler's
+`MYELIN_ISSUES_RECONCILE_TENANTS`. On the dogfood stack that list holds the development and
+integration tenants but not `myelin`, the tenant where the product is actually built. So merge
+when ready never merged anything there, and the sweep never repaired its pull requests. Any tenant
+placed after boot would have been missed the same way.
+
+The loop now reads the cell's active placed tenants (`local_tenant`) before each pass, the same
+directory Git boot recovery walks. Every tenant the cell hosts gets the queue and the sweep, and a
+newly placed tenant joins without a restart. A placement read failure is reported and the pass
+skips, rather than stopping the loop.
+
+Proof: on the dogfood stack all three placed tenants (`development`, `integration`, `myelin`) are
+now served, the boot recovery count matches, and the logs show no tenant-read errors. The
+merge-queue and closes-issue journeys pass through the placed-tenant path, along with strict
+Clippy.
+
 ## 2026-11-09 — Indexes for the merge queue and branch sweep
 
 The merge queue reads each tenant's scheduled pull requests in request order on every pass. The

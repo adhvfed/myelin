@@ -97,7 +97,7 @@ pub use gateway::{
 pub use git_durable::{
     merge_queue_interval_from_env, recover_placed_git_at_boot, register_git_durable,
     spawn_merge_queue, DurableGitBackend, GitBootRecoveryReport, GitCellBootRecoveryReport,
-    GitDatabaseProviders, MergeQueueHandle,
+    GitDatabaseProviders, MergeQueueHandle, QueueTenants,
 };
 pub use git_effect::GitEffectApi;
 pub use git_wire_exec::{
