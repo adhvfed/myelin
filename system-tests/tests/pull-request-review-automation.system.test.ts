@@ -3,6 +3,12 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "vitest";
 
 import { browserApprovedCliClient, reviewerClient, uniqueName } from "../src/context.js";
+import {
+  activateExternalAgent,
+  askAgent,
+  beginAgentRun,
+  closeAgentRun,
+} from "../src/journeys/agents.js";
 import { systemTestConfig } from "../src/config.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
@@ -77,4 +83,51 @@ describe("automations on pull-request reviews", () => {
       });
     }
   }, 120_000);
+
+  test("an agent reads what the reviewer asked for and the change under review", async () => {
+    const founder = await browserApprovedCliClient();
+    const project = new GitProject(uniqueName("agent-reads-review"), founder);
+    await project.create();
+    await project.writeFile("main", "README.md", "# Agent reads review\n");
+    const change = await proposeChange(founder, project, {
+      branch: "agent/greeting",
+      path: "greeting.txt",
+      contents: "helo\n",
+      title: "Add a greeting",
+      reviewers: [systemTestConfig.reviewerPrincipal],
+    });
+    await reviewerClient.json(`${project.path}/prs/${change.number}/threads`, {
+      method: "POST",
+      body: { body_md: "Typo: it should say hello." },
+      idempotencyKey: `review-thread-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+
+    const agent = await activateExternalAgent(founder, uniqueName("Review reader"), [
+      "git.read_pull_request",
+    ]);
+    const run = await beginAgentRun(founder, agent.agent.id);
+    try {
+      const read = await askAgent(run, 1, "git.read_pull_request", {
+        repo: project.slug,
+        number: change.number,
+      });
+      expect(record(read.pull_request, "pull request")).toMatchObject({
+        number: change.number,
+        title: "Add a greeting",
+        head_oid: change.headOid,
+        pr_state: "open",
+      });
+      const said = array(record(read.conversation, "conversation").discussion, "discussion")
+        .flatMap((thread) => array(record(thread, "thread").comments, "comments"))
+        .map((comment) => record(comment, "comment").body_md);
+      expect(said).toContain("Typo: it should say hello.");
+      const files = array(record(read.diff, "diff").files, "diff files")
+        .map((file) => record(file, "diff file"));
+      expect(files).toEqual([expect.objectContaining({ path: "greeting.txt", status: "A" })]);
+    } finally {
+      await closeAgentRun(run);
+    }
+  }, 120_000);
 });
+

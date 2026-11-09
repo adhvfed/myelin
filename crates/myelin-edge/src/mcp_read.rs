@@ -245,6 +245,37 @@ impl DirectReadExecutor for McpReadExecutor {
                     .read_file(access_subject, repo, gitref, path)
                     .map_err(map_edge_error)
             }
+            "git.read_pull_request" => {
+                exact_fields(
+                    arguments,
+                    &["repo", "number"],
+                    &["repo", "number", "diff_offset", "diff_limit"],
+                )?;
+                let repo = required_string(arguments, "repo")?;
+                if !RunTokenAuthorizer::allows_repository(&run_token, repo) {
+                    return Err(DirectReadError::Denied);
+                }
+                let number = arguments
+                    .get("number")
+                    .and_then(Value::as_u64)
+                    .filter(|number| *number >= 1)
+                    .ok_or_else(|| invalid("`number` must be a positive pull-request number"))?;
+                let offset = optional_u32(arguments, "diff_offset")?.unwrap_or(0) as usize;
+                if offset > myelin_git::durable::PR_DIFF_MAX_FILES {
+                    return Err(invalid(
+                        "`diff_offset` is beyond the largest reviewable diff",
+                    ));
+                }
+                let limit = optional_u32(arguments, "diff_limit")?.unwrap_or(10) as usize;
+                if limit == 0 || limit > 50 {
+                    return Err(invalid("`diff_limit` must be 1..=50 files"));
+                }
+                self.git
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .read_pull_request(access_subject, repo, number, offset, limit)
+                    .map_err(map_edge_error)
+            }
             "projects.list" => {
                 exact_fields(arguments, &[], &["limit", "cursor"])?;
                 let limit = optional_u32(arguments, "limit")?.unwrap_or(50);

@@ -436,6 +436,7 @@ pub const GOVERNED_DIRECT_READ_TOOLS: &[&str] = &[
     "ci.read_run",
     "git.list_repositories",
     "git.read_file",
+    "git.read_pull_request",
     "git.search_code",
     "issues.list",
     "issues.view",
@@ -461,7 +462,7 @@ fn read_resource_ref(
     }
     let (subsystem, resource_type, id) = match tool {
         "ci.read_run" | "ci.read_log" => ("ci", "run", args.get("run_id")?.as_str()?),
-        "git.read_file" => ("git", "repo", args.get("repo")?.as_str()?),
+        "git.read_file" | "git.read_pull_request" => ("git", "repo", args.get("repo")?.as_str()?),
         "git.search_code" => ("git", "repo", args.get("repo")?.as_str()?),
         "issues.view" => ("issue", "issue", args.get("issue_id")?.as_str()?),
         "knowledge.read_page" => ("knowledge", "page", args.get("page_id")?.as_str()?),

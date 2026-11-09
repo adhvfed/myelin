@@ -1355,6 +1355,53 @@ impl DurableGitBackend {
         Ok(file)
     }
 
+    /// Everything an agent needs to act on a pull request: the record, its reviews and discussion,
+    /// and one page of its diff.
+    pub fn read_pull_request(
+        &self,
+        principal: &Principal,
+        repo: &str,
+        number: u64,
+        diff_offset: usize,
+        diff_limit: usize,
+    ) -> Result<Value, EdgeError> {
+        if !valid_code_search_repo(repo) {
+            return Err(EdgeError::BadRequest("repository slug is invalid".into()));
+        }
+        let (tenant, region) = (principal.tenant.0.as_str(), principal.region.0.as_str());
+        let location = Self::loc(tenant, region, repo);
+        if !self
+            .repo_authz
+            .authorize_repo_permission(principal, &location, RepoPermission::Pull)
+        {
+            return Err(EdgeError::NotFound("repository not found".into()));
+        }
+        let record = self
+            .pr_get(&location, number, principal)
+            .map_err(map_durable_err)?
+            .ok_or_else(|| EdgeError::NotFound("pull request not found".into()))?;
+        let mut pull_request = Self::pr_json(tenant, repo, &record);
+        if let Some(behind) = self.pr_behind_base(&location, &record) {
+            pull_request["behind_base"] = json!(behind);
+        }
+        let conversation = self
+            .list_threads(tenant, region, repo, number, principal)
+            .map_err(map_durable_err)?;
+        let diff = self
+            .pr_diff(
+                RepoActorContext::new(tenant, region, repo, principal).for_pr(number),
+                diff_offset,
+                diff_limit,
+            )
+            .map_err(map_durable_err)?
+            .map(|diff| diff.to_json());
+        Ok(json!({
+            "pull_request": pull_request,
+            "conversation": conversation,
+            "diff": diff,
+        }))
+    }
+
     fn blob_json_bounded(
         &self,
         tenant: &str,

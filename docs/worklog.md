@@ -4,6 +4,23 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Agents can read a pull request
+
+Agents could comment on a pull request, reply, resolve threads, submit reviews, update its branch,
+and be called in when a reviewer requested changes. They could not read what the reviewer said or
+see the change under review, so an agent asked to address feedback was working blind.
+
+`git.read_pull_request` is a governed direct read like `git.read_file`. It returns the pull
+request's record (state, refs, head, behind-base, queue and merge state), its reviews and discussion
+threads with every comment, and a page of its diff (`diff_offset`, `diff_limit` up to 50 files). It
+uses the same views and authorization as the web: repository pull for the run's access subject and
+the run token's repository scope. Private review drafts stay visible only to their author.
+
+Proof: the readable TypeScript journey has a reviewer leave "Typo: it should say hello." on a pull
+request. An external agent with only `git.read_pull_request` reads the pull request's title and head,
+the reviewer's comment, and the one added file in the diff. The CLI-authentication, private agent
+thread, and agent merge journeys still pass with the larger catalogue, along with strict Clippy.
+
 ## 2026-11-09 — A scheduled pull request shows its place in line
 
 A pull request scheduled to merge when ready said what would happen, but not when. Its overview now

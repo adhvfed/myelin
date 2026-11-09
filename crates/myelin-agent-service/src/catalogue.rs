@@ -233,6 +233,7 @@ mod tests {
             "chat.reply",
             "git.list_repositories",
             "git.read_file",
+            "git.read_pull_request",
             "git.search_code",
             "git.comment",
             "git.reply",

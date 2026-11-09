@@ -189,6 +189,7 @@ mod tests {
                 "git.merge",
                 "git.open_pr",
                 "git.read_file",
+                "git.read_pull_request",
                 "git.reply",
                 "git.resolve_thread",
                 "git.search_code",

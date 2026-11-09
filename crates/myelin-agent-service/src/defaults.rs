@@ -16,6 +16,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "endorse_fork_ci") => false,
         ("git", "list_repositories") => false,
         ("git", "read_file") => false,
+        ("git", "read_pull_request") => false,
         ("git", "search_code") => false,
 
         ("issues", "list") => false,
@@ -226,7 +227,12 @@ mod tests {
             !requires_approval_default("git", "resolve_thread"),
             "git.resolve_thread is reversible → NOT gated"
         );
-        for read in ["list_repositories", "read_file", "search_code"] {
+        for read in [
+            "list_repositories",
+            "read_file",
+            "read_pull_request",
+            "search_code",
+        ] {
             assert!(
                 !requires_approval_default("git", read),
                 "git.{read} is read-only → NOT gated"

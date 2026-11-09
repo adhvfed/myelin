@@ -6,6 +6,7 @@ const GIT_TOOL_VERSION: u32 = 1;
 pub const LIST_REPOSITORIES_TOOL: &str = "list_repositories";
 pub const READ_FILE_TOOL: &str = "read_file";
 pub const SEARCH_CODE_TOOL: &str = "search_code";
+pub const READ_PULL_REQUEST_TOOL: &str = "read_pull_request";
 
 fn read_tool(name: &str, input_schema: &str) -> ToolDef {
     ToolDef {
@@ -32,6 +33,10 @@ pub fn git_read_tool_defs() -> Vec<ToolDef> {
             r#"{"type":"object","required":["repo","ref","path"],"properties":{"repo":{"type":"string","minLength":1,"maxLength":1024},"ref":{"type":"string","minLength":1,"maxLength":1024},"path":{"type":"string","minLength":1,"maxLength":4096}},"additionalProperties":false}"#,
         ),
         read_tool(
+            READ_PULL_REQUEST_TOOL,
+            r#"{"type":"object","required":["repo","number"],"description":"Reads one pull request: its record, its reviews and discussion threads with every comment, and a page of its diff. Page the diff with diff_offset.","properties":{"repo":{"type":"string","minLength":1,"maxLength":1024},"number":{"type":"integer","minimum":1},"diff_offset":{"type":"integer","minimum":0},"diff_limit":{"type":"integer","minimum":1,"maximum":50}},"additionalProperties":false}"#,
+        ),
+        read_tool(
             SEARCH_CODE_TOOL,
             r#"{"type":"object","required":["query"],"properties":{"query":{"type":"string","minLength":1,"maxLength":4096},"repo":{"type":"string","minLength":1,"maxLength":1024}},"additionalProperties":false}"#,
         ),
@@ -50,7 +55,12 @@ mod tests {
                 .iter()
                 .map(ToolDef::canonical_name)
                 .collect::<Vec<_>>(),
-            ["git.list_repositories", "git.read_file", "git.search_code"]
+            [
+                "git.list_repositories",
+                "git.read_file",
+                "git.read_pull_request",
+                "git.search_code"
+            ]
         );
         assert!(
             definitions[0].input_schema.contains("newest to oldest"),
