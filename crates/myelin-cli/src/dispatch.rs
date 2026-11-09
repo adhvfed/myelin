@@ -310,17 +310,25 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/reviews"),
             json!({ "verdict": verdict }),
         )),
-        CliCommand::PrMerge { repo, number } => Ok(EdgeCall::post_json(
+        CliCommand::PrMerge {
+            repo,
+            number,
+            squash,
+        } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/merge"),
-            json!({}),
+            merge_body(*squash),
         )),
         CliCommand::PrUpdateBranch { repo, number } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/update-branch"),
             json!({}),
         )),
-        CliCommand::PrAutoMerge { repo, number } => Ok(EdgeCall::post_json(
+        CliCommand::PrAutoMerge {
+            repo,
+            number,
+            squash,
+        } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/auto-merge"),
-            json!({}),
+            merge_body(*squash),
         )),
         CliCommand::PrDisableAutoMerge { repo, number } => Ok(EdgeCall::delete_keyed(format!(
             "/v1/git/repos/{repo}/prs/{number}/auto-merge"
@@ -329,6 +337,14 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/endorse-fork-ci"),
             json!({}),
         )),
+    }
+}
+
+fn merge_body(squash: bool) -> serde_json::Value {
+    if squash {
+        json!({ "method": "squash" })
+    } else {
+        json!({})
     }
 }
 
@@ -665,6 +681,12 @@ mod tests {
         let auto = git_dispatch(&["pr", "merge", "alpha", "7", "--auto"]).unwrap();
         assert_eq!(auto.method, HttpMethod::Post);
         assert_eq!(auto.path, "/v1/git/repos/alpha/prs/7/auto-merge");
+        let squash = git_dispatch(&["pr", "merge", "alpha", "7", "--squash"]).unwrap();
+        assert_eq!(squash.path, "/v1/git/repos/alpha/prs/7/merge");
+        assert_eq!(
+            squash.payload.as_deref(),
+            Some(br#"{"method":"squash"}"#.as_slice())
+        );
         let disable = git_dispatch(&["pr", "merge", "alpha", "7", "--disable-auto"]).unwrap();
         assert_eq!(disable.method, HttpMethod::Delete);
         assert_eq!(disable.path, "/v1/git/repos/alpha/prs/7/auto-merge");

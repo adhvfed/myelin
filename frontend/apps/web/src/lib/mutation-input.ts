@@ -23,9 +23,9 @@ export type PrMutation =
   | { op: "review-comment"; repo: string; n: number; reviewId: string; body_md: string; clientNonce: string }
   | { op: "review-submit"; repo: string; n: number; reviewId: string; verdict: ReviewVerdict; summary_md?: string }
   | { op: "review-discard"; repo: string; n: number; reviewId: string }
-  | { op: "merge"; repo: string; n: number }
+  | { op: "merge"; repo: string; n: number; method?: MergeMethod }
   | { op: "update-branch"; repo: string; n: number; expected_head_oid: string }
-  | { op: "auto-merge"; repo: string; n: number }
+  | { op: "auto-merge"; repo: string; n: number; method?: MergeMethod }
   | { op: "cancel-auto-merge"; repo: string; n: number };
 
 export interface PrAnchor {
@@ -35,6 +35,12 @@ export interface PrAnchor {
 }
 
 type ReviewVerdict = "approved" | "changes_requested" | "commented";
+export type MergeMethod = "fast_forward" | "squash";
+
+function mergeMethod(value: unknown): MergeMethod | undefined | null {
+  if (value === undefined) return undefined;
+  return value === "fast_forward" || value === "squash" ? value : null;
+}
 type WireRecord = Record<string, unknown>;
 
 const utf8 = new TextEncoder();
@@ -199,8 +205,11 @@ export function parsePrMutation(value: unknown): PrMutation | null {
         ? { op: "review-discard", ...base, reviewId: input.reviewId }
         : null;
     case "merge":
-      return exactKeys(input, ["op", "repo", "n"]) ? { op: "merge", ...base } : null;
-    case "auto-merge":
+    case "auto-merge": {
+      const method = mergeMethod(input.method);
+      if (!exactKeys(input, ["op", "repo", "n", "method"]) || method === null) return null;
+      return { op: input.op, ...base, ...(method === undefined ? {} : { method }) };
+    }
     case "cancel-auto-merge":
       return exactKeys(input, ["op", "repo", "n"]) ? { op: input.op, ...base } : null;
     case "update-branch":

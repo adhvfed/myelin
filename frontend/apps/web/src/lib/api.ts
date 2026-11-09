@@ -1251,7 +1251,7 @@ export const prMutate = action(async (
         try {
           const response = await edgePost(
             `${base}/merge`,
-            {},
+            parsed.method ? { method: parsed.method } : {},
             mutationOptions,
           );
           const merged = parseAppliedMerge(response);
@@ -1275,8 +1275,12 @@ export const prMutate = action(async (
       case "cancel-auto-merge": {
         const request = parsed.op === "auto-merge";
         try {
-          const response = request
-            ? await edgePost(`${base}/auto-merge`, {}, mutationOptions)
+          const response = parsed.op === "auto-merge"
+            ? await edgePost(
+              `${base}/auto-merge`,
+              parsed.method ? { method: parsed.method } : {},
+              mutationOptions,
+            )
             : await edgeDelete(`${base}/auto-merge`, mutationOptions);
           if (!hasAppliedAction(response, request ? "git.pr.auto_merge.request" : "git.pr.auto_merge.cancel")) {
             throw new RepoRouteError("error");

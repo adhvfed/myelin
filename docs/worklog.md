@@ -4,6 +4,52 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Squash merges
+
+Merging was fast-forward only. With Update branch and the merge queue, that put a "Merge branch
+'main' into …" commit on main for every pull request that had fallen behind. Agents' work-in-progress
+commits went to main one by one.
+
+A merge can now squash: from the web merge card ("How to merge"), `myelin repo pr merge <repo> <n>
+--squash`, a queued merge (`--auto --squash`, or `{"method": "squash"}` on the auto-merge request),
+and the agent `git.merge` tool's `method`. A squash still requires the branch to contain its base.
+So the single commit it puts on the base has exactly the tree that was reviewed and tested. The pull
+request's author is the commit's author, and the person merging is its committer. The pull request
+records the landed commit as `merged_oid`, and `git.pr.merged` carries it.
+
+The durable merge saga carries the method and the commit it lands through its intent, ledger hash,
+compare-and-swap, crash recovery, and finalisation:
+- The squash commit is written and fsynced before the intent names it, so recovery always finds it.
+- It is deterministic for one head and base, so retries and concurrent passes write the same object.
+- A pending operation retried with a different method conflicts.
+- Squashing onto a base that does not exist is refused rather than quietly fast-forwarding.
+
+The commit message uses only text already in git: a single commit's own summary, or a list of the
+squashed commits' summaries, plus a `Myelin-Pull-Request:` trailer. It never uses the pull request's
+title. Titles can be erased on request, and git history cannot. A repository too large to summarise
+still merges, with a summary-less message.
+
+While proving this, the commit log showed a parent before its child when their timestamps tied.
+libgit2's time sort collects the whole history and then orders it by time alone. Every history walk
+now orders topologically and then by time, at no extra asymptotic cost. A regression test with four
+commits sharing one timestamp fails under the old sort.
+
+An independent review found the erasable title in history, the summary preflight that could block
+merges in huge repositories, and the nondeterministic and unsynced squash object. It also found the
+pending-method gap, the silent fast-forward on a missing base, the agent tool's fail-open method
+parsing, and a second requester's method running under the first requester's authority (the latest
+requester now takes over both). All are fixed.
+
+Proof:
+- The readable TypeScript journey squash-merges one approved pull request directly and queues the
+  second as a squash. Main then reads exactly two commits with the pull requests' commit messages,
+  each on top of the last, and the first pull request reports its `merged_oid`.
+- Unit tests cover the same-object guarantee, keeping the title out of history, the missing-base
+  refusal, a queued squash with exactly the reviewed content, and the log order.
+- A mocked browser test covers the squash confirmation copy.
+- The merge, queue, lifecycle, update-branch, agent-merge, and wire journeys pass, along with the
+  frontend check and strict Clippy for the touched crates.
+
 ## 2026-11-09 — Automations can answer pull-request reviews
 
 Agents can open and update pull requests, but nothing could call one in when a reviewer asked for

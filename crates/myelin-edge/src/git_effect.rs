@@ -7,7 +7,7 @@ use myelin_agent::{
 use myelin_git::core::RepoLoc;
 use myelin_git::durable::DurableError;
 use myelin_git::pg_pr_store::PrOperationId;
-use myelin_git::pr_store::MergeAttempt;
+use myelin_git::pr_store::{MergeAttempt, MergeMethod};
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_storage::TenantScope;
@@ -419,10 +419,19 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::ProtectedPush) {
                     return denied;
                 }
+                let method = match args.get("method") {
+                    None => MergeMethod::FastForward,
+                    Some(Value::String(method)) if method == "fast_forward" => {
+                        MergeMethod::FastForward
+                    }
+                    Some(Value::String(method)) if method == "squash" => MergeMethod::Squash,
+                    Some(_) => return deny_missing("method (fast_forward or squash)"),
+                };
                 match self.backend.merge_human_approved_agent_with_operation(
                     RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
                     &self.delegator,
                     operation_id,
+                    method,
                 ) {
                     Ok(MergeAttempt::Merged { base_ref, new_oid, .. }) => {
                         applied(run, tool, &format!("git.pr.merge:#{number}:{base_ref}@{new_oid}"))

@@ -110,6 +110,7 @@ impl Fixture {
         self.backend.request_auto_merge_with_operation(
             RepoActorContext::new(TENANT, REGION, REPO, actor).for_pr(self.number),
             &self.backend.fresh_operation_id().unwrap(),
+            MergeMethod::FastForward,
         )
     }
 
@@ -279,4 +280,55 @@ fn a_deleted_base_stops_rather_than_recreating_it() {
         QueueStep::Stopped("main no longer exists".into())
     );
     assert_eq!(fixture.repo.read_ref("refs/heads/main").unwrap(), None);
+}
+
+#[test]
+fn a_squash_merge_lands_one_commit_with_the_reviewed_tree() {
+    let fixture = pull_request_behind_its_base(("feature.txt", b"feature\n"));
+    fixture.approve();
+    fixture.request(&fixture.author).unwrap();
+    assert_eq!(
+        fixture.advance(),
+        QueueStep::Holding,
+        "first the base merges in"
+    );
+    let reviewed = fixture.record().head_oid;
+    let base = fixture.repo.read_ref("refs/heads/main").unwrap().unwrap();
+    let MergeAttempt::Merged { new_oid, .. } = fixture
+        .backend
+        .merge_with_operation(
+            RepoActorContext::new(TENANT, REGION, REPO, &fixture.author).for_pr(fixture.number),
+            &fixture.backend.fresh_operation_id().unwrap(),
+            MergeMethod::Squash,
+        )
+        .unwrap()
+    else {
+        panic!("an approved, up-to-date pull request squashes");
+    };
+    assert_ne!(new_oid, reviewed, "a squash is a new commit");
+    let squash = fixture
+        .repo
+        .commit_meta_at_oid(&CoreOid::new(new_oid.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(squash.parents, [base.0], "one commit on top of the base");
+    assert_eq!(
+        squash.summary,
+        format!("change (#{})", fixture.number),
+        "the commit's own words; the queue's base merge is left out"
+    );
+    for path in ["README.md", "feature.txt"] {
+        assert_eq!(
+            fixture.repo.blob_oid_at_path(&new_oid, path).unwrap(),
+            fixture.repo.blob_oid_at_path(&reviewed, path).unwrap(),
+            "exactly the tested content at {path}"
+        );
+    }
+    assert_eq!(
+        fixture.repo.read_ref("refs/heads/main").unwrap().unwrap().0,
+        new_oid
+    );
+    let record = fixture.record();
+    assert_eq!(record.state, PrState::Merged);
+    assert_eq!(record.merged_oid, Some(new_oid));
 }

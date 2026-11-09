@@ -144,7 +144,8 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         parse_cli(&["pr", "merge", "core", "42"]).unwrap(),
         CliCommand::PrMerge {
             repo: "core".into(),
-            number: 42
+            number: 42,
+            squash: false,
         }
     );
     assert_eq!(
@@ -158,7 +159,24 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         parse_cli(&["pr", "merge", "core", "42", "--auto"]).unwrap(),
         CliCommand::PrAutoMerge {
             repo: "core".into(),
-            number: 42
+            number: 42,
+            squash: false,
+        }
+    );
+    assert_eq!(
+        parse_cli(&["pr", "merge", "core", "42", "--squash", "--auto"]).unwrap(),
+        CliCommand::PrAutoMerge {
+            repo: "core".into(),
+            number: 42,
+            squash: true,
+        }
+    );
+    assert_eq!(
+        parse_cli(&["pr", "merge", "core", "42", "--squash"]).unwrap(),
+        CliCommand::PrMerge {
+            repo: "core".into(),
+            number: 42,
+            squash: true,
         }
     );
     assert_eq!(
@@ -199,6 +217,8 @@ fn git_cli_rejects_every_unconsumed_operand_flag_and_counterfeit_feature() {
         vec!["pr", "review", "core", "1", "--approve", "extra"],
         vec!["pr", "merge", "core", "1", "--auto", "--auto"],
         vec!["pr", "merge", "core", "1", "--auto", "--disable-auto"],
+        vec!["pr", "merge", "core", "1", "--squash", "--squash"],
+        vec!["pr", "merge", "core", "1", "--disable-auto", "--squash"],
         vec!["pr", "merge", "core", "1", "extra"],
         vec!["pr", "endorse-fork-ci", "core", "1", "extra"],
     ] {
@@ -371,7 +391,8 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
     assert_eq!(
         CliCommand::PrMerge {
             repo: "r".into(),
-            number: 1
+            number: 1,
+            squash: false,
         }
         .handler(),
         Handler::MergeGate
@@ -398,7 +419,8 @@ fn cli_each_verb_lowers_to_an_existing_handler() {
 fn cli_write_commands_are_classified_for_the_bus2_gate() {
     assert!(CliCommand::PrMerge {
         repo: "r".into(),
-        number: 1
+        number: 1,
+        squash: false,
     }
     .is_write());
     assert!(CliCommand::PrReview {

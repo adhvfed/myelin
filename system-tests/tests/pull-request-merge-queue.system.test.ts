@@ -55,6 +55,7 @@ async function approvedChange(
     path,
     contents: `${path}\n`,
     title: `Add ${path}`,
+    commitMessage: `Add ${path}`,
     reviewers: [systemTestConfig.reviewerPrincipal],
   });
   await reviewerClient.json(`${project.path}/prs/${change.number}/reviews`, {
@@ -156,4 +157,54 @@ describe("the merge queue", () => {
       expectedStatus: [403, 404],
     });
   }, 150_000);
+
+  test("squash merges leave one commit per pull request on main, queued or not", async () => {
+    const project = new GitProject(uniqueName("squash-merge"), systemClient);
+    await project.create();
+    await project.writeFile("main", "README.md", "# squash\n");
+    const startCommits = await systemClient.json(`${project.path}/commits/main?limit=1`);
+    const start = string(
+      record(array(startCommits.body.items, "start commits")[0], "start commit").oid,
+      "start oid",
+    );
+    const first = await approvedChange(project, "feature/first", "first.txt");
+    const second = await approvedChange(project, "feature/second", "second.txt");
+
+    const merged = await systemClient.json(`${project.path}/prs/${first.number}/merge`, {
+      method: "POST",
+      body: { method: "squash" },
+    });
+    const squashed = string(record(merged.body.applied, "squash merge").new_oid, "squash oid");
+    expect(squashed).not.toBe(first.headOid);
+    expect(await pullRequest(project, first.number)).toMatchObject({
+      pr_state: "merged",
+      merged_oid: squashed,
+    });
+
+    await systemClient.json(`${project.path}/prs/${second.number}/auto-merge`, {
+      method: "POST",
+      body: { method: "squash" },
+    });
+    await eventually(async () =>
+      (await pullRequest(project, second.number)).pr_state === "merged" ? true : undefined, {
+      description: "the queued pull request to squash onto the first",
+      timeoutMs: 60_000,
+    });
+    const history = array((await systemClient.json(
+      `${project.path}/commits/main?limit=3`,
+    )).body.items, "squashed history").map((item) => record(item, "commit"));
+    expect(history).toEqual([
+      expect.objectContaining({
+        summary: `Add second.txt (#${second.number})`,
+        parents: [squashed],
+      }),
+      expect.objectContaining({
+        oid: squashed,
+        summary: `Add first.txt (#${first.number})`,
+        parents: [start],
+      }),
+      expect.objectContaining({ oid: start }),
+    ]);
+    expect(await project.readFile("main", "second.txt")).toMatchObject({ contents: "second.txt\n" });
+  }, 120_000);
 });

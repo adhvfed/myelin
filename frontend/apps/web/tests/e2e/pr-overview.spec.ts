@@ -403,6 +403,18 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
       .toContainText("Automatic merge stopped: main and this branch both changed README.md.");
   });
 
+  test("choosing to squash says what the merge will do before it happens", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/2"); // gate admitted.
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("merge-method").getByRole("combobox").selectOption("squash");
+    await page.getByTestId("merge-button").click();
+    await expect(page.getByRole("alertdialog")).toContainText(
+      "This adds one commit to main with the reviewed changes of hotfix.",
+    );
+  });
+
   test("a mergeable PR opens the merge ConfirmDialog (alertdialog, safe-action focus)", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/2"); // gate admitted.

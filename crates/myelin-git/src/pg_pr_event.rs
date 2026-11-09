@@ -79,6 +79,10 @@ pub(crate) async fn co_commit_event(
     if let Some(generation) = head_generation {
         payload["head_generation"] = generation.into();
     }
+    if let Some(merged) = &record.merged_oid {
+        // The commit now on the base: the head itself, or the squash of it.
+        payload["merged_oid"] = merged.clone().into();
+    }
     if event_type == GIT_REVIEW_SUBMITTED {
         // Automations act on the decision itself, such as an agent addressing requested changes.
         // Automation filters see top-level scalars, so the decision is flat like the rest.

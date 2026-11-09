@@ -1356,7 +1356,7 @@ impl DurableGitRepo {
         let requested: std::collections::BTreeSet<&str> =
             entries.iter().map(|entry| entry.name.as_str()).collect();
         let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
-        walk.set_sorting(git2::Sort::TIME)
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)
             .map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
         let mut out: std::collections::BTreeMap<String, CommitMeta> = Default::default();
@@ -1433,7 +1433,7 @@ impl DurableGitRepo {
             return Ok((Vec::new(), false));
         };
         let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
-        walk.set_sorting(git2::Sort::TIME)
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)
             .map_err(|e| git_err("revwalk sort", e))?;
         walk.push(tip).map_err(|e| git_err("revwalk push", e))?;
         let mut seen = 0usize;
@@ -1544,9 +1544,10 @@ impl DurableGitRepo {
         let mut walk = repo
             .revwalk()
             .map_err(|error| PrCommitPageError::Durable(git_err("pull-request revwalk", error)))?;
-        walk.set_sorting(git2::Sort::TIME).map_err(|error| {
-            PrCommitPageError::Durable(git_err("pull-request revwalk sort", error))
-        })?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)
+            .map_err(|error| {
+                PrCommitPageError::Durable(git_err("pull-request revwalk sort", error))
+            })?;
         walk.push(head)
             .map_err(|error| pr_commit_walk_error("pull-request revwalk push head", error))?;
         if let Some(base) = base {
@@ -2204,6 +2205,59 @@ impl DurableGitRepo {
         is_commit
     }
 
+    /// A commit with `head`'s tree on top of `parent`, for a squash merge.
+    pub fn write_squash_commit(
+        &self,
+        head: &Oid,
+        parent: &Oid,
+        message: &str,
+        author_pseudonym: &str,
+        committer_pseudonym: &str,
+        at_unix: i64,
+    ) -> Result<Oid, DurableError> {
+        let repo = self.open_git()?;
+        let head = repo
+            .find_commit(Self::parse_oid(head)?)
+            .map_err(|e| git_err("find squash head", e))?;
+        let parent = repo
+            .find_commit(Self::parse_oid(parent)?)
+            .map_err(|e| git_err("find squash parent", e))?;
+        let tree = head.tree().map_err(|e| git_err("read squash tree", e))?;
+        let at = git2::Time::new(at_unix, 0);
+        let author = git2::Signature::new(author_pseudonym, author_pseudonym, &at)
+            .map_err(|e| git_err("squash author", e))?;
+        let committer = git2::Signature::new(committer_pseudonym, committer_pseudonym, &at)
+            .map_err(|e| git_err("squash committer", e))?;
+        let commit = repo
+            .commit(None, &author, &committer, message, &tree, &[&parent])
+            .map_err(|e| git_err("write squash commit", e))?;
+        let commit = Oid::new(commit.to_string());
+        // A merge intent will name this object, so it must survive a host crash.
+        self.sync_loose_object(&commit)?;
+        Ok(commit)
+    }
+
+    fn sync_loose_object(&self, oid: &Oid) -> Result<(), DurableError> {
+        let (fanout, rest) = oid.as_str().split_at(2);
+        let directory = self.path.join("objects").join(fanout);
+        match std::fs::File::open(directory.join(rest)) {
+            Ok(file) => file
+                .sync_all()
+                .map_err(|e| DurableError::Io(format!("sync object {}: {e}", oid.as_str())))?,
+            // Already packed, so already durable.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(DurableError::Io(format!(
+                    "open object {}: {error}",
+                    oid.as_str()
+                )))
+            }
+        }
+        std::fs::File::open(&directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| DurableError::Io(format!("sync {}: {e}", directory.display())))
+    }
+
     pub fn prepare_merge_commit(
         &self,
         head: &Oid,
@@ -2801,6 +2855,44 @@ mod tests {
             "psn-7@acme.noreply",
         )
         .expect("commit")
+    }
+
+    #[test]
+    fn a_log_never_shows_a_parent_before_its_child_when_their_times_tie() {
+        let root = temp_root("log-ties");
+        let repo = init_bare_repo(&root.join("repo.git")).expect("repo");
+        let git = repo.open_git().expect("open");
+        let at = git2::Signature::new(
+            "psn",
+            "psn@acme.noreply",
+            &git2::Time::new(1_700_000_000, 0),
+        )
+        .unwrap();
+        let tree = git
+            .find_tree(git2::Oid::from_str(repo.write_tree(&[]).unwrap().as_str()).unwrap())
+            .unwrap();
+        let mut parent: Option<git2::Oid> = None;
+        let mut chain = Vec::new();
+        for message in ["first", "second", "third", "fourth"] {
+            let parents: Vec<git2::Commit> = parent
+                .map(|oid| git.find_commit(oid).unwrap())
+                .into_iter()
+                .collect();
+            let refs: Vec<&git2::Commit> = parents.iter().collect();
+            let oid = git.commit(None, &at, &at, message, &tree, &refs).unwrap();
+            chain.push(oid.to_string());
+            parent = Some(oid);
+        }
+        git.reference("refs/heads/main", parent.unwrap(), true, "seed")
+            .unwrap();
+        let (log, _) = repo.commit_log("refs/heads/main", 0, 10).unwrap();
+        let shown: Vec<String> = log.into_iter().map(|commit| commit.oid).collect();
+        chain.reverse();
+        assert_eq!(
+            shown, chain,
+            "newest first, and never a parent before its child"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

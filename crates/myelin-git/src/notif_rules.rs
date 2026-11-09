@@ -477,6 +477,7 @@ mod tests {
             requested_by: "alice".into(),
             requested_at: 20,
             head_oid: "1".repeat(40),
+            method: crate::pr_store::MergeMethod::FastForward,
         });
         let resolved = drafts(crate::events::GIT_PR_MERGE_QUEUED, &record);
         assert_eq!(resolved.len(), 1);

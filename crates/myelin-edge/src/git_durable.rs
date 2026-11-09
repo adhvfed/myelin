@@ -41,8 +41,8 @@ use myelin_git::pr_list_pagination::{
 };
 use myelin_git::pr_store::{
     effective_ruleset, merge_pr, BranchProtectionConfig, ChecksSummary, DurablePrStore,
-    MergeAttempt, PrCrossListQuery, PrListBucket, PrListCounts, PrListQuery, PrListSlice,
-    PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
+    MergeAttempt, MergeMethod, PrCrossListQuery, PrListBucket, PrListCounts, PrListQuery,
+    PrListSlice, PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
 };
 use myelin_git::pr_threads::{
     AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, CommentWrite,
@@ -2752,23 +2752,26 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<MergeAttempt, DurableError> {
         let operation_id = self.fresh_operation_id()?;
-        self.merge_with_operation(tenant, region, slug, number, principal, &operation_id)
+        self.merge_with_operation(
+            RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
+            &operation_id,
+            MergeMethod::FastForward,
+        )
     }
 
     pub fn merge_with_operation(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
-        principal: &Principal,
+        target: PrActorContext<'_>,
         operation_id: &PrOperationId,
+        method: MergeMethod,
     ) -> Result<MergeAttempt, DurableError> {
+        let principal = target.repo.principal;
         self.merge_for_actor_with_operation(
-            RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
+            target,
             principal,
             operation_id,
             PushProvenance::direct(Self::is_agent(principal)),
+            method,
         )
     }
 
@@ -2777,6 +2780,7 @@ impl DurableGitBackend {
         target: PrActorContext<'_>,
         repo_reader: &Principal,
         operation_id: &PrOperationId,
+        method: MergeMethod,
     ) -> Result<MergeAttempt, DurableError> {
         if !Self::is_agent(target.repo.principal) {
             return Err(DurableError::Git(
@@ -2788,6 +2792,7 @@ impl DurableGitBackend {
             repo_reader,
             operation_id,
             PushProvenance::HumanApprovedAgent,
+            method,
         )
     }
 
@@ -2800,10 +2805,17 @@ impl DurableGitBackend {
         repo_reader: &Principal,
         operation_id: &PrOperationId,
         ref_update_provenance: PushProvenance,
+        method: MergeMethod,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = Self::loc(target.repo.tenant, target.repo.region, target.repo.slug);
         let actor = target.repo.principal;
-        let attempt = self.land_merge(target, repo_reader, operation_id, ref_update_provenance)?;
+        let attempt = self.land_merge(
+            target,
+            repo_reader,
+            operation_id,
+            ref_update_provenance,
+            method,
+        )?;
         if let MergeAttempt::Merged { base_ref, .. } = &attempt {
             self.follow_branch(&loc, actor, base_ref);
         }
@@ -2816,6 +2828,7 @@ impl DurableGitBackend {
         repo_reader: &Principal,
         operation_id: &PrOperationId,
         ref_update_provenance: PushProvenance,
+        method: MergeMethod,
     ) -> Result<MergeAttempt, DurableError> {
         let PrActorContext { repo, number } = target;
         let RepoActorContext {
@@ -2879,6 +2892,7 @@ impl DurableGitBackend {
                 &Self::pseudonym(tenant, actor),
                 ref_update_provenance,
                 self.checks.is_some(),
+                method,
             );
         }
         merge_pr(
@@ -2889,6 +2903,7 @@ impl DurableGitBackend {
             &repo,
             &Self::pseudonym(tenant, actor),
             ref_update_provenance,
+            method,
         )
     }
 
@@ -3217,6 +3232,7 @@ impl DurableGitBackend {
             "updated_at": rec.updated_at,
             "created_at": rec.created_at,
             "is_fork": rec.head_repo_slug != repo,
+            "merged_oid": rec.merged_oid,
             "auto_merge": rec.auto_merge.as_ref().filter(|_| rec.state == PrState::Open).map(|request| json!({
                 "requested_by": format!("{}@{tenant}.noreply", request.requested_by),
                 "requested_at": request.requested_at,
@@ -3508,12 +3524,9 @@ mod agent_file_write_tests {
         assert!(matches!(
             backend
                 .merge_with_operation(
-                    TENANT,
-                    REGION,
-                    REPO,
-                    opened.number,
-                    &actor,
+                    RepoActorContext::new(TENANT, REGION, REPO, &actor).for_pr(opened.number),
                     &PrOperationId::parse("direct-agent-merge").unwrap(),
+                    MergeMethod::FastForward,
                 )
                 .unwrap(),
             MergeAttempt::RefRefused(RejectReason::AgentNeedsHuman { .. })
@@ -3534,6 +3547,7 @@ mod agent_file_write_tests {
                     RepoActorContext::new(TENANT, REGION, REPO, &actor).for_pr(opened.number),
                     &founder,
                     &PrOperationId::parse("approved-agent-merge").unwrap(),
+                    MergeMethod::FastForward,
                 )
                 .unwrap(),
             MergeAttempt::Merged { .. }

@@ -40,6 +40,7 @@ impl DurableGitBackend {
         &self,
         target: PrActorContext<'_>,
         operation_id: &PrOperationId,
+        method: MergeMethod,
     ) -> Result<PrRecord, DurableError> {
         let PrActorContext {
             repo: actor,
@@ -64,6 +65,7 @@ impl DurableGitBackend {
             number,
             PrMutation::RequestAutoMerge {
                 requested_by: actor.principal.principal_id.0.clone(),
+                method,
             },
             operation_id,
             actor.principal,
@@ -277,12 +279,9 @@ impl DurableGitBackend {
         }
         // A merge that lost a race is recorded as a finished attempt, so every attempt is new.
         let attempt = self.merge_with_operation(
-            &loc.tenant,
-            &loc.region,
-            &loc.repo,
-            number,
-            &requester,
+            actor.for_pr(number),
             &self.fresh_operation_id()?,
+            request.method,
         );
         match attempt {
             Ok(MergeAttempt::Merged { .. }) => Ok(QueueStep::Merged),

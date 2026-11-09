@@ -1438,17 +1438,20 @@ struct DMerge {
 }
 impl Handler for DMerge {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        optional_json::<EmptyMutationBody>(&ctx.request.body, "pull request merge")?;
+        let body: MergeBody = optional_json(&ctx.request.body, "pull request merge")?;
         let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let attempt = self
             .be
             .merge_with_operation(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                pull_request_number_param(ctx, "n")?,
-                ctx.principal,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(pull_request_number_param(ctx, "n")?),
                 &operation_id,
+                body.method,
             )
             .map_err(map_durable_err)?;
         match attempt {
@@ -1575,7 +1578,12 @@ struct DAutoMerge {
 }
 impl Handler for DAutoMerge {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        optional_json::<EmptyMutationBody>(&ctx.request.body, "automatic merge")?;
+        let body: MergeBody = if self.request {
+            optional_json(&ctx.request.body, "automatic merge")?
+        } else {
+            optional_json::<EmptyMutationBody>(&ctx.request.body, "automatic merge")?;
+            MergeBody::default()
+        };
         let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let target = RepoActorContext::new(
             tenant_of(ctx),
@@ -1588,7 +1596,7 @@ impl Handler for DAutoMerge {
             (
                 "git.pr.auto_merge.request",
                 self.be
-                    .request_auto_merge_with_operation(target, &operation_id),
+                    .request_auto_merge_with_operation(target, &operation_id, body.method),
             )
         } else {
             (

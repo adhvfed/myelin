@@ -42,6 +42,7 @@ import {
   type PrincipalVM,
   type PrCommitsPage,
 } from "~/lib/api";
+import type { MergeMethod } from "~/lib/mutation-input";
 import { NotAvailable } from "~/components/NotAvailable";
 import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
@@ -1010,6 +1011,8 @@ function MergeCard(props: {
   const mergeableNow = () => live().gate_admitted && !behind();
   const canQueue = () => props.pr.pr_state === "open" && props.pr.is_fork !== true;
   const [scheduling, setScheduling] = createSignal(false);
+  const [method, setMethod] = createSignal<MergeMethod>("fast_forward");
+  const headName = () => props.pr.head_ref.replace(/^refs\/heads\//, "");
   // The queue works in the background, so a queued pull request keeps its card current.
   createEffect(() => {
     if (!queued()) return;
@@ -1024,11 +1027,9 @@ function MergeCard(props: {
     setScheduling(true);
     let result: { ok: true } | { refused: string } | null = null;
     try {
-      result = await doMutate({
-        op: request ? "auto-merge" : "cancel-auto-merge",
-        repo: props.repo,
-        n: props.n,
-      }) as { ok: true } | { refused: string };
+      result = await doMutate(request
+        ? { op: "auto-merge", repo: props.repo, n: props.n, method: method() }
+        : { op: "cancel-auto-merge", repo: props.repo, n: props.n }) as { ok: true } | { refused: string };
     } catch {
       props.toast.show({
         title: request ? "Could not schedule the merge" : "Could not cancel the automatic merge",
@@ -1048,7 +1049,7 @@ function MergeCard(props: {
 
   const doMerge = async () => {
     try {
-      const res = await doMutate({ op: "merge", repo: props.repo, n: props.n });
+      const res = await doMutate({ op: "merge", repo: props.repo, n: props.n, method: method() });
       const r = res as MergeResult;
       if (r.blocked) {
         // N6 — the gate flipped mid-dialog: re-render the blocked card from the FRESH checks, never merge.
@@ -1107,6 +1108,13 @@ function MergeCard(props: {
             </button>
           </div>
         </Show>
+        <label data-testid="merge-method" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", "align-self": "flex-start" }}>
+          <span>How to merge</span>
+          <select value={method()} onChange={(event) => setMethod(event.currentTarget.value as MergeMethod)}>
+            <option value="fast_forward">Fast-forward to the reviewed commits</option>
+            <option value="squash">Squash into one commit</option>
+          </select>
+        </label>
         <Show
           when={live().gate_admitted}
           fallback={
@@ -1171,7 +1179,9 @@ function MergeCard(props: {
         onCancel={() => setConfirm(false)}
         onConfirm={() => void doMerge()}
         title="Merge this pull request?"
-        description={`This moves ${baseName()} forward to the reviewed head of ${props.pr.head_ref.replace(/^refs\/heads\//, "")}. Branch protection is checked again at merge time.`}
+        description={method() === "squash"
+          ? `This adds one commit to ${baseName()} with the reviewed changes of ${headName()}. Branch protection is checked again at merge time.`
+          : `This moves ${baseName()} forward to the reviewed head of ${headName()}. Branch protection is checked again at merge time.`}
         confirmLabel="Merge"
         cancelLabel="Cancel"
       />

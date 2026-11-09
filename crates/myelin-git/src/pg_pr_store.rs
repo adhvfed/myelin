@@ -375,6 +375,22 @@ pub struct MergeIntent {
     pub expected_old_oid: String,
     pub head_oid: String,
     pub head_repo_slug: String,
+    #[serde(default)]
+    pub method: crate::pr_store::MergeMethod,
+    /// The squash commit the base moves to; empty when the base moves to the head itself.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub target_oid: String,
+}
+
+impl MergeIntent {
+    /// The commit the base moves to.
+    pub fn target(&self) -> &str {
+        if self.target_oid.is_empty() {
+            &self.head_oid
+        } else {
+            &self.target_oid
+        }
+    }
 }
 
 fn untrusted_merge_provenance() -> PushProvenance {
@@ -450,6 +466,7 @@ pub enum PrMutation {
     /// head. Asking again for the same head keeps the original place in the queue.
     RequestAutoMerge {
         requested_by: String,
+        method: crate::pr_store::MergeMethod,
     },
     /// Leave the merge queue. A `reason` records why the queue gave up rather than a person; with
     /// `requested_at`, it applies only to that request, never to a newer one.
@@ -544,23 +561,31 @@ impl PrMutation {
                     }
                 }
             }
-            Self::RequestAutoMerge { requested_by } => {
+            Self::RequestAutoMerge {
+                requested_by,
+                method,
+            } => {
                 if record.state != PrState::Open {
                     return Err("only an open pull request can merge automatically");
                 }
                 if requested_by.trim().is_empty() {
                     return Err("an automatic merge needs the person who asked for it");
                 }
-                let unchanged = record
-                    .auto_merge
-                    .as_ref()
-                    .is_some_and(|request| request.head_oid == record.head_oid);
-                if !unchanged {
-                    record.auto_merge = Some(crate::pr_store::AutoMerge {
-                        requested_by,
-                        requested_at: updated_at_unix,
-                        head_oid: record.head_oid.clone(),
-                    });
+                match &mut record.auto_merge {
+                    // Same head: keep the place in the queue. The latest person to ask merges with
+                    // their own authority and their chosen method.
+                    Some(request) if request.head_oid == record.head_oid => {
+                        request.requested_by = requested_by;
+                        request.method = method;
+                    }
+                    _ => {
+                        record.auto_merge = Some(crate::pr_store::AutoMerge {
+                            requested_by,
+                            requested_at: updated_at_unix,
+                            head_oid: record.head_oid.clone(),
+                            method,
+                        });
+                    }
                 }
                 record.auto_merge_stopped = None;
             }
@@ -1865,6 +1890,7 @@ impl PgPrStore {
         merger_pseudonym: &str,
         ref_update_provenance: PushProvenance,
         project_checks: bool,
+        method: crate::pr_store::MergeMethod,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
         if &loc != target_loc {
@@ -1877,6 +1903,7 @@ impl PgPrStore {
             if intent.operation_id != operation_id.as_str()
                 || intent.actor_subject_id != actor_subject_id
                 || intent.ref_update_provenance != ref_update_provenance
+                || intent.method != method
             {
                 return Err(DurableError::Git(
                     "a different merge operation is already pending".into(),
@@ -1908,6 +1935,8 @@ impl PgPrStore {
             expected_old_oid: PushOid::zero().0,
             head_oid: record.head_oid.clone(),
             head_repo_slug: record.head_repo_slug.clone(),
+            method,
+            target_oid: String::new(),
         });
         let command_hash = merge_payload_hash(number, &command_intent)?;
         match self.merge_command_state(
@@ -1938,7 +1967,7 @@ impl PgPrStore {
                 "completed",
                 MergeCommandResult::Merged {
                     base_ref: record.base_ref,
-                    new_oid: record.head_oid,
+                    new_oid: record.merged_oid.unwrap_or(record.head_oid),
                     update_seq,
                 },
             );
@@ -2004,18 +2033,54 @@ impl PgPrStore {
             );
         }
 
-        let intent = pending.unwrap_or_else(|| MergeIntent {
-            operation_id: operation_id.as_str().to_owned(),
-            actor_subject_id,
-            ref_update_provenance,
-            base_ref: record.base_ref.clone(),
-            expected_old_oid: actual_before
-                .as_ref()
-                .map(|oid| oid.0.clone())
-                .unwrap_or_else(|| PushOid::zero().0),
-            head_oid: record.head_oid.clone(),
-            head_repo_slug: record.head_repo_slug.clone(),
-        });
+        let intent = match pending {
+            Some(intent) => intent,
+            None => {
+                // The squash commit is written before the intent records it, so recovery always
+                // finds the object it pushes.
+                let target_oid = match (method, actual_before.as_ref()) {
+                    (crate::pr_store::MergeMethod::Squash, Some(tip)) => {
+                        crate::pr_store::squash_commit(
+                            target_repo,
+                            target_loc,
+                            &record,
+                            &CoreOid::new(tip.0.clone()),
+                            merger_pseudonym,
+                        )?
+                        .0
+                    }
+                    (crate::pr_store::MergeMethod::Squash, None) => {
+                        return self.record_merge_terminal(
+                            scope,
+                            repo,
+                            number,
+                            operation_id,
+                            &actor_subject_id,
+                            &command_hash,
+                            "completed",
+                            MergeCommandResult::InvalidHead {
+                                reason: "a squash merge needs the base branch to exist".into(),
+                            },
+                        )
+                    }
+                    (crate::pr_store::MergeMethod::FastForward, _) => String::new(),
+                };
+                MergeIntent {
+                    operation_id: operation_id.as_str().to_owned(),
+                    actor_subject_id,
+                    ref_update_provenance,
+                    base_ref: record.base_ref.clone(),
+                    expected_old_oid: actual_before
+                        .as_ref()
+                        .map(|oid| oid.0.clone())
+                        .unwrap_or_else(|| PushOid::zero().0),
+                    head_oid: record.head_oid.clone(),
+                    head_repo_slug: record.head_repo_slug.clone(),
+                    method,
+                    target_oid,
+                }
+            }
+        };
         validate_merge_intent(&intent)?;
         if let Some(attempt) = self.begin_merge(
             scope,
@@ -2089,8 +2154,7 @@ impl PgPrStore {
         )));
         let base = RefName::new(intent.base_ref.clone());
         let actual = ref_store.try_tip(&base)?;
-        let attempt = if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str())
-        {
+        let attempt = if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.target()) {
             let update_seq = target_repo.ref_generation(&base.0)?;
             self.finalize_merge(scope, repo, number, &intent, &command_hash, update_seq, ctx)?
         } else {
@@ -2133,7 +2197,7 @@ impl PgPrStore {
     ) -> Result<MergeAttempt, DurableError> {
         let base = RefName::new(intent.base_ref.clone());
         let actual = ref_store.try_tip(&base)?;
-        if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str()) {
+        if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.target()) {
             let update_seq = target_repo.ref_generation(&base.0)?;
             return self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx);
         }
@@ -2144,7 +2208,7 @@ impl PgPrStore {
             return self.cancel_merge(scope, repo, number, intent, command_hash, actual, ctx);
         }
 
-        let head = PushOid::new(intent.head_oid.clone());
+        let head = PushOid::new(intent.target().to_owned());
         let push = PushSession {
             updates: vec![ProposedRefUpdate {
                 ref_name: base.clone(),
@@ -2162,7 +2226,7 @@ impl PgPrStore {
         {
             PushOutcome::Accepted { moved, .. } => {
                 if ref_store.try_tip(&base)?.as_ref().map(|oid| oid.0.as_str())
-                    != Some(intent.head_oid.as_str())
+                    != Some(intent.target())
                 {
                     return Err(DurableError::Git(
                         "merge ref adapter did not verify the committed head".into(),
@@ -2173,7 +2237,7 @@ impl PgPrStore {
             }
             PushOutcome::Rejected(_reason) => {
                 let actual = ref_store.try_tip(&base)?;
-                if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.head_oid.as_str()) {
+                if actual.as_ref().map(|oid| oid.0.as_str()) == Some(intent.target()) {
                     let update_seq = target_repo.ref_generation(&base.0)?;
                     self.finalize_merge(scope, repo, number, intent, command_hash, update_seq, ctx)
                 } else {
@@ -2643,6 +2707,7 @@ impl PgPrStore {
         let operation_id = PrOperationId::from_stored_digest(&intent.operation_id)?;
         let actor_subject_id = intent.actor_subject_id.clone();
         let command_hash = command_hash.to_owned();
+        let target = intent.target().to_owned();
         let expected = serde_json::to_value(intent)
             .map_err(|e| DurableError::Git(format!("encode merge intent: {e}")))?;
         let loc = self.scoped_loc(scope, repo)?;
@@ -2681,6 +2746,7 @@ impl PgPrStore {
                 let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row).map_err(|_| pg_query("decode merge PR"))?;
                 record.state = PrState::Merged;
                 record.updated_at = Some(ctx.unix_seconds);
+                record.merged_oid = Some(target.clone());
                 if free_text_erased {
                     let projection = command_projection(&record).map_err(|_| pg_query("encode erased merge PR projection"))?;
                     sqlx::query("UPDATE git_pr SET record=$5,version=version+1,merge_intent=NULL,updated_at=now() \
@@ -2705,7 +2771,7 @@ impl PgPrStore {
                 co_commit_event(conn, minter, ctx.emit, &loc, &record, GIT_PR_MERGED, Some(&expected)).await?;
                 let result = MergeCommandResult::Merged {
                     base_ref: record.base_ref.clone(),
-                    new_oid: record.head_oid.clone(),
+                    new_oid: target,
                     update_seq,
                 };
                 let result_json = serde_json::to_value(&result).map_err(|_| pg_query("encode merged command result"))?;
@@ -3091,6 +3157,7 @@ fn merge_payload_hash(number: u64, intent: &MergeIntent) -> Result<String, Durab
         intent.base_ref.as_str(),
         intent.head_oid.as_str(),
         intent.head_repo_slug.as_str(),
+        intent.method,
     ))
 }
 
@@ -3335,6 +3402,7 @@ fn validate_merge_intent(intent: &MergeIntent) -> Result<(), DurableError> {
         || intent.head_repo_slug.len() > 255
         || !valid_oid(&intent.expected_old_oid)
         || !valid_oid(&intent.head_oid)
+        || !(intent.target_oid.is_empty() || valid_oid(&intent.target_oid))
     {
         return Err(DurableError::Git(
             "merge intent contains an empty authority field".into(),
@@ -3551,6 +3619,8 @@ mod tests {
             expected_old_oid: "a".repeat(40),
             head_oid: "b".repeat(40),
             head_repo_slug: "fork".into(),
+            method: crate::pr_store::MergeMethod::FastForward,
+            target_oid: String::new(),
         };
         assert!(validate_merge_intent(&intent).is_ok());
         intent.operation_id.clear();
@@ -3694,6 +3764,7 @@ mod tests {
         let mut record = PrRecord::open(&pull_request, "a".repeat(40));
         let request = |by: &str| PrMutation::RequestAutoMerge {
             requested_by: by.into(),
+            method: crate::pr_store::MergeMethod::FastForward,
         };
         assert_eq!(request("alice").event_type(), GIT_PR_MERGE_QUEUED);
         request("alice").apply_to_at(&mut record, 100).unwrap();
@@ -3703,12 +3774,13 @@ mod tests {
                 requested_by: by.into(),
                 requested_at: at,
                 head_oid: head.to_string().repeat(40),
+                method: crate::pr_store::MergeMethod::FastForward,
             })
         };
         assert_eq!(
             record.auto_merge,
-            scheduled("alice", 100, 'a'),
-            "asking again for the same head keeps the original place"
+            scheduled("bob", 100, 'a'),
+            "asking again for the same head keeps the place; the latest asker's authority merges"
         );
 
         PrMutation::AdoptBaseMerge {
@@ -3719,7 +3791,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             record.auto_merge,
-            scheduled("alice", 100, 'b'),
+            scheduled("bob", 100, 'b'),
             "Myelin's base merge is still the scheduled change"
         );
         PrMutation::SynchronizeHead {
@@ -3730,7 +3802,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             record.auto_merge,
-            scheduled("alice", 100, 'b'),
+            scheduled("bob", 100, 'b'),
             "a push does not inherit the schedule"
         );
         request("bob").apply_to_at(&mut record, 500).unwrap();
@@ -3838,6 +3910,8 @@ mod tests {
             expected_old_oid: "a".repeat(40),
             head_oid: "b".repeat(40),
             head_repo_slug: "fork".into(),
+            method: crate::pr_store::MergeMethod::FastForward,
+            target_oid: String::new(),
         };
         let before = merge_payload_hash(41, &intent).expect("fresh command hash");
         intent.expected_old_oid = "c".repeat(40);
@@ -4264,6 +4338,8 @@ mod tests {
             expected_old_oid: PushOid::zero().0,
             head_oid: projected_pr.head_oid.clone(),
             head_repo_slug: projection_slug.clone(),
+            method: crate::pr_store::MergeMethod::FastForward,
+            target_oid: String::new(),
         };
         let projection_hash = merge_payload_hash(projected_pr.number, &projection_intent).unwrap();
         let projection_ctx = store.operation_context(&scope_a, &actor).unwrap();
@@ -4738,6 +4814,8 @@ mod tests {
                 expected_old_oid: base.0.clone(),
                 head_oid: head.0.clone(),
                 head_repo_slug: slug.into(),
+                method: crate::pr_store::MergeMethod::FastForward,
+                target_oid: String::new(),
             };
             let hash = merge_payload_hash(opened.number, &intent).unwrap();
             let mut event_agent = Principal::stub(
@@ -4935,6 +5013,7 @@ mod tests {
                         "merger@tenant.noreply",
                         PushProvenance::NonAgent,
                         false,
+                        crate::pr_store::MergeMethod::FastForward,
                     )
                     .unwrap();
                 assert_eq!(first, retry, "cancelled command replays deterministically");

@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::EdgeError;
+use myelin_git::pr_store::MergeMethod;
 
 const MAX_WEB_COMMIT_MESSAGE_BYTES: usize = 8 * 1024;
 const DEFAULT_WEB_COMMIT_MESSAGE: &str = "web edit";
@@ -137,6 +138,14 @@ pub(super) struct ReviewBody {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EmptyMutationBody {}
+
+/// How a merge, or a merge scheduled for when the pull request is ready, lands.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct MergeBody {
+    #[serde(default)]
+    pub(super) method: MergeMethod,
+}
 
 #[cfg(test)]
 mod tests {

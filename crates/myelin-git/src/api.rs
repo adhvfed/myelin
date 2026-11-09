@@ -202,6 +202,7 @@ pub enum CliCommand {
     PrMerge {
         repo: String,
         number: u64,
+        squash: bool,
     },
     PrUpdateBranch {
         repo: String,
@@ -210,6 +211,7 @@ pub enum CliCommand {
     PrAutoMerge {
         repo: String,
         number: u64,
+        squash: bool,
     },
     PrDisableAutoMerge {
         repo: String,
@@ -391,10 +393,32 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
         }
         "merge" => {
             let (repo, number, flags) = repo_and_number_prefix(args)?;
-            match flags {
-                [] => Ok(CliCommand::PrMerge { repo, number }),
-                ["--auto"] => Ok(CliCommand::PrAutoMerge { repo, number }),
-                ["--disable-auto"] => Ok(CliCommand::PrDisableAutoMerge { repo, number }),
+            let squash = flags.contains(&"--squash");
+            let rest: Vec<&str> = flags
+                .iter()
+                .copied()
+                .filter(|flag| *flag != "--squash")
+                .collect();
+            if flags.len() - rest.len() > 1 {
+                return Err(CliParseError::DuplicateFlag { flag: "--squash" });
+            }
+            match rest.as_slice() {
+                [] => Ok(CliCommand::PrMerge {
+                    repo,
+                    number,
+                    squash,
+                }),
+                ["--auto"] => Ok(CliCommand::PrAutoMerge {
+                    repo,
+                    number,
+                    squash,
+                }),
+                ["--disable-auto"] if !squash => {
+                    Ok(CliCommand::PrDisableAutoMerge { repo, number })
+                }
+                ["--disable-auto"] => Err(CliParseError::Unknown {
+                    token: "--squash".into(),
+                }),
                 ["--auto" | "--disable-auto", extra, ..] | [extra, ..] => {
                     Err(CliParseError::Unknown {
                         token: (*extra).to_string(),
@@ -680,7 +704,7 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
     vec![
         AgentToolDef {
             local_name: "merge",
-            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1}},"additionalProperties":false}"#,
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"method":{"type":"string","enum":["fast_forward","squash"],"description":"fast_forward moves the base to the reviewed head; squash adds one commit with its tree"}},"additionalProperties":false}"#,
             requires_approval: true,
             required_caps: &["pull_request.merge"],
             handler: Handler::MergeGate,

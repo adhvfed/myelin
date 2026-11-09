@@ -221,6 +221,8 @@ myelin repo pr list
 myelin --idempotency-key update-pr-7 repo pr update platform 7
 # Merge it once it is approved, up to date, and green; the queue lands one per base branch:
 myelin --idempotency-key queue-pr-7 repo pr merge platform 7 --auto
+# Or land it as one commit with exactly the reviewed tree:
+myelin --idempotency-key squash-pr-7 repo pr merge platform 7 --squash
 myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
 myelin project show
 myelin project list

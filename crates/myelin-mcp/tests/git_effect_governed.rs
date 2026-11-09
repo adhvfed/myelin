@@ -960,12 +960,15 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         expected_old_oid: base.0.clone(),
         head_oid: head.0.clone(),
         head_repo_slug: slug.clone(),
+        method: myelin_git::pr_store::MergeMethod::FastForward,
+        target_oid: String::new(),
     };
     let merge_payload = serde_json::to_vec(&(
         1_u64,
         intent.base_ref.as_str(),
         intent.head_oid.as_str(),
         intent.head_repo_slug.as_str(),
+        intent.method,
     ))
     .unwrap();
     let merge_hash = blake3::hash(&merge_payload).to_hex().to_string();

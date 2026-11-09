@@ -119,6 +119,77 @@ impl ReviewRecord {
     }
 }
 
+/// How a pull request lands on its base. Both require the branch to contain its base, so what
+/// lands has exactly the tree that was reviewed and tested.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeMethod {
+    /// The base moves to the pull request's head commit.
+    #[default]
+    FastForward,
+    /// The base gains one new commit with the head's tree, so its history reads one pull
+    /// request per commit.
+    Squash,
+}
+
+/// Squashed commit summaries beyond this many are counted rather than listed.
+const SQUASH_SUMMARY_LINES: usize = 50;
+
+/// Writes the single commit a squash merge puts on `base_tip`: the head's tree, authored by the
+/// pull request's author and committed by the person merging. Nothing references it until the
+/// base moves, and the same head and base always give the same commit.
+pub fn squash_commit(
+    repo: &DurableGitRepo,
+    repo_loc: &RepoLoc,
+    record: &PrRecord,
+    base_tip: &CoreOid,
+    merger_pseudonym: &str,
+) -> Result<CoreOid, DurableError> {
+    let head = CoreOid::new(record.head_oid.clone());
+    // Only git-authored text enters history: a pull request's title and body can be erased on
+    // request, while its commits are already history. The list is decoration, so a repository too
+    // large to summarise still merges.
+    let (commits, more) = repo
+        .commits_in_pr(&record.base_ref, &record.head_oid, SQUASH_SUMMARY_LINES)
+        .unwrap_or_default();
+    let commits: Vec<_> = commits
+        .into_iter()
+        .filter(|commit| commit.parents.len() < 2)
+        .collect();
+    let mut message = match commits.as_slice() {
+        [only] if !more => format!("{} (#{})\n", only.summary, record.number),
+        _ => format!("Squash pull request #{}\n", record.number),
+    };
+    if commits.len() > 1 || more {
+        message.push('\n');
+        if more {
+            message.push_str("* …earlier commits\n");
+        }
+        for commit in commits.iter().rev() {
+            message.push_str(&format!("* {}\n", commit.summary));
+        }
+    }
+    message.push_str(&format!(
+        "\nMyelin-Pull-Request: myelin://{}/git/pr/{}:{}\n",
+        repo_loc.tenant, repo_loc.repo, record.number
+    ));
+    let time = |oid: &CoreOid| -> Result<i64, DurableError> {
+        Ok(repo
+            .commit_meta_at_oid(oid)?
+            .map(|meta| meta.time)
+            .unwrap_or_default())
+    };
+    let at = time(&head)?.max(time(base_tip)?);
+    repo.write_squash_commit(
+        &head,
+        base_tip,
+        &message,
+        &record.author_pseudonym,
+        merger_pseudonym,
+        at,
+    )
+}
+
 /// A request to merge as soon as the pull request can, with one person's merge authority.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoMerge {
@@ -129,6 +200,8 @@ pub struct AutoMerge {
     /// after scheduling are not theirs to merge.
     #[serde(default)]
     pub head_oid: String,
+    #[serde(default)]
+    pub method: MergeMethod,
 }
 
 /// Why the merge queue gave up on a pull request, kept until someone asks again.
@@ -173,6 +246,9 @@ pub struct PrRecord {
     pub auto_merge: Option<AutoMerge>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_merge_stopped: Option<AutoMergeStopped>,
+    /// The commit the base moved to: the head itself, or the squash of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merged_oid: Option<String>,
 }
 
 impl PrRecord {
@@ -199,6 +275,7 @@ impl PrRecord {
             outstanding_conversations: 0,
             auto_merge: None,
             auto_merge_stopped: None,
+            merged_oid: None,
         }
     }
 
@@ -1126,6 +1203,7 @@ pub enum MergeAttempt {
     RefRefused(crate::receive_pack::RejectReason),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn merge_pr<P: RepoPathResolver>(
     store: &DurablePrStore<P>,
     repo_loc: &RepoLoc,
@@ -1134,6 +1212,7 @@ pub fn merge_pr<P: RepoPathResolver>(
     repo: &DurableGitRepo,
     merger_pseudonym: &str,
     provenance: PushProvenance,
+    method: MergeMethod,
 ) -> Result<MergeAttempt, DurableError> {
     let merged_at_unix = myelin_events::clock::system_clock_reading()
         .map_err(|error| DurableError::Io(format!("Git merge clock unavailable: {error}")))?
@@ -1165,10 +1244,21 @@ pub fn merge_pr<P: RepoPathResolver>(
         });
     }
 
+    let target = match (method, &cur_tip) {
+        (MergeMethod::Squash, Some(tip)) => {
+            squash_commit(repo, repo_loc, &rec, tip, merger_pseudonym)?.0
+        }
+        (MergeMethod::Squash, None) => {
+            return Ok(MergeAttempt::InvalidHead(
+                "a squash merge needs the base branch to exist".into(),
+            ))
+        }
+        (MergeMethod::FastForward, _) => rec.head_oid.clone(),
+    };
     let expected_old = cur_tip
         .map(|o| PushOid::new(o.0))
         .unwrap_or_else(PushOid::zero);
-    let head = PushOid::new(rec.head_oid.clone());
+    let head = PushOid::new(target);
     let push = PushSession {
         updates: vec![ProposedRefUpdate {
             ref_name: base.clone(),
@@ -1192,6 +1282,7 @@ pub fn merge_pr<P: RepoPathResolver>(
                 .map_err(|e| DurableError::Git(format!("PR merge transition: {e}")))?;
             rec.state = pr.state;
             rec.updated_at = Some(merged_at_unix);
+            rec.merged_oid = Some(head.0.clone());
             store.put(repo_loc, &rec)?;
             Ok(MergeAttempt::Merged {
                 base_ref: rec.base_ref,
@@ -1792,6 +1883,7 @@ mod tests {
             &repo,
             "psn:author@acme",
             PushProvenance::NonAgent,
+            MergeMethod::FastForward,
         )
         .unwrap();
         assert!(
@@ -1840,6 +1932,7 @@ mod tests {
                 &repo,
                 "agent-7@acme.noreply",
                 PushProvenance::Agent,
+                MergeMethod::FastForward,
             )
             .unwrap(),
             MergeAttempt::RefRefused(crate::receive_pack::RejectReason::AgentNeedsHuman {
@@ -1861,6 +1954,7 @@ mod tests {
                 &repo,
                 "agent-7@acme.noreply",
                 PushProvenance::HumanApprovedAgent,
+                MergeMethod::FastForward,
             )
             .unwrap(),
             MergeAttempt::Merged { .. }
@@ -1911,6 +2005,7 @@ mod tests {
                 &repo,
                 "psn:m@acme",
                 PushProvenance::NonAgent,
+                MergeMethod::FastForward,
             )
             .unwrap(),
             MergeAttempt::Blocked(_)
@@ -1934,6 +2029,7 @@ mod tests {
                     &repo,
                     "psn:m@acme",
                     PushProvenance::NonAgent,
+                    MergeMethod::FastForward,
                 )
                 .unwrap(),
                 MergeAttempt::Blocked(_)
@@ -1956,6 +2052,7 @@ mod tests {
             &repo,
             "psn:m@acme",
             PushProvenance::NonAgent,
+            MergeMethod::FastForward,
         )
         .unwrap()
         {
@@ -2083,6 +2180,57 @@ mod tests {
     }
 
     #[test]
+    fn a_squash_is_deterministic_and_keeps_erasable_text_out_of_history() {
+        let root = temp_root("squash");
+        let gitstore = DurableGitStore::rooted(&root);
+        let repo = Arc::new(gitstore.create_repo(&loc()).unwrap());
+        let (c1, c2) = seed_main_then_descendant(&repo);
+        let mut record = open_record(3, "refs/heads/main", &c2.0, "author@acme.noreply");
+        record.title = "Codename Bluebird".into();
+
+        let first = squash_commit(&repo, &loc(), &record, &c1, "merger@acme.noreply").unwrap();
+        let again = squash_commit(&repo, &loc(), &record, &c1, "merger@acme.noreply").unwrap();
+        assert_eq!(
+            first, again,
+            "the same head and base always give the same commit"
+        );
+        let meta = repo.commit_meta_at_oid(&first).unwrap().unwrap();
+        assert_eq!(
+            meta.summary, "c2 (#3)",
+            "the commit's own words, not the erasable title"
+        );
+        assert_eq!(meta.parents, vec![c1.0.clone()]);
+        assert_eq!(meta.author_email, "author@acme.noreply");
+        let raw = String::from_utf8(repo.read_object_bounded(&first, 64 * 1024).unwrap()).unwrap();
+        assert!(!raw.contains("Bluebird"));
+        assert!(raw.contains("Myelin-Pull-Request: myelin://acme/git/pr/core:3"));
+
+        let store = DurablePrStore::rooted(&root);
+        store
+            .open_pr(
+                &loc(),
+                &open_record(4, "refs/heads/release", &c2.0, "author@acme.noreply"),
+            )
+            .unwrap();
+        assert_eq!(
+            merge_pr(
+                &store,
+                &loc(),
+                4,
+                &durable_ref_store(repo.clone()),
+                &repo,
+                "merger@acme.noreply",
+                PushProvenance::NonAgent,
+                MergeMethod::Squash,
+            )
+            .unwrap(),
+            MergeAttempt::InvalidHead("a squash merge needs the base branch to exist".into())
+        );
+        assert_eq!(repo.read_ref("refs/heads/release").unwrap(), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn arbitrary_or_nondescendant_head_oid_is_refused() {
         let root = temp_root("head");
         let gitstore = DurableGitStore::rooted(&root);
@@ -2123,6 +2271,7 @@ mod tests {
                 &repo,
                 "psn:m@acme",
                 PushProvenance::NonAgent,
+                MergeMethod::FastForward,
             )
             .unwrap(),
             MergeAttempt::InvalidHead(_)
@@ -2144,6 +2293,7 @@ mod tests {
                     &repo,
                     "psn:m@acme",
                     PushProvenance::NonAgent,
+                    MergeMethod::FastForward,
                 )
                 .unwrap(),
                 MergeAttempt::BehindBase { .. }
