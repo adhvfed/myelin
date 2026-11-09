@@ -194,7 +194,7 @@ fn its_author_or_a_writer_closes_it_and_an_agent_only_its_own() {
 }
 
 #[test]
-fn a_draft_merges_only_once_it_is_marked_ready() {
+fn a_draft_or_closed_pull_request_merges_only_once_it_is_open() {
     let fixture = pull_request(principal("author", PrincipalKind::Human), true);
     fixture.approve();
     assert!(matches!(
@@ -203,6 +203,16 @@ fn a_draft_merges_only_once_it_is_marked_ready() {
     ));
     fixture
         .change(&fixture.author, PrStateChange::MarkReady)
+        .unwrap();
+    fixture
+        .change(&fixture.author, PrStateChange::Close)
+        .unwrap();
+    assert!(matches!(
+        fixture.merge(),
+        Err(DurableError::Conflict(message)) if message == CLOSED_MERGE_REFUSAL
+    ));
+    fixture
+        .change(&fixture.author, PrStateChange::Reopen)
         .unwrap();
     let merged = fixture.merge();
     assert!(

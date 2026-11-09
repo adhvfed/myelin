@@ -105,7 +105,7 @@ impl PullRequest {
     ) -> Result<PrState, LifecycleError> {
         let next = match (self.state, transition) {
             (PrState::Draft, PrTransition::MarkReady) => PrState::Open,
-            (PrState::Draft | PrState::Open, PrTransition::Merge) => {
+            (PrState::Open, PrTransition::Merge) => {
                 if !gate_satisfied {
                     return Err(LifecycleError::MergeGateNotSatisfied);
                 }

@@ -2976,8 +2976,8 @@ impl DurableGitBackend {
             let rec = self
                 .pr_get(&loc, number, actor)?
                 .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
-            if rec.state == PrState::Draft {
-                return Err(DurableError::Conflict(pr_state::DRAFT_MERGE_REFUSAL.into()));
+            if let Some(refusal) = pr_state::merge_refusal(rec.state) {
+                return Err(DurableError::Conflict(refusal.into()));
             }
             let source_loc = Self::loc(&actor.tenant.0, &actor.region.0, &rec.head_repo_slug);
             if !self.repo_authz.authorize_repo_permission(
@@ -3007,12 +3007,12 @@ impl DurableGitBackend {
                 method,
             );
         }
-        if self
+        if let Some(refusal) = self
             .prs
             .get(&loc, number)?
-            .is_some_and(|record| record.state == PrState::Draft)
+            .and_then(|record| pr_state::merge_refusal(record.state))
         {
-            return Err(DurableError::Conflict(pr_state::DRAFT_MERGE_REFUSAL.into()));
+            return Err(DurableError::Conflict(refusal.into()));
         }
         merge_pr(
             &self.prs,

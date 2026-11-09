@@ -1250,6 +1250,11 @@ pub fn merge_pr<P: RepoPathResolver>(
     let mut rec = store
         .get(repo_loc, number)?
         .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
+    if rec.state != PrState::Open {
+        return Err(DurableError::Conflict(
+            crate::pg_pr_store::MERGE_REFUSAL.into(),
+        ));
+    }
 
     let default_ref = RefName::new(repo.default_branch_ref()?);
     let ruleset = store.effective_ruleset_for(repo_loc, &rec.base_ref, &default_ref)?;
@@ -1920,6 +1925,39 @@ mod tests {
             matches!(attempt, MergeAttempt::Blocked(_)),
             "default-closed blocks: {attempt:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn only_an_open_pull_request_moves_its_base() {
+        let root = temp_root("merge-only-open");
+        let gitstore = DurableGitStore::rooted(&root);
+        let repo = Arc::new(gitstore.create_repo(&loc()).unwrap());
+        let (c1, c2) = seed_main_then_descendant(&repo);
+        let store = DurablePrStore::rooted(&root);
+        let mut record = open_record(1, "refs/heads/main", &c2.0, "psn:author@acme");
+        store.open_pr(&loc(), &record).unwrap();
+        let rs = durable_ref_store(repo.clone());
+        for state in [PrState::Draft, PrState::Closed] {
+            record.state = state;
+            store.put(&loc(), &record).unwrap();
+            let refused = merge_pr(
+                &store,
+                &loc(),
+                1,
+                &rs,
+                &repo,
+                "psn:author@acme",
+                PushProvenance::NonAgent,
+                MergeMethod::FastForward,
+            );
+            assert!(
+                matches!(&refused, Err(DurableError::Conflict(message))
+                    if message == crate::pg_pr_store::MERGE_REFUSAL),
+                "{state:?}: {refused:?}"
+            );
+            assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c1.clone()));
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 

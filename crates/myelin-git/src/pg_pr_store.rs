@@ -535,6 +535,8 @@ impl From<crate::pr_store::PrStateChange> for PrMutation {
 }
 
 const CLOSE_REFUSAL: &str = "only an open pull request can be closed";
+/// Checked under the row lock, so a merge that lost a race with closing does not land.
+pub const MERGE_REFUSAL: &str = "only an open pull request can be merged";
 const REOPEN_REFUSAL: &str = "only a closed pull request can be reopened";
 const MARK_READY_REFUSAL: &str = "only a draft pull request can be marked ready for review";
 
@@ -2800,6 +2802,9 @@ impl PgPrStore {
                         }
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode merge PR"))?;
+                        if matches!(record.state, PrState::Draft | PrState::Closed) {
+                            return Err(pg_query(MERGE_REFUSAL));
+                        }
                         if record.state == PrState::Merged
                             || record.head_oid != intent.head_oid
                             || record.head_repo_slug != intent.head_repo_slug
@@ -3539,9 +3544,14 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         DurableError::Conflict("the automatic merge changed before it could be stopped".into())
     } else if message.contains("an automatic merge needs the person") {
         DurableError::InvalidInput("an automatic merge needs the person who asked for it".into())
-    } else if let Some(refusal) = [CLOSE_REFUSAL, REOPEN_REFUSAL, MARK_READY_REFUSAL]
-        .into_iter()
-        .find(|refusal| message.contains(refusal))
+    } else if let Some(refusal) = [
+        CLOSE_REFUSAL,
+        REOPEN_REFUSAL,
+        MARK_READY_REFUSAL,
+        MERGE_REFUSAL,
+    ]
+    .into_iter()
+    .find(|refusal| message.contains(refusal))
     {
         DurableError::Conflict(refusal.into())
     } else if message.contains("different repository")
@@ -5045,6 +5055,74 @@ mod tests {
         let root = std::env::temp_dir().join(format!("myelin-pg-pr-live-{suffix}"));
         let git_store = crate::durable::DurableGitStore::rooted(&root);
         let policy_store = DurablePrStore::rooted(&root);
+        {
+            // A merge that lost a race with closing must not land: the row lock decides.
+            let slug = "merge-closed";
+            let loc = RepoLoc::new(&tenant_a, &region, slug);
+            let target = Arc::new(git_store.create_repo(&loc).unwrap());
+            let (base, head) = seed_repo(&target);
+            let opened = store
+                .open(
+                    &scope_a,
+                    slug,
+                    record(head.as_str(), "merge closed", slug),
+                    &PrOperationId::parse("open-merge-closed").unwrap(),
+                    &actor,
+                )
+                .unwrap();
+            store
+                .apply_mutation(
+                    &scope_a,
+                    slug,
+                    opened.number,
+                    PrMutation::Close,
+                    &PrOperationId::parse("close-merge-closed").unwrap(),
+                    &actor,
+                )
+                .unwrap();
+            let intent = MergeIntent {
+                operation_id: PrOperationId::parse("merge-merge-closed")
+                    .unwrap()
+                    .as_str()
+                    .into(),
+                actor_subject_id: actor.principal_id.0.clone(),
+                ref_update_provenance: PushProvenance::NonAgent,
+                base_ref: "refs/heads/main".into(),
+                expected_old_oid: base.0.clone(),
+                head_oid: head.0.clone(),
+                head_repo_slug: slug.into(),
+                method: crate::pr_store::MergeMethod::FastForward,
+                target_oid: String::new(),
+            };
+            let refused = store.begin_merge(
+                &scope_a,
+                slug,
+                opened.number,
+                MergeAdmission {
+                    command_hash: merge_payload_hash(opened.number, &intent).unwrap(),
+                    intent,
+                    ctx: store.operation_context(&scope_a, &actor).unwrap(),
+                    ruleset: crate::lifecycle::BranchProtectionRuleset {
+                        ref_pattern: "refs/heads/main".into(),
+                        required_contexts: vec![],
+                        required_approvals: 0,
+                        require_codeowner_review: false,
+                        require_conversation_resolution: false,
+                        allow_force_push: false,
+                    },
+                    project_checks: false,
+                },
+            );
+            assert!(
+                matches!(&refused, Err(DurableError::Conflict(message)) if message == MERGE_REFUSAL),
+                "{refused:?}"
+            );
+            assert!(store
+                .pending_merge_intent(&scope_a, slug, opened.number)
+                .unwrap()
+                .is_none());
+            assert_eq!(target.read_ref("refs/heads/main").unwrap(), Some(base));
+        }
         for slug in ["merge-before", "merge-after", "merge-cancel"] {
             let loc = RepoLoc::new(&tenant_a, &region, slug);
             let target = Arc::new(git_store.create_repo(&loc).unwrap());

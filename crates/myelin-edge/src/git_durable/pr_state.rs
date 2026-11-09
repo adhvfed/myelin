@@ -7,6 +7,18 @@ pub use myelin_git::pr_store::PrStateChange;
 
 pub(super) const DRAFT_MERGE_REFUSAL: &str =
     "a draft pull request cannot be merged; mark it ready for review first";
+pub(super) const CLOSED_MERGE_REFUSAL: &str =
+    "a closed pull request cannot be merged; reopen it first";
+
+/// Why a pull request in this state cannot merge, said before any merge work starts. The store
+/// checks again under its row lock.
+pub(super) fn merge_refusal(state: PrState) -> Option<&'static str> {
+    match state {
+        PrState::Draft => Some(DRAFT_MERGE_REFUSAL),
+        PrState::Closed => Some(CLOSED_MERGE_REFUSAL),
+        PrState::Open | PrState::Merged => None,
+    }
+}
 
 fn what(change: PrStateChange) -> &'static str {
     match change {

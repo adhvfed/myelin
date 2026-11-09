@@ -4,6 +4,28 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Only an open pull request merges
+
+Closing a pull request was new, and nothing on the merge path knew it.
+- The durable merge saga refused an already-merged pull request under its row lock, but not a
+  closed or draft one. `POST /merge` would have landed a closed pull request.
+- The queue re-reads a pull request before merging it. A close landing after that re-read would
+  still have merged it.
+- The in-memory merge moved the base before its state transition failed.
+
+Each layer now refuses:
+- The edge says why before any work starts: reopen it first, or mark it ready first.
+- The saga refuses under the row lock.
+- The in-memory merge refuses before it touches a ref.
+- The pure lifecycle model merges only from open.
+
+Proof: the live Postgres PR store test closes a pull request, then begins its merge directly. The
+merge is refused under the lock, nothing is left pending, and the base is unmoved. With the guard
+removed the same test fails, because `begin_merge` records the merge. An in-memory test proves
+neither a draft nor a closed pull request moves its base. The close-and-reopen journey shows a
+closed pull request's merge refused with a 409 on the real stack. The merge-queue journeys still
+pass.
+
 ## 2026-11-09 — Pull requests can be closed, reopened, and marked ready
 
 A pull request could not be abandoned, and a draft could never become ready. The pure lifecycle

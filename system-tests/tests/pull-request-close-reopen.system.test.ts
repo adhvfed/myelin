@@ -101,6 +101,12 @@ describe("a pull request's life: draft, ready, closed, reopened", () => {
     expect(await keyed("repo", "pr", "close", slug, n)).toBe(`closed #${number} Add a greeting\n`);
     expect(await view()).toContain(`#${number} Add a greeting [closed]\n`);
     await reviewRequest("done");
+    const closedMerge = await systemClient.json(`${project.path}/prs/${number}/merge`, {
+      method: "POST",
+      body: {},
+      expectedStatus: 409,
+    });
+    expect(JSON.stringify(closedMerge.body)).toContain("a closed pull request cannot be merged");
 
     const moved = (await project.writeFile(branch, "farewell.txt", "goodbye\n")).commitOid;
     expect(await keyed("repo", "pr", "reopen", slug, n)).toBe(
