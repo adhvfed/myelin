@@ -4,6 +4,47 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Review fixes for editing pull requests
+
+An independent review of the edit slice found no way for an edit to race erasure, and no
+plaintext leak. It did find two things worth fixing first:
+- **A description edit could change what a scheduled merge closes.** Merging closes the issues the
+  description names, under the authority of whoever scheduled it. An author could approve-bait a
+  reviewer, then edit `Closes ENG-1` into a list of other issues before the queue landed it. A
+  description change now stops a scheduled merge, atomically with the edit. The scheduler gets
+  the usual stopped-merge notice and can schedule again after reading the new text. A retitle, or
+  an edit that keeps the description, leaves the schedule alone.
+- **Erasure did not reach the keyed digest.** The digest was keyed to the cell root, which erasure
+  never destroys, so a root holder could still confirm a guessed title. The erasure batch now
+  replaces the digests of an erased pull request's open and edit commands with a fixed marker.
+  This is verified on the dogfood database: the newest erased pull request's open command carries
+  the marker, and no erased pull request in the run kept a real digest.
+
+Smaller fixes:
+- A description whose `Closes` lines exceed the parser's limits is refused with a 400. Before, it
+  was a bare 500 on open and on edit.
+- An edit during the author's erasure says to try again, instead of returning a 500.
+- An edit that changes nothing records nothing.
+- Editing a merged pull request no longer claims new `Closes` edges.
+- The keyed digest takes a typed purpose, so no subsystem can reproduce another's digests.
+
+Known gaps:
+- Conversation and review receipts still hash comment bodies unkeyed (`pr_threads.rs`), and so do
+  issue-creation receipts. They need the same treatment.
+- Replaying an edit returns the current text, not the text of that edit. Nothing stores old text,
+  by design.
+- Open commands recorded with the old unkeyed hash conflict on retry. There is no production
+  release.
+
+Proof:
+- Store tests cover the stop on a changed description, and the retitle and same-text cases that
+  keep the schedule.
+- A notification test shows the stopped notice raised by the edit, and not repeated by a later
+  edit.
+- Edge tests cover the trailer limit and the no-op edit.
+- Real-stack privacy, CLI, close-and-reopen and merge-queue journeys pass, alongside the database
+  check above.
+
 ## 2026-11-09 — A pull request's title and description can be edited
 
 A pull request's title and description were fixed at open. A typo stayed, a description could not

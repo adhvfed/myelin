@@ -14,6 +14,10 @@ use crate::pr_store::PrRecord;
 pub const GIT_PR_TEXT_ERASURE_OPERATION_TABLE: &str = "git_pr_text_erasure_operation";
 pub const ERASED_PR_TITLE: &str = "[erased pull request title]";
 pub const ERASED_TITLE_KEY_REF: &str = "erased";
+/// Replaces the keyed digest of an erased pull request's open and edit commands, so nothing derived
+/// from its text survives; a retry of such a command now conflicts instead of replaying.
+const ERASED_COMMAND_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 pub const ERASED_TITLE_NONCE: [u8; 12] = [0; 12];
 pub const ERASED_TITLE_CIPHERTEXT: [u8; 1] = [0];
 const PR_TEXT_ERASURE_BATCH_MAX: i64 = 100;
@@ -391,6 +395,14 @@ impl PgPrStore {
                         let mut record: PrRecord = serde_json::from_value(value).map_err(|_| pg_query("decode erased PR projection"))?;
                         record.title = ERASED_PR_TITLE.into();
                         record.body_md = None;
+                        let number = i64::try_from(record.number).map_err(|_| pg_query("encode erased PR number"))?;
+                        sqlx::query(
+                            "UPDATE git_pr_command SET payload_hash=$5 \
+                             WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND pr_number=$4 \
+                               AND command_kind IN ('open','edit')",
+                        )
+                        .bind(&tenant).bind(&region).bind(&repo).bind(number).bind(ERASED_COMMAND_DIGEST)
+                        .execute(&mut *conn).await.map_err(|_| pg_query("scrub erased PR command digests"))?;
                         co_commit_event(
                             conn,
                             minter.clone(),

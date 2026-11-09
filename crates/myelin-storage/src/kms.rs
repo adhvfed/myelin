@@ -270,6 +270,22 @@ impl CellRoot {
     }
 }
 
+/// What a keyed digest identifies; each purpose has its own key, so no subsystem can reproduce
+/// another's digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigestPurpose {
+    /// A pull-request command that carries its title or description.
+    PullRequestTextCommand,
+}
+
+impl DigestPurpose {
+    fn context(self) -> &'static str {
+        match self {
+            Self::PullRequestTextCommand => "myelin.git.pr-text-command.v1",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SealKey(RawKey);
 
@@ -996,8 +1012,8 @@ impl KmsEngine {
 
     /// A digest of `value` keyed to the cell: equal inputs match, but nobody without the key can
     /// confirm a guess. For durable identities derived from personal text.
-    pub fn keyed_digest(&self, context: &str, value: &[u8]) -> String {
-        self.blind_index(context, value)
+    pub fn keyed_digest(&self, purpose: DigestPurpose, value: &[u8]) -> String {
+        self.blind_index(purpose.context(), value)
     }
 
     pub fn export_kek(&self, id: &KekId) -> Result<Option<ExportedKek>, KmsError> {

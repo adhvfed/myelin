@@ -29,6 +29,17 @@ fn what(change: PrStateChange) -> &'static str {
     }
 }
 
+/// Refuses a description whose `Closes` lines exceed what a merge will act on.
+pub(super) fn closes_targets_of(tenant: &str, body: &str) -> Result<(), DurableError> {
+    myelin_git::typed_edges::closes_issue_targets(tenant, body)
+        .map(|_| ())
+        .map_err(|error| {
+            DurableError::InvalidInput(format!(
+                "the description names too many issues to close ({error})"
+            ))
+        })
+}
+
 /// The text a person or agent asks to change; at least one is present.
 pub struct PrEdit<'a> {
     pub title: Option<&'a str>,
@@ -105,6 +116,9 @@ impl DurableGitBackend {
                 "an edit changes the title, the description, or both".into(),
             ));
         }
+        if let Some(body) = edit.body_md {
+            closes_targets_of(&loc.tenant, body)?;
+        }
         let record = self
             .pr_get(&loc, number, actor.principal)?
             .ok_or_else(|| DurableError::NotFound("pull request not found".into()))?;
@@ -115,6 +129,14 @@ impl DurableGitBackend {
             false,
             "edit this pull request",
         )?;
+        let same_title = title.is_none_or(|title| title == record.title);
+        let same_body = edit
+            .body_md
+            .is_none_or(|body| (!body.is_empty()).then_some(body) == record.body_md.as_deref());
+        if same_title && same_body {
+            // Nothing to record: no event, and a scheduled merge keeps its place.
+            return Ok(record);
+        }
         self.pr_mutate(
             &loc,
             number,

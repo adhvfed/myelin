@@ -119,6 +119,13 @@ fn land(
 }
 
 impl Fixture {
+    fn record(&self) -> PrRecord {
+        self.backend
+            .pr_get(&loc(), self.number, &self.author)
+            .unwrap()
+            .unwrap()
+    }
+
     fn change(&self, actor: &Principal, change: PrStateChange) -> Result<PrRecord, DurableError> {
         self.backend.change_pr_state_with_operation(
             RepoActorContext::new(TENANT, REGION, REPO, actor).for_pr(self.number),
@@ -457,4 +464,16 @@ fn its_author_or_a_writer_edits_its_title_and_description() {
             Err(DurableError::InvalidInput(_))
         ));
     }
+    let too_many: String = (1..=101).map(|n| format!("Closes ENG-{n}\n")).collect();
+    assert!(matches!(
+        edit(&fixture.author, None, Some(&too_many)),
+        Err(DurableError::InvalidInput(message))
+            if message.starts_with("the description names too many issues to close")
+    ));
+    let before = fixture.record();
+    let unchanged = edit(&fixture.author, Some("Feature, explained"), Some("")).unwrap();
+    assert_eq!(
+        unchanged.updated_at, before.updated_at,
+        "an edit that changes nothing records nothing"
+    );
 }

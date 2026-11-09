@@ -2219,6 +2219,9 @@ impl DurableGitBackend {
                 myelin_git::typed_edges::MAX_CLOSES_MESSAGE_BYTES
             )));
         }
+        if let Some(body) = body_md.as_deref() {
+            pr_state::closes_targets_of(tenant, body)?;
+        }
         let number = if self.pg_prs.is_some() {
             0
         } else {

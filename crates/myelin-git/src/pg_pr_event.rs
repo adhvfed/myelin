@@ -162,7 +162,10 @@ pub(crate) async fn co_commit_event(
         )
         .map_err(|_| pg_query("derive automatic-merge signals"))?
     };
-    let closes_targets = if matches!(event_type, GIT_PR_OPENED | GIT_PR_EDITED) {
+    // A merged pull request closed what it closed; editing it afterwards claims nothing new.
+    let closes_targets = if event_type == GIT_PR_OPENED
+        || (event_type == GIT_PR_EDITED && record.state != crate::lifecycle::PrState::Merged)
+    {
         closes_issue_targets(&loc.tenant, record.body_md.as_deref().unwrap_or_default())
             .map_err(|_| pg_query("parse PR lifecycle trailers"))?
     } else {

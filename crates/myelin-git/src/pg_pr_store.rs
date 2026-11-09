@@ -543,13 +543,14 @@ pub const MERGE_REFUSAL: &str = "only an open pull request can be merged";
 const REOPEN_REFUSAL: &str = "only a closed pull request can be reopened";
 const MARK_READY_REFUSAL: &str = "only a draft pull request can be marked ready for review";
 const EDIT_NOTHING_REFUSAL: &str = "an edit changes the title, the description, or both";
+pub const DESCRIPTION_CHANGED_STOP: &str =
+    "its description changed after the merge was scheduled; schedule it again to merge it";
 const EDIT_TITLE_REFUSAL: &str =
     "a pull request title must be 1-512 bytes without surrounding space";
 const EDIT_BODY_REFUSAL: &str = "a pull request description must be at most 64 KiB";
 const ERASED_TEXT_REFUSAL: &str = "this pull request's text was erased, so it cannot be edited";
-/// Pull-request text commands are identified by a digest keyed to the cell, so a retained ledger
-/// row cannot confirm a guessed title after the text is erased.
-const PR_TEXT_COMMAND_CONTEXT: &str = "myelin.git.pr-text-command.v1";
+const TEXT_ERASURE_IN_PROGRESS: &str =
+    "this pull request's text is being erased; try again once that finishes";
 pub const REOPEN_CLOSER_REFUSAL: &str =
     "someone else closed this pull request; reopening it takes push access";
 
@@ -752,7 +753,19 @@ impl PrMutation {
                     if body.len() > crate::typed_edges::MAX_CLOSES_MESSAGE_BYTES {
                         return Err(EDIT_BODY_REFUSAL);
                     }
-                    record.body_md = (!body.is_empty()).then_some(body);
+                    let body = (!body.is_empty()).then_some(body);
+                    // Merging closes the issues the description names, under the authority of
+                    // whoever scheduled it; they must see a changed description before it lands.
+                    if body != record.body_md {
+                        if let Some(request) = record.auto_merge.take() {
+                            record.auto_merge_stopped = Some(crate::pr_store::AutoMergeStopped {
+                                reason: DESCRIPTION_CHANGED_STOP.into(),
+                                at: updated_at_unix,
+                                requested_by: request.requested_by,
+                            });
+                        }
+                    }
+                    record.body_md = body;
                 }
             }
             Self::Touch => {}
@@ -3429,7 +3442,11 @@ fn text_command_hash(
         serde_json::to_vec(command)
             .map_err(|_| DurableError::Git("encode PR command payload failed".into()))?,
     );
-    Ok(kms.keyed_digest(PR_TEXT_COMMAND_CONTEXT, &bytes))
+    // Keyed, so a retained ledger row cannot confirm a guessed title; erasure also scrubs it.
+    Ok(kms.keyed_digest(
+        myelin_storage::kms::DigestPurpose::PullRequestTextCommand,
+        &bytes,
+    ))
 }
 
 fn merge_payload_hash(number: u64, intent: &MergeIntent) -> Result<String, DurableError> {
@@ -3619,6 +3636,8 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         DurableError::Conflict("the automatic merge changed before it could be stopped".into())
     } else if message.contains("an automatic merge needs the person") {
         DurableError::InvalidInput("an automatic merge needs the person who asked for it".into())
+    } else if message.contains("while subject erasure is in progress") {
+        DurableError::Conflict(TEXT_ERASURE_IN_PROGRESS.into())
     } else if message.contains(REOPEN_CLOSER_REFUSAL) {
         DurableError::Forbidden(REOPEN_CLOSER_REFUSAL.into())
     } else if message.contains("merge command is pending")
@@ -4198,6 +4217,40 @@ mod tests {
         }
         assert_eq!(record.title, "Fix the onboarding typo");
 
+        record.body_md = Some("Closes ENG-1".into());
+        PrMutation::RequestAutoMerge {
+            requested_by: "carol".into(),
+            method: crate::pr_store::MergeMethod::FastForward,
+        }
+        .apply_to_at(&mut record, 400)
+        .unwrap();
+        edit(Some("Fix every onboarding typo"), None)
+            .apply_to_at(&mut record, 500)
+            .unwrap();
+        assert!(record.auto_merge.is_some(), "a retitle keeps the schedule");
+        edit(None, Some("Closes ENG-1"))
+            .apply_to_at(&mut record, 550)
+            .unwrap();
+        assert!(
+            record.auto_merge.is_some(),
+            "the same description keeps it too"
+        );
+        edit(None, Some("Closes ENG-7"))
+            .apply_to_at(&mut record, 600)
+            .unwrap();
+        assert_eq!(
+            record.auto_merge, None,
+            "a new description waits for whoever scheduled"
+        );
+        assert_eq!(
+            record.auto_merge_stopped,
+            Some(crate::pr_store::AutoMergeStopped {
+                reason: DESCRIPTION_CHANGED_STOP.into(),
+                at: 600,
+                requested_by: "carol".into(),
+            })
+        );
+
         let kms = KmsEngine::new();
         let mutation = edit(Some("Fix the onboarding typo"), None);
         assert_ne!(
@@ -4208,6 +4261,12 @@ mod tests {
         assert!(matches!(
             pg_error(myelin_storage::PgError::Query(ERASED_TEXT_REFUSAL.into())),
             DurableError::Conflict(message) if message == ERASED_TEXT_REFUSAL
+        ));
+        assert!(matches!(
+            pg_error(myelin_storage::PgError::Query(
+                "PR text cannot be written while subject erasure is in progress".into()
+            )),
+            DurableError::Conflict(message) if message == TEXT_ERASURE_IN_PROGRESS
         ));
     }
 
