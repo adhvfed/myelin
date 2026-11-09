@@ -418,6 +418,11 @@ impl DurableGitBackend {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_repo_for_test(&self, loc: &RepoLoc) -> Result<DurableGitRepo, DurableError> {
+        self.store.open_repo(loc)
+    }
+
     pub fn with_repo_authorizer(
         mut self,
         repo_authz: Arc<dyn RepoAuthorizer>,

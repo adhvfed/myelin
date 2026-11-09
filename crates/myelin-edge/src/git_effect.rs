@@ -18,7 +18,7 @@ use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
 use crate::git_durable::{
     describe_conflicts, map_durable_err, AgentFileWrite, BranchUpdate, DurableGitBackend,
-    RepoActorContext,
+    PrStateChange, RepoActorContext,
 };
 use crate::repo_authz::RepoPermission;
 
@@ -411,6 +411,36 @@ impl GitEffectApi {
                     Err(error) => deny_durable_error(error),
                 }
             }
+            "git.mark_pr_ready" | "git.close_pr" => {
+                let (repo, number) = match repo_and_number(args) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Pull) {
+                    return denied;
+                }
+                let change = if tool == "git.close_pr" {
+                    PrStateChange::Close
+                } else {
+                    PrStateChange::MarkReady
+                };
+                // The backend lets an agent change only the pull requests it opened.
+                match self.backend.change_pr_state_with_operation(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    change,
+                    operation_id,
+                ) {
+                    Ok(_) => applied_resource(
+                        run,
+                        &format!("{}:#{number}", change.action()),
+                        format!("myelin://{t}/git/pr/{repo}:{number}"),
+                        serde_json::json!({ "repo": repo, "number": number }),
+                    ),
+                    // Its refusals say who may change the pull request, so the agent can stop.
+                    Err(DurableError::Forbidden(reason)) => EffectResult::Denied(reason),
+                    Err(error) => deny_durable_error(error),
+                }
+            }
             "git.merge" => {
                 let (repo, number) = match repo_and_number(args) {
                     Ok(v) => v,
@@ -598,6 +628,7 @@ fn repo_and_number(args: &Value) -> Result<(&str, u64), EffectResult> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_git::lifecycle::PrState;
     use myelin_identity::{PrincipalId, PrincipalKind, RunToken, RuntimeRef};
     use myelin_identity_service::machine_auth::StructuralTokenVerifier;
     use myelin_identity_service::revocation::RevocationStore;
@@ -642,6 +673,113 @@ mod tests {
             EffectResult::Denied("forbidden".into()),
             "forbidden policy internals stay private"
         );
+    }
+
+    #[test]
+    fn an_agent_readies_and_closes_only_the_pull_requests_it_opened() {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-git-effect-pr-state-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
+        backend.create_repo("acme", "eu-west", "alpha").unwrap();
+        let repo = backend
+            .open_repo_for_test(&RepoLoc::new("acme", "eu-west", "alpha"))
+            .unwrap();
+        let land = |gitref: &str, start: Option<&str>, path: &str| {
+            let (commit, _, prior) = repo
+                .build_file_commit_from_ref(gitref, start, path, b"x\n", "change", "psn", "psn")
+                .unwrap();
+            repo.update_ref_cas(gitref, prior.as_ref(), Some(&commit), "seed", "psn")
+                .unwrap();
+            commit
+        };
+        land("refs/heads/main", None, "README.md");
+        let mut agent = Principal::stub(
+            PrincipalId("agent:claude".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("rt-local".into()),
+                on_behalf_of: None,
+            },
+            TenantId("acme".into()),
+        );
+        agent.region = Region("eu-west".into());
+        let mut person = Principal::stub(
+            PrincipalId("alice".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        );
+        person.region = Region("eu-west".into());
+        let open = |author: &Principal, branch: &str, draft: bool| {
+            let head = land(
+                &format!("refs/heads/{branch}"),
+                Some("refs/heads/main"),
+                branch,
+            );
+            backend
+                .open_pr_with_operation(
+                    "acme",
+                    "eu-west",
+                    "alpha",
+                    &serde_json::json!({
+                        "title": branch, "base_ref": "refs/heads/main",
+                        "head_ref": format!("refs/heads/{branch}"), "head_oid": head.0,
+                        "draft": draft, "reviewers": [],
+                    }),
+                    author,
+                    &PrOperationId::parse(&format!("open-{branch}")).unwrap(),
+                )
+                .unwrap()
+                .number
+        };
+        let own = open(&agent, "agent-work", true);
+        let theirs = open(&person, "alice-work", false);
+        let api = GitEffectApi::new(
+            backend.clone(),
+            "acme",
+            "eu-west",
+            agent.clone(),
+            agent.clone(),
+            Arc::new(RunTokenAuthorizer::new(
+                Arc::new(StructuralTokenVerifier::new()),
+                RevocationStore::new(),
+            )),
+        );
+        let run = |tool: &str, number: u64, key: &str| {
+            api.apply_tool(
+                &RunCtx(key.into()),
+                tool,
+                &serde_json::json!({ "repo": "alpha", "number": number }),
+                &PrOperationId::parse(key).unwrap(),
+            )
+        };
+        let state = |number: u64| {
+            backend
+                .get_pr("acme", "eu-west", "alpha", number, &agent)
+                .unwrap()
+                .unwrap()
+                .state
+        };
+
+        assert!(matches!(
+            run("git.mark_pr_ready", own, "ready-own"),
+            EffectResult::AppliedResource { .. }
+        ));
+        assert_eq!(state(own), PrState::Open);
+        assert_eq!(
+            run("git.close_pr", theirs, "close-theirs"),
+            EffectResult::Denied("an agent changes only the pull requests it opened".into())
+        );
+        assert_eq!(state(theirs), PrState::Open);
+        assert!(matches!(
+            run("git.close_pr", own, "close-own"),
+            EffectResult::AppliedResource { .. }
+        ));
+        assert_eq!(state(own), PrState::Closed);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

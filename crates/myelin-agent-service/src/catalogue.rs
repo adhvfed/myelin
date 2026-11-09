@@ -242,6 +242,8 @@ mod tests {
             "git.open_pr",
             "git.write_file",
             "git.update_branch",
+            "git.mark_pr_ready",
+            "git.close_pr",
             "ci.read_run",
             "ci.read_log",
             "ci.retry_run",

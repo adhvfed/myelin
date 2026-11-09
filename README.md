@@ -364,6 +364,11 @@ base into the pull request's branch on the server, under the same protected-bran
 agent file write. A clean merge keeps the reviews on the change; a conflict names the files and
 writes nothing.
 
+`git.mark_pr_ready` and `git.close_pr` let an agent finish or abandon its own work. It can open a
+draft, mark it ready once its checks pass, or close a pull request it no longer stands behind. An
+agent changes only the pull requests it opened. A person can reopen what it closed, and its close
+cannot undo theirs.
+
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous
 two-segment events such as `ci.result` use `--subject-type run`. Myelin currently admits subjects

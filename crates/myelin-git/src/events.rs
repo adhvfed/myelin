@@ -102,6 +102,16 @@ pub const GIT_UPDATE_BRANCH_APPLIED: &str = "git.update_branch.applied";
 pub const GIT_UPDATE_BRANCH_GATED: &str = "git.update_branch.gated";
 pub const GIT_UPDATE_BRANCH_DENIED: &str = "git.update_branch.denied";
 pub const GIT_UPDATE_BRANCH_INDETERMINATE: &str = "git.update_branch.indeterminate";
+pub const GIT_MARK_PR_READY_ATTEMPTED: &str = "git.mark_pr_ready.attempted";
+pub const GIT_MARK_PR_READY_APPLIED: &str = "git.mark_pr_ready.applied";
+pub const GIT_MARK_PR_READY_GATED: &str = "git.mark_pr_ready.gated";
+pub const GIT_MARK_PR_READY_DENIED: &str = "git.mark_pr_ready.denied";
+pub const GIT_MARK_PR_READY_INDETERMINATE: &str = "git.mark_pr_ready.indeterminate";
+pub const GIT_CLOSE_PR_ATTEMPTED: &str = "git.close_pr.attempted";
+pub const GIT_CLOSE_PR_APPLIED: &str = "git.close_pr.applied";
+pub const GIT_CLOSE_PR_GATED: &str = "git.close_pr.gated";
+pub const GIT_CLOSE_PR_DENIED: &str = "git.close_pr.denied";
+pub const GIT_CLOSE_PR_INDETERMINATE: &str = "git.close_pr.indeterminate";
 pub const GIT_SUBMIT_REVIEW_ATTEMPTED: &str = "git.submit_review.attempted";
 pub const GIT_SUBMIT_REVIEW_APPLIED: &str = "git.submit_review.applied";
 pub const GIT_SUBMIT_REVIEW_GATED: &str = "git.submit_review.gated";
@@ -152,6 +162,16 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_UPDATE_BRANCH_GATED,
     GIT_UPDATE_BRANCH_DENIED,
     GIT_UPDATE_BRANCH_INDETERMINATE,
+    GIT_MARK_PR_READY_ATTEMPTED,
+    GIT_MARK_PR_READY_APPLIED,
+    GIT_MARK_PR_READY_GATED,
+    GIT_MARK_PR_READY_DENIED,
+    GIT_MARK_PR_READY_INDETERMINATE,
+    GIT_CLOSE_PR_ATTEMPTED,
+    GIT_CLOSE_PR_APPLIED,
+    GIT_CLOSE_PR_GATED,
+    GIT_CLOSE_PR_DENIED,
+    GIT_CLOSE_PR_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,
@@ -243,6 +263,16 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_UPDATE_BRANCH_GATED,
     GIT_UPDATE_BRANCH_DENIED,
     GIT_UPDATE_BRANCH_INDETERMINATE,
+    GIT_MARK_PR_READY_ATTEMPTED,
+    GIT_MARK_PR_READY_APPLIED,
+    GIT_MARK_PR_READY_GATED,
+    GIT_MARK_PR_READY_DENIED,
+    GIT_MARK_PR_READY_INDETERMINATE,
+    GIT_CLOSE_PR_ATTEMPTED,
+    GIT_CLOSE_PR_APPLIED,
+    GIT_CLOSE_PR_GATED,
+    GIT_CLOSE_PR_DENIED,
+    GIT_CLOSE_PR_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,

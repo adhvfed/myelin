@@ -4,6 +4,29 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Agents can ready and close their own pull requests
+
+An agent could open a draft pull request but never mark it ready. It could also never withdraw a
+pull request it no longer stood behind. Two governed tools close that gap:
+- `git.mark_pr_ready` marks a draft the agent opened ready for review.
+- `git.close_pr` closes a pull request the agent opened.
+
+Neither needs approval. Both act only on the agent's own pull requests and are reversible by a
+person, so a human approval would add only ceremony.
+
+Both tools run through the same backend as the HTTP routes. Every rule there applies: an agent
+changes only what it opened, and it never reopens a person's close. A refusal reaches the agent as
+the backend words it, so the agent can stop instead of retrying. Other forbidden errors stay
+opaque. Each tool has its own audit events (`git.mark_pr_ready.*`, `git.close_pr.*`) and an entry
+in the MCP manifest.
+
+Proof: an effect test drives both tools against an in-memory backend.
+- The agent readies its own draft and closes it.
+- Closing a person's pull request is refused with "an agent changes only the pull requests it
+  opened", and that pull request stays open.
+
+The registry, catalogue, and audit-taxonomy tests include the new tools.
+
 ## 2026-11-09 — The pull request page closes, reopens, and readies
 
 The server learned to close, reopen and mark ready, but the web page had not. A draft whose gate

@@ -786,6 +786,20 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
+            local_name: "mark_pr_ready",
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1,"description":"a draft pull request this agent opened, now ready for review and merging"}},"additionalProperties":false}"#,
+            requires_approval: false,
+            required_caps: &["repo.push"],
+            handler: Handler::Lifecycle,
+        },
+        AgentToolDef {
+            local_name: "close_pr",
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1,"description":"a pull request this agent opened and abandons; a person can reopen it"}},"additionalProperties":false}"#,
+            requires_approval: false,
+            required_caps: &["repo.push"],
+            handler: Handler::Lifecycle,
+        },
+        AgentToolDef {
             local_name: "submit_review",
             input_schema: r#"{"type":"object","required":["repo","number","verdict"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"verdict":{"type":"string","enum":["approve","request_changes","comment"]}},"additionalProperties":false}"#,
             requires_approval: false,
