@@ -2240,7 +2240,7 @@ impl DurableGitBackend {
                 ));
             }
             let author = actor.principal_id.0.as_str();
-            let mut requested = std::collections::BTreeSet::new();
+            let mut requested = std::collections::BTreeMap::new();
             for reviewer in reviewers {
                 let reviewer = reviewer.as_str().ok_or_else(|| {
                     DurableError::Git("open-PR reviewer ids must be strings".into())
@@ -2256,23 +2256,49 @@ impl DurableGitBackend {
                     ));
                 }
                 if reviewer != author {
-                    requested.insert(format!("{reviewer}@{tenant}.noreply"));
+                    let is_agent = self.requested_reviewer_is_agent(actor, reviewer)?;
+                    requested.insert(format!("{reviewer}@{tenant}.noreply"), is_agent);
                 }
             }
-            rec.reviews.extend(
-                requested
-                    .into_iter()
-                    .map(|reviewer_pseudonym| ReviewRecord {
-                        reviewer_pseudonym,
-                        state: ReviewState::Requested,
-                        is_agent: false,
-                    }),
-            );
+            rec.reviews
+                .extend(
+                    requested
+                        .into_iter()
+                        .map(|(reviewer_pseudonym, is_agent)| ReviewRecord {
+                            reviewer_pseudonym,
+                            state: ReviewState::Requested,
+                            is_agent,
+                        }),
+                );
         }
         let now = now_unix()?;
         rec.created_at = Some(now);
         rec.updated_at = Some(now);
         self.pr_open(&loc, rec, operation_id, actor)
+    }
+
+    /// Whether `reviewer` is an agent, once the directory confirms it is an active person or agent
+    /// of the requester's tenant. Without a directory, as in tests, every id is taken as a person.
+    fn requested_reviewer_is_agent(
+        &self,
+        requester: &Principal,
+        reviewer: &str,
+    ) -> Result<bool, DurableError> {
+        let Some(directory) = &self.principals else {
+            return Ok(false);
+        };
+        let scope = TenantScope::from_verified_token(requester, requester.region.clone());
+        match directory.get_principal(&scope, &PrincipalId(reviewer.into())) {
+            Ok(Some(row)) if row.status == PrincipalStatus::Active => {
+                Ok(matches!(row.kind, PrincipalKind::Agent { .. }))
+            }
+            Ok(_) => Err(DurableError::InvalidInput(format!(
+                "`{reviewer}` is not an active person or agent here, so they cannot review"
+            ))),
+            Err(error) => Err(DurableError::Io(format!(
+                "the principal directory is unavailable: {error}"
+            ))),
+        }
     }
 
     fn list_prs_for_repo(
@@ -3353,6 +3379,7 @@ impl DurableGitBackend {
             "created_at": rec.created_at,
             "is_fork": rec.head_repo_slug != repo,
             "merged_oid": rec.merged_oid,
+            "closed_by": rec.closed_by.as_ref().filter(|_| rec.state == PrState::Closed),
             "auto_merge": rec.auto_merge.as_ref().filter(|_| rec.state == PrState::Open).map(|request| json!({
                 "requested_by": format!("{}@{tenant}.noreply", request.requested_by),
                 "requested_at": request.requested_at,

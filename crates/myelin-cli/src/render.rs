@@ -15,6 +15,23 @@ mod pull_request;
 mod refs;
 mod tool;
 
+/// Unicode format characters that reorder or hide the text around them: bidirectional controls
+/// and invisible separators. Zero-width joiners stay, since emoji and some scripts need them.
+fn reorders_or_hides_text(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{180e}'
+            | '\u{200b}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
 fn terminal_safe_single_line(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
@@ -24,7 +41,7 @@ fn terminal_safe_single_line(value: &str) -> String {
             '\t' => safe.push_str("\\t"),
             '\u{2028}' => safe.push_str("\\u{2028}"),
             '\u{2029}' => safe.push_str("\\u{2029}"),
-            character if character.is_control() => {
+            character if character.is_control() || reorders_or_hides_text(character) => {
                 let codepoint = character as u32;
                 if codepoint <= 0xff {
                     let _ = write!(safe, "\\x{codepoint:02x}");
@@ -564,7 +581,10 @@ fn push_safe_log_text(output: &mut String, text: &str) {
     for character in text.chars() {
         if character == '\n' {
             output.push('\n');
-        } else if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+        } else if character.is_control()
+            || reorders_or_hides_text(character)
+            || matches!(character, '\u{2028}' | '\u{2029}')
+        {
             output.push_str(&terminal_safe_single_line(&character.to_string()));
         } else {
             output.push(character);
@@ -803,6 +823,20 @@ mod tests {
             !rendered.contains('\u{1b}'),
             "titles cannot drive the terminal"
         );
+
+        let ended = |state: &str| {
+            json!({
+                "number": 7, "title": "Add a greeting", "pr_state": state,
+                "base_ref": "refs/heads/main", "head_ref": "refs/heads/greet",
+                "head_oid": "ab".repeat(20), "closed_by": "bob@acme.noreply",
+            })
+        };
+        assert!(render_for_call(&ended("closed"), false, &view)
+            .ends_with("\n  closed by bob@acme.noreply\n"));
+        assert!(render_for_call(&ended("draft"), false, &view).ends_with(
+            "\n  closed by bob@acme.noreply\n  a draft; when it is ready for review: myelin \
+             --idempotency-key <key> repo pr ready core 7\n"
+        ));
 
         let list = json!({
             "items": [{
@@ -1163,6 +1197,23 @@ mod tests {
         assert!(out.contains("\\nsecond row\\x1b[31mred\\x85next"));
         assert!(out.contains("ENG\\t1  [open\\rclosed]"));
         assert!(out.contains("id\\x7ftail"));
+
+        let spoof = json!({ "id": "id", "key": "ENG-1", "title": "fix\u{202e}txt.exe\u{200b}", "state": "open" });
+        let out = render(&spoof, false);
+        assert!(
+            out.contains("fix\\u{202e}txt.exe\\u{200b}"),
+            "reordering marks are visible: {out}"
+        );
+        let joined =
+            json!({ "id": "id", "key": "ENG-2", "title": "👨\u{200d}👩", "state": "open" });
+        assert!(
+            render(&joined, false).contains("👨\u{200d}👩"),
+            "emoji joiners survive"
+        );
+        assert_eq!(
+            terminal_safe_log_bytes("a\u{2066}b\n".as_bytes()),
+            "a\\u{2066}b\n"
+        );
 
         let json = render(&issue, true);
         assert!(json.contains("Grüße 🚀"));

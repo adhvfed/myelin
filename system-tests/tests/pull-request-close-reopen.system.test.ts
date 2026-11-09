@@ -84,7 +84,11 @@ describe("a pull request's life: draft, ready, closed, reopened", () => {
       return item?.state === state ? item : undefined;
     }, { timeoutMs: 30_000, description: `the reviewer's request to be ${state}` });
 
-    expect(await view()).toContain(`#${number} Add a greeting [draft]\n`);
+    const draftView = await view();
+    expect(draftView).toContain(`#${number} Add a greeting [draft]\n`);
+    expect(draftView).toContain(
+      `  a draft; when it is ready for review: myelin --idempotency-key <key> repo pr ready ${slug} ${number}\n`,
+    );
     const draftMerge = await systemClient.json(`${project.path}/prs/${number}/merge`, {
       method: "POST",
       body: {},
@@ -99,7 +103,11 @@ describe("a pull request's life: draft, ready, closed, reopened", () => {
     await reviewRequest("unread");
 
     expect(await keyed("repo", "pr", "close", slug, n)).toBe(`closed #${number} Add a greeting\n`);
-    expect(await view()).toContain(`#${number} Add a greeting [closed]\n`);
+    const closedView = await view();
+    expect(closedView).toContain(`#${number} Add a greeting [closed]\n`);
+    expect(closedView).toContain(
+      `  closed by ${systemTestConfig.principal}@${systemTestConfig.tenant}.noreply\n`,
+    );
     await reviewRequest("done");
     const closedMerge = await systemClient.json(`${project.path}/prs/${number}/merge`, {
       method: "POST",

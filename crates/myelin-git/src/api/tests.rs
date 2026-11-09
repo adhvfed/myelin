@@ -143,6 +143,24 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         parse_cli(&["pr", "open", "core", "--title", "Ship", "--reviewer"]),
         Err(CliParseError::MissingValue { flag: "--reviewer" })
     ));
+    assert!(matches!(
+        parse_cli(&["pr", "open", "core", "--title", "Ship", "--reviewer", "bob,carol"]),
+        Ok(CliCommand::PrOpen { reviewers, .. }) if reviewers == ["bob", "carol"]
+    ));
+    for malformed in ["bob,", "bob carol"] {
+        assert!(matches!(
+            parse_cli(&[
+                "pr",
+                "open",
+                "core",
+                "--title",
+                "Ship",
+                "--reviewer",
+                malformed
+            ]),
+            Err(CliParseError::BadArg { .. })
+        ));
+    }
     for (verb, change) in [
         ("close", crate::pr_store::PrStateChange::Close),
         ("reopen", crate::pr_store::PrStateChange::Reopen),

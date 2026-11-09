@@ -279,6 +279,9 @@ pub struct PrRecord {
     /// The commit the base moved to: the head itself, or the squash of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_oid: Option<String>,
+    /// Who closed it, so its author cannot undo a maintainer's decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
 }
 
 impl PrRecord {
@@ -306,6 +309,7 @@ impl PrRecord {
             auto_merge: None,
             auto_merge_stopped: None,
             merged_oid: None,
+            closed_by: None,
         }
     }
 

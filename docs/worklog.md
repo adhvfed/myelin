@@ -4,6 +4,38 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — A maintainer's close sticks, and reviewers must exist
+
+A second independent review, of the edge, routes, and CLI, confirmed:
+- the authorization matrix;
+- that every merge entry point refuses drafts and closed pull requests;
+- that an in-flight merge stays recoverable.
+
+It found one policy gap and a few rough edges:
+- **A maintainer's close did not stick.** An author with only read access could reopen a pull
+  request a maintainer had closed, again and again, re-raising every review request each time. A
+  pull request now records who closed it. Its author can undo only their own close. Reopening one
+  that someone else closed takes push access, and an agent never can. `pr view` shows who closed
+  it.
+- **Reviewers were never checked.** Requested reviewers were not checked against the principal
+  directory, so `--reviewer bob,carol` asked a reviewer literally named `bob,carol`. Opening a pull
+  request now refuses a reviewer who is not an active person or agent of the tenant, with a 400
+  that names them. It also records whether each requested reviewer is an agent; before, every
+  request said "person". The CLI splits `--reviewer bob,carol` into two and refuses empty or
+  spaced names.
+- **Spoofable terminal output.** Terminal output passed bidirectional controls and zero-width
+  separators through, so a title or branch name could visually reorder a line. They are now
+  printed as escapes, in logs too. Zero-width joiners stay, because emoji and some scripts need
+  them.
+- **No path out of draft in `pr view`.** `pr view` on a draft now gives the `pr ready` command.
+
+Proof:
+- Edge unit tests cover the reopen matrix: the author after a maintainer's close, the maintainer,
+  the author after their own close, and an agent after a maintainer's close.
+- On the real stack, the CLI journey shows an unknown reviewer refused. The close-and-reopen
+  journey shows the closer named and the draft hint.
+- The Git lifecycle, merge-queue, and closes-issue journeys still pass.
+
 ## 2026-11-09 — Review fixes for closing and reopening
 
 An independent review of the close and reopen slice confirmed that no path merges a draft or

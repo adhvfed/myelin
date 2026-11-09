@@ -514,24 +514,16 @@ pub enum PrMutation {
         reason: Option<String>,
         requested_at: Option<i64>,
     },
-    /// Stop considering a draft or open pull request; it also leaves the merge queue.
-    Close,
+    /// Stop considering a draft or open pull request; it also leaves the merge queue. `by` is
+    /// the closer's pseudonym.
+    Close {
+        by: String,
+    },
     /// Bring a closed pull request back as open.
     Reopen,
     /// A draft asks for review and becomes mergeable.
     MarkReady,
     Touch,
-}
-
-impl From<crate::pr_store::PrStateChange> for PrMutation {
-    fn from(change: crate::pr_store::PrStateChange) -> Self {
-        use crate::pr_store::PrStateChange;
-        match change {
-            PrStateChange::Close => Self::Close,
-            PrStateChange::Reopen => Self::Reopen,
-            PrStateChange::MarkReady => Self::MarkReady,
-        }
-    }
 }
 
 const CLOSE_REFUSAL: &str = "only an open or draft pull request can be closed";
@@ -552,7 +544,7 @@ impl PrMutation {
             Self::AdoptBaseMerge { .. } => "adopt-base-merge",
             Self::RequestAutoMerge { .. } => "request-auto-merge",
             Self::CancelAutoMerge { .. } => "cancel-auto-merge",
-            Self::Close => "close",
+            Self::Close { .. } => "close",
             Self::Reopen => "reopen",
             Self::MarkReady => "mark-ready",
             Self::Touch => "touch",
@@ -564,7 +556,7 @@ impl PrMutation {
             Self::SubmitReview(_) => GIT_REVIEW_SUBMITTED,
             Self::SynchronizeHead { .. } | Self::AdoptBaseMerge { .. } => GIT_PR_SYNCHRONIZED,
             Self::RequestAutoMerge { .. } => GIT_PR_MERGE_QUEUED,
-            Self::Close => GIT_PR_CLOSED,
+            Self::Close { .. } => GIT_PR_CLOSED,
             Self::Reopen => GIT_PR_REOPENED,
             Self::MarkReady => GIT_PR_MARKED_READY,
             Self::CancelAutoMerge {
@@ -685,18 +677,20 @@ impl PrMutation {
                         requested_by,
                     });
             }
-            Self::Close => {
+            Self::Close { by } => {
                 if !matches!(record.state, PrState::Draft | PrState::Open) {
                     return Err(CLOSE_REFUSAL);
                 }
                 record.state = PrState::Closed;
                 record.auto_merge = None;
+                record.closed_by = Some(by);
             }
             Self::Reopen => {
                 if record.state != PrState::Closed {
                     return Err(REOPEN_REFUSAL);
                 }
                 record.state = PrState::Open;
+                record.closed_by = None;
                 // Closing withdrew the stopped-merge notice; its banner must not come back.
                 record.auto_merge_stopped = None;
             }
@@ -4109,8 +4103,12 @@ mod tests {
             requested_by: "bob".into(),
         };
         record.auto_merge_stopped = Some(stopped.clone());
-        assert_eq!(PrMutation::Close.event_type(), GIT_PR_CLOSED);
-        PrMutation::Close.apply_to_at(&mut record, 500).unwrap();
+        let close = || PrMutation::Close {
+            by: "carol@acme.noreply".into(),
+        };
+        assert_eq!(close().event_type(), GIT_PR_CLOSED);
+        close().apply_to_at(&mut record, 500).unwrap();
+        assert_eq!(record.closed_by.as_deref(), Some("carol@acme.noreply"));
         assert_eq!(record.state, PrState::Closed);
         assert_eq!(record.auto_merge, None, "closing leaves the merge queue");
         assert_eq!(
@@ -4118,14 +4116,14 @@ mod tests {
             Some(stopped),
             "the closed event still names whose stopped-merge notice to withdraw"
         );
-        assert_eq!(
-            PrMutation::Close.apply_to_at(&mut record, 600),
-            Err(CLOSE_REFUSAL)
-        );
+        assert_eq!(close().apply_to_at(&mut record, 600), Err(CLOSE_REFUSAL));
 
         assert_eq!(PrMutation::Reopen.event_type(), GIT_PR_REOPENED);
         PrMutation::Reopen.apply_to_at(&mut record, 700).unwrap();
-        assert_eq!(record.state, PrState::Open);
+        assert_eq!(
+            (record.state, record.closed_by.as_deref()),
+            (PrState::Open, None)
+        );
         assert_eq!(
             record.auto_merge, None,
             "reopening does not schedule a merge again"
@@ -4137,7 +4135,7 @@ mod tests {
 
         record.state = PrState::Merged;
         for (mutation, refusal) in [
-            (PrMutation::Close, CLOSE_REFUSAL),
+            (close(), CLOSE_REFUSAL),
             (PrMutation::Reopen, REOPEN_REFUSAL),
             (PrMutation::MarkReady, MARK_READY_REFUSAL),
         ] {
@@ -4933,7 +4931,10 @@ mod tests {
                 .len(),
             1
         );
-        for (change, still_asked) in [(PrMutation::Close, 0), (PrMutation::Reopen, 1)] {
+        let close = PrMutation::Close {
+            by: "author@tenant.noreply".into(),
+        };
+        for (change, still_asked) in [(close, 0), (PrMutation::Reopen, 1)] {
             store
                 .apply_mutation(
                     &scope_a,
@@ -5116,7 +5117,9 @@ mod tests {
                     &scope_a,
                     slug,
                     opened.number,
-                    PrMutation::Close,
+                    PrMutation::Close {
+                        by: "author@tenant.noreply".into(),
+                    },
                     &PrOperationId::parse("close-merge-closed").unwrap(),
                     &actor,
                 )

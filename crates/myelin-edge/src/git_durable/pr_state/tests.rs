@@ -172,14 +172,34 @@ fn its_author_or_a_writer_closes_it_and_an_agent_only_its_own() {
     let writer = principal("writer", PrincipalKind::Human);
     let closed = fixture.change(&writer, PrStateChange::Close).unwrap();
     assert_eq!(closed.state, PrState::Closed);
+    assert_eq!(closed.closed_by.as_deref(), Some("writer@acme.noreply"));
+    assert!(matches!(
+        fixture.change(&fixture.author, PrStateChange::Reopen),
+        Err(DurableError::Forbidden(message))
+            if message == "only someone who can push to product can reopen a pull request that someone else closed"
+    ));
     assert!(matches!(
         fixture.change(&writer, PrStateChange::Close),
         Err(DurableError::Conflict(message)) if message == "only an open or draft pull request can be closed"
     ));
-    let reopened = fixture
-        .change(&fixture.author, PrStateChange::Reopen)
+    assert_eq!(
+        fixture
+            .change(&writer, PrStateChange::Reopen)
+            .unwrap()
+            .state,
+        PrState::Open
+    );
+    fixture
+        .change(&fixture.author, PrStateChange::Close)
         .unwrap();
-    assert_eq!(reopened.state, PrState::Open);
+    assert_eq!(
+        fixture
+            .change(&fixture.author, PrStateChange::Reopen)
+            .unwrap()
+            .closed_by,
+        None,
+        "an author undoes their own close"
+    );
 
     let agents = pull_request(agent("builder"), true);
     let own = agents.author.clone();
@@ -191,6 +211,16 @@ fn its_author_or_a_writer_closes_it_and_an_agent_only_its_own() {
         agents.change(&own, PrStateChange::Close).unwrap().state,
         PrState::Closed
     );
+    assert_eq!(
+        agents.change(&own, PrStateChange::Reopen).unwrap().state,
+        PrState::Open
+    );
+    agents.change(&writer, PrStateChange::Close).unwrap();
+    assert!(matches!(
+        agents.change(&own, PrStateChange::Reopen),
+        Err(DurableError::Forbidden(message))
+            if message == "an agent cannot reopen a pull request that someone else closed"
+    ));
 }
 
 #[test]

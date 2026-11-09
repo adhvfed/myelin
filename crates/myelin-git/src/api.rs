@@ -505,7 +505,15 @@ fn parse_pr_open(args: &[&str]) -> Result<CliCommand, CliParseError> {
             "--head" => parse_value_flag(flags, &mut index, "--head", &mut head_ref)?,
             "--head-oid" => parse_value_flag(flags, &mut index, "--head-oid", &mut head_oid)?,
             "--reviewer" => {
-                reviewers.push(required_flag_value(flags, index, "--reviewer")?.to_string());
+                // `--reviewer bob,carol` asks both, as does repeating the flag.
+                for reviewer in required_flag_value(flags, index, "--reviewer")?.split(',') {
+                    if reviewer.is_empty() || reviewer.chars().any(char::is_whitespace) {
+                        return Err(CliParseError::BadArg {
+                            value: reviewer.to_string(),
+                        });
+                    }
+                    reviewers.push(reviewer.to_string());
+                }
                 index += 2;
             }
             "--draft" => {

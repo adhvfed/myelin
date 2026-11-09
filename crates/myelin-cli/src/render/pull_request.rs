@@ -102,6 +102,18 @@ pub(super) fn render_view(value: &Value, call: Option<&EdgeCall>) -> Option<Stri
     if let Some(merged) = text(value, "merged_oid") {
         out.push_str(&format!("  merged as {}\n", short_oid(merged)));
     }
+    if let Some(closer) = text(value, "closed_by") {
+        out.push_str(&format!(
+            "  closed by {}\n",
+            terminal_safe_single_line(closer)
+        ));
+    }
+    if text(value, "pr_state") == Some("draft") {
+        out.push_str(&format!(
+            "  a draft; when it is ready for review: myelin --idempotency-key <key> repo pr ready \
+             {repo} {number}\n"
+        ));
+    }
     Some(out)
 }
 

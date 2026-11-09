@@ -75,6 +75,29 @@ describe("pull requests from the terminal", () => {
       "--reviewer", systemTestConfig.reviewerPrincipal,
     );
     const number = Number(/^opened #(\d+) /.exec(opened)?.[1]);
+    const unknownReviewer = await runCliWith(
+      configDirectory,
+      {
+        environment: {
+          MYELIN_EDGE: systemTestConfig.edgeUrl,
+          MYELIN_TOKEN: session.token,
+          MYELIN_TOKEN_SCHEME: session.tokenScheme,
+        },
+      },
+      [
+        "--idempotency-key", `open-${randomUUID()}`,
+        "repo", "pr", "open", project.slug,
+        "--title", "Ask nobody",
+        "--base", "refs/heads/main",
+        "--head", "refs/heads/greet",
+        "--head-oid", head,
+        "--reviewer", "nobody-by-this-name",
+      ],
+    );
+    expect(unknownReviewer.exitCode).not.toBe(0);
+    expect(unknownReviewer.stderr).toContain(
+      "`nobody-by-this-name` is not an active person or agent here, so they cannot review",
+    );
     expect(opened).toBe(`opened #${number} Add a greeting [open]  greet → main · review requested\n`);
 
     await project.writeFile("main", "NEWS.md", "Greetings arrive.\n");

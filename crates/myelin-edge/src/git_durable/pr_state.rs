@@ -49,20 +49,35 @@ impl DurableGitBackend {
         let record = self
             .pr_get(&loc, number, principal)?
             .ok_or_else(|| DurableError::NotFound("pull request not found".into()))?;
-        if record.author_pseudonym != Self::pseudonym(tenant, principal) {
-            if Self::is_agent(principal) {
-                return Err(DurableError::Forbidden(
-                    "an agent changes only the pull requests it opened".into(),
-                ));
-            }
-            if !self
-                .repo_authz
-                .authorize_repo_permission(principal, &loc, RepoPermission::Push)
-            {
-                return Err(DurableError::Forbidden(format!(
+        let me = Self::pseudonym(tenant, principal);
+        // An author may undo their own close, never a maintainer's.
+        let closed_by_someone_else = change == PrStateChange::Reopen
+            && record.state == PrState::Closed
+            && record
+                .closed_by
+                .as_deref()
+                .is_some_and(|closer| closer != me);
+        if record.author_pseudonym != me || closed_by_someone_else {
+            let refusal = match (Self::is_agent(principal), closed_by_someone_else) {
+                (true, false) => "an agent changes only the pull requests it opened".into(),
+                (true, true) => {
+                    "an agent cannot reopen a pull request that someone else closed".into()
+                }
+                (false, false) => format!(
                     "only its author or someone who can push to {slug} can {}",
                     what(change)
-                )));
+                ),
+                (false, true) => format!(
+                    "only someone who can push to {slug} can reopen a pull request that someone \
+                     else closed"
+                ),
+            };
+            if Self::is_agent(principal)
+                || !self
+                    .repo_authz
+                    .authorize_repo_permission(principal, &loc, RepoPermission::Push)
+            {
+                return Err(DurableError::Forbidden(refusal));
             }
         }
         let head_ref = branch_ref(&record.head_ref);
@@ -81,7 +96,12 @@ impl DurableGitBackend {
                 )));
             }
         }
-        let changed = self.pr_mutate(&loc, number, change.into(), operation_id, principal)?;
+        let mutation = match change {
+            PrStateChange::Close => PrMutation::Close { by: me },
+            PrStateChange::Reopen => PrMutation::Reopen,
+            PrStateChange::MarkReady => PrMutation::MarkReady,
+        };
+        let changed = self.pr_mutate(&loc, number, mutation, operation_id, principal)?;
         if change == PrStateChange::Reopen && same_repository {
             // The branch may have moved while the pull request was closed; reviews of the old
             // head do not carry over to new commits.
