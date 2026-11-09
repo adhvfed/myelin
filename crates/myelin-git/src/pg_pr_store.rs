@@ -198,6 +198,24 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS git_pr_command_operation_scope_ui
   ON git_pr_command (tenant_id, region, operation_id)
 "#;
 
+/// The branch-follow sweep reads every open pull request whose branch lives in its own repository.
+pub const CREATE_GIT_PR_OPEN_HEADS_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_open_heads_idx
+  ON git_pr (tenant_id, region, repo_slug, number)
+  WHERE record->>'state' IN ('Open', 'Draft') AND head_repo_slug = repo_slug
+"#;
+
+/// The merge queue reads scheduled pull requests in the order they asked.
+pub const CREATE_GIT_PR_AUTO_MERGE_QUEUE_INDEX_DDL: &str = r#"
+CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_auto_merge_queue_idx
+  ON git_pr (
+    tenant_id, region,
+    ((record->'auto_merge'->>'requested_at')::bigint),
+    repo_slug, number
+  )
+  WHERE record->>'state' = 'Open' AND record->'auto_merge' IS NOT NULL
+"#;
+
 pub fn git_pr_migrations() -> Migrations {
     Migrations::of([
         Migration::plain_on(
@@ -284,6 +302,18 @@ pub fn git_pr_migrations() -> Migrations {
             "git_0016_pr_text_erasure_batch_index",
             CREATE_GIT_PR_TEXT_ERASURE_BATCH_INDEX_DDL,
             MigrationPhase::Contract,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0017_pr_open_heads_index",
+            CREATE_GIT_PR_OPEN_HEADS_INDEX_DDL,
+            MigrationPhase::Expand,
+            GIT_PR_TABLE,
+        ),
+        Migration::phased(
+            "git_0018_pr_auto_merge_queue_index",
+            CREATE_GIT_PR_AUTO_MERGE_QUEUE_INDEX_DDL,
+            MigrationPhase::Expand,
             GIT_PR_TABLE,
         ),
     ])
@@ -3647,7 +3677,7 @@ mod tests {
     #[test]
     fn migration_set_is_forward_only_and_declares_mutated_tables_hot() {
         let migrations = git_pr_migrations();
-        assert_eq!(migrations.0.len(), 16);
+        assert_eq!(migrations.0.len(), 18);
         for migration in &migrations.0 {
             let upper = migration.ddl.to_ascii_uppercase();
             assert!(!upper.contains("DROP TABLE"));

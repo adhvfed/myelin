@@ -4,6 +4,20 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Indexes for the merge queue and branch sweep
+
+The merge queue reads each tenant's scheduled pull requests in request order on every pass. The
+branch-follow sweep reads every open pull request once a minute. Both filtered JSON fields across a
+tenant's whole `git_pr` table. Two forward-only concurrent partial indexes, `git_0017` and
+`git_0018`, now cover exactly those rows in exactly that order. One holds open and draft pull
+requests whose branch lives in their own repository; the other holds open scheduled pull requests
+by request time.
+
+Proof: on the dogfood database both indexes build valid at boot. EXPLAIN shows the queue query on
+`git_pr_auto_merge_queue_idx` and the sweep's keyset scan as an index-only scan on
+`git_pr_open_heads_idx`. The production boot validator admits the 18-migration set, and the
+merge-queue, follow-branch, and Git journeys pass.
+
 ## 2026-11-09 — Merging closes the issues a pull request names
 
 A `Closes DX-1` line in a pull request's description linked the pull request to the issue in the
