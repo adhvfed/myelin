@@ -1306,6 +1306,22 @@ export const prMutate = action(async (
           throw e;
         }
       }
+      case "edit": {
+        try {
+          const response = await edgePost(`${base}/edit`, {
+            ...(parsed.title === undefined ? {} : { title: parsed.title }),
+            ...(parsed.body_md === undefined ? {} : { body_md: parsed.body_md }),
+          }, mutationOptions);
+          if (!hasAppliedAction(response, "git.pr.edit")) throw new RepoRouteError("error");
+          return { ok: true };
+        } catch (e) {
+          if (!(e instanceof GatewayError)) throw e;
+          const message = [400, 403, 409].includes(e.status) ? edgeErrorMessage(e.body) : null;
+          if (message) return { refused: message };
+          if (e.status === 403 || e.status === 404) return { refused: "You can't edit this pull request." };
+          throw e;
+        }
+      }
       case "close":
       case "reopen":
       case "ready": {

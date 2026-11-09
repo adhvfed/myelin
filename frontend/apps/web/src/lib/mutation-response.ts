@@ -284,7 +284,8 @@ export function hasAppliedAction(
     | "git.pr.auto_merge.cancel"
     | "git.pr.close"
     | "git.pr.reopen"
-    | "git.pr.ready",
+    | "git.pr.ready"
+    | "git.pr.edit",
 ): boolean {
   return applied(value, action) !== null;
 }

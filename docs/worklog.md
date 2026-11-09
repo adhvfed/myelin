@@ -4,6 +4,22 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — The pull request page edits its title and description
+
+The pull request page gained what the API and CLI already had. The description card now always
+shows, reading "No description." when there is none. Its **Edit title and description** button
+opens one inline form for both. When a merge is scheduled, the form says that a new description
+stops it until whoever scheduled it does so again. Refusals from the edge are shown as it words
+them, and an edit that changes nothing is a no-op.
+
+Proof:
+- A real-stack browser spec retitles a pull request opened through the API and writes its
+  description. The new title and the rendered markdown survive a reload.
+- The mocked overview suite walks the same edit with an axe scan.
+- Unit tests cover the edit input's rules: a title or a description, a trimmed non-blank title
+  within 512 bytes, an empty description that clears it, and exact keys.
+- `pnpm --dir frontend check` passes.
+
 ## 2026-11-09 — The merge binding holds under takeover, and migrations see every tenant
 
 A third independent pass confirmed the `Closes` list is bound to the text that lands on every path.

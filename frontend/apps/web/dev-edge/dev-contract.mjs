@@ -987,6 +987,8 @@ const UPDATED_BRANCHES = new Set();
 const AUTO_MERGES = new Map();
 /** Pull requests closed, reopened, or marked ready since the last reset: `{ pr_state, closed_by, closed_while_draft }`. */
 const PR_STATES = new Map();
+/** Titles and descriptions edited since the last reset: `{ title?, body_md? }`. */
+const PR_TEXTS = new Map();
 
 // Keep one namespaced repository in the browser contract. Both coordinates deliberately share the
 // same PR records; the test double is proving transport and routing semantics, not modelling storage.
@@ -1055,6 +1057,7 @@ export function resetPrFixtures() {
   UPDATED_BRANCHES.clear();
   AUTO_MERGES.clear();
   PR_STATES.clear();
+  PR_TEXTS.clear();
   threadSeq = 0;
 }
 function subjectKey(repo, n) {
@@ -1305,6 +1308,20 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
     doc.reviews = doc.reviews.filter((r) => r.id !== m[1]);
     return { status: 200, json: { applied: { action: "git.pr.review.discard", result: { discarded: m[1] } }, durable: true } };
   }
+  // POST …/edit — a new title, description, or both; an empty description removes it.
+  if (tail === "edit") {
+    const title = typeof body.title === "string" ? body.title.trim() : undefined;
+    if (title === "" || (title === undefined && typeof body.body_md !== "string")) {
+      return { status: 400, json: { error: { code: "bad_request", message: "an edit changes the title, the description, or both" } } };
+    }
+    const current = PR_TEXTS.get(n) ?? {};
+    PR_TEXTS.set(n, {
+      ...current,
+      ...(title === undefined ? {} : { title }),
+      ...(typeof body.body_md === "string" ? { body_md: body.body_md === "" ? null : body.body_md } : {}),
+    });
+    return { status: 200, json: { applied: { action: "git.pr.edit", pr: prJson(repo, n) }, durable: true } };
+  }
   // POST …/close, …/reopen, …/ready — mirror the edge's state machine and its refusals.
   if (tail === "close" || tail === "reopen" || tail === "ready") {
     const state = prJson(repo, n).pr_state;
@@ -1375,6 +1392,7 @@ export function prJson(repo, n) {
   return {
     ...SEED_PRS[n].pr,
     ...updated,
+    ...(PR_TEXTS.get(n) ?? {}),
     ...(lifecycle ? { pr_state: lifecycle.pr_state } : {}),
     closed_by: lifecycle?.pr_state === "closed" ? lifecycle.closed_by : null,
     auto_merge: AUTO_MERGES.has(n) ? AUTO_MERGES.get(n).auto_merge : null,

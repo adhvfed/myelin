@@ -42,7 +42,7 @@ import {
   type PrincipalVM,
   type PrCommitsPage,
 } from "~/lib/api";
-import type { MergeMethod, PrStateOp } from "~/lib/mutation-input";
+import { MAX_PR_TITLE_BYTES, type MergeMethod, type PrStateOp } from "~/lib/mutation-input";
 import { NotAvailable } from "~/components/NotAvailable";
 import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
@@ -210,11 +210,7 @@ export default function PrOverviewScreen() {
                     <>
                       <PrHeader pr={p()} repo={current.repo} active="overview" commitsCount={p().commits_count} />
 
-                      <Show when={p().body_md}>
-                        <section aria-label="Description" style={{ ...card }}>
-                          <Markdown source={p().body_md ?? ""} />
-                        </section>
-                      </Show>
+                      <PrDescription repo={current.repo} n={current.n} pr={p()} onChange={reload} toast={toast} />
 
                       {/* G-9 CHECKS — degrades LOCALLY: an `unavailable` sentinel renders "Checks
                           unavailable" HERE, the PR stays live (never "PR not available", finding 5). The
@@ -1212,6 +1208,92 @@ function MergeCard(props: {
         confirmLabel="Merge"
         cancelLabel="Cancel"
       />
+    </section>
+  );
+}
+
+/** The title and description, editable by its author or a maintainer; the edge refuses anyone
+ *  else with a reason, shown as it says it. */
+function PrDescription(props: {
+  repo: string;
+  n: number;
+  pr: PrVM;
+  onChange: () => Promise<void>;
+  toast: ReturnType<typeof useToast>;
+}) {
+  const doMutate = useAction(prMutate);
+  const [editing, setEditing] = createSignal(false);
+  const [title, setTitle] = createSignal("");
+  const [body, setBody] = createSignal("");
+  const [saving, setSaving] = createSignal(false);
+  const start = () => {
+    setTitle(props.pr.title ?? "");
+    setBody(props.pr.body_md ?? "");
+    setEditing(true);
+  };
+  const save = async (event: SubmitEvent) => {
+    event.preventDefault();
+    setSaving(true);
+    let result: { ok: true } | { refused: string } | null = null;
+    try {
+      result = await doMutate({
+        op: "edit",
+        repo: props.repo,
+        n: props.n,
+        title: title().trim(),
+        body_md: body(),
+      }) as { ok: true } | { refused: string };
+    } catch {
+      props.toast.show({ title: "Could not save the pull request", variant: "danger" });
+    }
+    if (result && "refused" in result) props.toast.show({ title: result.refused, variant: "warning" });
+    else if (result) {
+      props.toast.show({ title: "Saved", variant: "success" });
+      setEditing(false);
+    }
+    await props.onChange().catch(() => undefined);
+    setSaving(false);
+  };
+  const field = { display: "flex", "flex-direction": "column", gap: "var(--space-1)" } as const;
+  return (
+    <section aria-label="Description" data-testid="pr-description" style={{ ...card }}>
+      <Show
+        when={editing()}
+        fallback={
+          <>
+            <Show when={props.pr.body_md} fallback={<p style={{ margin: "0", color: "var(--text-muted)" }}>No description.</p>}>
+              <Markdown source={props.pr.body_md ?? ""} />
+            </Show>
+            <button type="button" data-testid="edit-pr-button" onClick={start} class="btn-secondary" style={{ ...barBtn, "align-self": "flex-start" }}>
+              <Icon name="edit" /> Edit title and description
+            </button>
+          </>
+        }
+      >
+        <form aria-label="Edit pull request" onSubmit={(event) => void save(event)} style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+          <label style={field}>
+            Title
+            <input value={title()} required maxlength={MAX_PR_TITLE_BYTES} disabled={saving()} onInput={(event) => setTitle(event.currentTarget.value)} />
+          </label>
+          <label style={field}>
+            Description
+            <textarea value={body()} rows={8} disabled={saving()} onInput={(event) => setBody(event.currentTarget.value)} />
+          </label>
+          <Show when={props.pr.auto_merge}>
+            <p role="note" style={{ margin: "0", color: "var(--text-muted)" }}>
+              A new description stops the scheduled merge until whoever scheduled it does so again.
+            </p>
+          </Show>
+          <div style={{ display: "flex", gap: "var(--space-2)" }}>
+            <button type="submit" disabled={saving() || title().trim() === ""} aria-busy={saving()} class="btn-primary" style={barBtnPrimary}>
+              {saving() ? "Saving…" : "Save"}
+            </button>
+            <button type="button" disabled={saving()} onClick={() => setEditing(false)} class="btn-secondary" style={barBtn}>
+              Cancel
+            </button>
+          </div>
+        </form>
+      </Show>
     </section>
   );
 }

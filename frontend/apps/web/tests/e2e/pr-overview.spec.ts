@@ -423,6 +423,26 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await expect(card.getByRole("button", { name: "Close pull request" })).toBeVisible();
   });
 
+  test("its title and description are edited in place", async ({ page }) => {
+    await resetPrFixtures();
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/prs/2"); // no description yet.
+    await page.waitForLoadState("networkidle");
+    const description = page.getByTestId("pr-description");
+    await expect(description).toContainText("No description.");
+    await description.getByRole("button", { name: "Edit title and description" }).click();
+    const form = page.getByRole("form", { name: "Edit pull request" });
+    await form.getByLabel("Title").fill("Hotfix: saturating cursor arithmetic, explained");
+    await form.getByLabel("Description").fill("The cursor **saturates** instead of wrapping.");
+    await expectNoAxeViolations(page, "the pull request edit form");
+    await form.getByRole("button", { name: "Save" }).click();
+    await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 1 }))
+      .toContainText("Hotfix: saturating cursor arithmetic, explained");
+    await expect(description.locator("strong")).toHaveText("saturates");
+    await expect(form).toHaveCount(0);
+  });
+
   test("a stopped automatic merge says why", async ({ page }) => {
     await resetPrFixtures();
     await devLogin(page);

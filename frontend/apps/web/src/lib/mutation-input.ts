@@ -27,7 +27,10 @@ export type PrMutation =
   | { op: "update-branch"; repo: string; n: number; expected_head_oid: string }
   | { op: "auto-merge"; repo: string; n: number; method?: MergeMethod }
   | { op: "cancel-auto-merge"; repo: string; n: number }
-  | { op: PrStateOp; repo: string; n: number };
+  | { op: PrStateOp; repo: string; n: number }
+  | { op: "edit"; repo: string; n: number; title?: string; body_md?: string };
+
+export const MAX_PR_TITLE_BYTES = 512;
 
 /** Closing, reopening, and marking a draft ready; each is also its Edge route's last segment. */
 export type PrStateOp = "close" | "reopen" | "ready";
@@ -219,6 +222,24 @@ export function parsePrMutation(value: unknown): PrMutation | null {
     case "reopen":
     case "ready":
       return exactKeys(input, ["op", "repo", "n"]) ? { op: input.op, ...base } : null;
+    case "edit": {
+      if (!exactKeys(input, ["op", "repo", "n", "title", "body_md"])) return null;
+      const title = input.title === undefined
+        ? undefined
+        : typeof input.title === "string" && input.title.trim() !== "" &&
+            bounded(input.title, MAX_PR_TITLE_BYTES)
+          ? input.title
+          : null;
+      // An empty description removes it.
+      const body_md = input.body_md === undefined ? undefined : markdown(input.body_md, false);
+      if (title === null || body_md === null || (title === undefined && body_md === undefined)) return null;
+      return {
+        op: "edit",
+        ...base,
+        ...(title === undefined ? {} : { title }),
+        ...(body_md === undefined ? {} : { body_md }),
+      };
+    }
     case "update-branch":
       return exactKeys(input, ["op", "repo", "n", "expected_head_oid"]) &&
           typeof input.expected_head_oid === "string" && /^[0-9a-f]{40}$/.test(input.expected_head_oid)

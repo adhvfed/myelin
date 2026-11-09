@@ -102,6 +102,19 @@ describe("parsePrMutation", () => {
     expect(parsePrMutation({ op: "auto-merge", repo: "core", n: 1, method: "fast_forward" }))
       .toEqual({ op: "auto-merge", repo: "core", n: 1, method: "fast_forward" });
     expect(parsePrMutation({ op: "merge", repo: "core", n: 1, method: "rebase" })).toBeNull();
+    expect(parsePrMutation({ op: "edit", repo: "core", n: 1, title: "Ship it" }))
+      .toEqual({ op: "edit", repo: "core", n: 1, title: "Ship it" });
+    expect(parsePrMutation({ op: "edit", repo: "core", n: 1, body_md: "" }))
+      .toEqual({ op: "edit", repo: "core", n: 1, body_md: "" });
+    for (const malformed of [
+      { op: "edit", repo: "core", n: 1 },
+      { op: "edit", repo: "core", n: 1, title: "  " },
+      { op: "edit", repo: "core", n: 1, title: "t".repeat(513) },
+      { op: "edit", repo: "core", n: 1, title: "Ship", force: true },
+      { op: "edit", repo: "core", n: 1, body_md: 7 },
+    ]) {
+      expect(parsePrMutation(malformed)).toBeNull();
+    }
     for (const op of ["auto-merge", "cancel-auto-merge", "close", "reopen", "ready"]) {
       expect(parsePrMutation({ op, repo: "team/core", n: 42 })).toEqual({ op, repo: "team/core", n: 42 });
       expect(parsePrMutation({ op, repo: "team/core", n: 42, force: true })).toBeNull();
