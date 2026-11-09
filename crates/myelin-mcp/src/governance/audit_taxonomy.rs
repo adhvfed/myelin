@@ -71,6 +71,13 @@ pub(super) fn effect_event_type(
             denied: myelin_git::events::GIT_MARK_PR_READY_DENIED,
             indeterminate: myelin_git::events::GIT_MARK_PR_READY_INDETERMINATE,
         },
+        "git.edit_pr" => EffectAuditEvents {
+            attempted: myelin_git::events::GIT_EDIT_PR_ATTEMPTED,
+            applied: myelin_git::events::GIT_EDIT_PR_APPLIED,
+            gated: myelin_git::events::GIT_EDIT_PR_GATED,
+            denied: myelin_git::events::GIT_EDIT_PR_DENIED,
+            indeterminate: myelin_git::events::GIT_EDIT_PR_INDETERMINATE,
+        },
         "git.close_pr" => EffectAuditEvents {
             attempted: myelin_git::events::GIT_CLOSE_PR_ATTEMPTED,
             applied: myelin_git::events::GIT_CLOSE_PR_APPLIED,

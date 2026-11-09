@@ -14,6 +14,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "update_branch") => false,
         ("git", "mark_pr_ready") => false,
         ("git", "close_pr") => false,
+        ("git", "edit_pr") => false,
         ("git", "submit_review") => false,
         ("git", "endorse_fork_ci") => false,
         ("git", "list_repositories") => false,

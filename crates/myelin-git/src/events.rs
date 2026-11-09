@@ -113,6 +113,11 @@ pub const GIT_CLOSE_PR_APPLIED: &str = "git.close_pr.applied";
 pub const GIT_CLOSE_PR_GATED: &str = "git.close_pr.gated";
 pub const GIT_CLOSE_PR_DENIED: &str = "git.close_pr.denied";
 pub const GIT_CLOSE_PR_INDETERMINATE: &str = "git.close_pr.indeterminate";
+pub const GIT_EDIT_PR_ATTEMPTED: &str = "git.edit_pr.attempted";
+pub const GIT_EDIT_PR_APPLIED: &str = "git.edit_pr.applied";
+pub const GIT_EDIT_PR_GATED: &str = "git.edit_pr.gated";
+pub const GIT_EDIT_PR_DENIED: &str = "git.edit_pr.denied";
+pub const GIT_EDIT_PR_INDETERMINATE: &str = "git.edit_pr.indeterminate";
 pub const GIT_SUBMIT_REVIEW_ATTEMPTED: &str = "git.submit_review.attempted";
 pub const GIT_SUBMIT_REVIEW_APPLIED: &str = "git.submit_review.applied";
 pub const GIT_SUBMIT_REVIEW_GATED: &str = "git.submit_review.gated";
@@ -173,6 +178,11 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_CLOSE_PR_GATED,
     GIT_CLOSE_PR_DENIED,
     GIT_CLOSE_PR_INDETERMINATE,
+    GIT_EDIT_PR_ATTEMPTED,
+    GIT_EDIT_PR_APPLIED,
+    GIT_EDIT_PR_GATED,
+    GIT_EDIT_PR_DENIED,
+    GIT_EDIT_PR_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,
@@ -275,6 +285,11 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_CLOSE_PR_GATED,
     GIT_CLOSE_PR_DENIED,
     GIT_CLOSE_PR_INDETERMINATE,
+    GIT_EDIT_PR_ATTEMPTED,
+    GIT_EDIT_PR_APPLIED,
+    GIT_EDIT_PR_GATED,
+    GIT_EDIT_PR_DENIED,
+    GIT_EDIT_PR_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,

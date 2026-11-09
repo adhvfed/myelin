@@ -4,6 +4,21 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Agents edit their own pull requests' text
+
+An agent that opened a pull request could not update what it said its change did, even as the
+work evolved. `git.edit_pr` takes a new title, description, or both. It runs through the same
+backend as people's edits:
+- An agent edits only what it opened.
+- An erased pull request refuses.
+- A new description stops a merge a person scheduled until they schedule it again. Agents cannot
+  schedule merges, so every agent description edit stops one.
+
+It needs no approval, has its own audit events, and its refusals reach the agent as worded.
+
+Proof: the effect test has an agent retitle its own pull request and be refused on a person's,
+whose title is unchanged. The registry, catalogue and audit-taxonomy tests include the tool.
+
 ## 2026-11-09 — The pull request page edits its title and description
 
 The pull request page gained what the API and CLI already had. The description card now always

@@ -364,6 +364,7 @@ base into the pull request's branch on the server, under the same protected-bran
 agent file write. A clean merge keeps the reviews on the change; a conflict names the files and
 writes nothing.
 
+`git.edit_pr` keeps an agent's title and description in step with what its change does.
 `git.mark_pr_ready` and `git.close_pr` let an agent finish or abandon its own work. It can open a
 draft, mark it ready once its checks pass, or close a pull request it no longer stands behind. An
 agent changes only the pull requests it opened. A person can reopen what it closed, and its close

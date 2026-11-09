@@ -185,6 +185,7 @@ mod tests {
                 "ci.retry_run",
                 "git.close_pr",
                 "git.comment",
+                "git.edit_pr",
                 "git.endorse_fork_ci",
                 "git.list_repositories",
                 "git.mark_pr_ready",

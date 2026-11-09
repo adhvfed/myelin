@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
 use crate::git_durable::{
-    describe_conflicts, map_durable_err, AgentFileWrite, BranchUpdate, DurableGitBackend,
+    describe_conflicts, map_durable_err, AgentFileWrite, BranchUpdate, DurableGitBackend, PrEdit,
     PrStateChange, RepoActorContext,
 };
 use crate::repo_authz::RepoPermission;
@@ -411,6 +411,32 @@ impl GitEffectApi {
                     Err(error) => deny_durable_error(error),
                 }
             }
+            "git.edit_pr" => {
+                let (repo, number) = match repo_and_number(args) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Pull) {
+                    return denied;
+                }
+                match self.backend.edit_pr_with_operation(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    PrEdit {
+                        title: str_arg(args, "title"),
+                        body_md: str_arg(args, "body_md"),
+                    },
+                    operation_id,
+                ) {
+                    Ok(_) => applied_resource(
+                        run,
+                        &format!("git.pr.edit:#{number}"),
+                        format!("myelin://{t}/git/pr/{repo}:{number}"),
+                        serde_json::json!({ "repo": repo, "number": number }),
+                    ),
+                    Err(DurableError::Forbidden(reason)) => EffectResult::Denied(reason),
+                    Err(error) => deny_durable_error(error),
+                }
+            }
             "git.mark_pr_ready" | "git.close_pr" => {
                 let (repo, number) = match repo_and_number(args) {
                     Ok(value) => value,
@@ -779,6 +805,32 @@ mod tests {
             EffectResult::AppliedResource { .. }
         ));
         assert_eq!(state(own), PrState::Closed);
+
+        let edited = api.apply_tool(
+            &RunCtx("edit-own".into()),
+            "git.edit_pr",
+            &serde_json::json!({ "repo": "alpha", "number": own, "title": "Agent work, explained" }),
+            &PrOperationId::parse("edit-own").unwrap(),
+        );
+        assert!(matches!(edited, EffectResult::AppliedResource { .. }));
+        let title = |number: u64| {
+            backend
+                .get_pr("acme", "eu-west", "alpha", number, &agent)
+                .unwrap()
+                .unwrap()
+                .title
+        };
+        assert_eq!(title(own), "Agent work, explained");
+        assert_eq!(
+            api.apply_tool(
+                &RunCtx("edit-theirs".into()),
+                "git.edit_pr",
+                &serde_json::json!({ "repo": "alpha", "number": theirs, "title": "Mine now" }),
+                &PrOperationId::parse("edit-theirs").unwrap(),
+            ),
+            EffectResult::Denied("an agent changes only the pull requests it opened".into())
+        );
+        assert_eq!(title(theirs), "alice-work");
         let _ = std::fs::remove_dir_all(root);
     }
 

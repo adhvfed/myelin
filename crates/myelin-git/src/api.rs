@@ -828,6 +828,13 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
+            local_name: "edit_pr",
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1,"description":"a pull request this agent opened"},"title":{"type":"string","minLength":1,"maxLength":512},"body_md":{"type":"string","maxLength":65536,"description":"the whole new description; an empty string removes it. A new description stops a merge someone else scheduled until they schedule it again."}},"additionalProperties":false}"#,
+            requires_approval: false,
+            required_caps: &["repo.push"],
+            handler: Handler::Lifecycle,
+        },
+        AgentToolDef {
             local_name: "close_pr",
             input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1,"description":"a pull request this agent opened and abandons; a person can reopen it"}},"additionalProperties":false}"#,
             requires_approval: false,
