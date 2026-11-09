@@ -276,6 +276,7 @@ pub enum CliParseError {
     DuplicateFlag { flag: &'static str },
     MissingValue { flag: &'static str },
     BadArg { value: String },
+    Use { hint: &'static str },
 }
 
 pub const REPO_LIST_CLI_MAX_LIMIT: usize = 100;
@@ -474,6 +475,9 @@ fn parse_pr_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
                 repo: Some((*repo).to_string()),
             })
         }
+        ["--repo", ..] => Err(CliParseError::Use {
+            hint: "pr list takes the repository directly: pr list <repo>",
+        }),
         [flag, ..] if flag.starts_with("--") => Err(unknown(flag)),
         [_, extra, ..] => Err(unknown(extra)),
         [only] => Err(unknown(only)),

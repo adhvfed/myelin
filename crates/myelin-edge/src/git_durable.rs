@@ -34,7 +34,7 @@ use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
     BranchProtectionRuleset, PrState, PullRequest, ReviewState, ReviewVerdict,
 };
-use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId};
+use myelin_git::pg_pr_store::{PgPrStore, PrMutation, PrOperationId, MERGE_IN_PROGRESS};
 use myelin_git::pr_list_pagination::{
     pr_list_static_scope, pr_list_visible_scope, PrListCursor, PrListCursorEndpoint,
     PrListDirection, PrListKey, PrListPage, PR_LIST_CURSOR_PREFIX,
@@ -2289,9 +2289,13 @@ impl DurableGitBackend {
         };
         let scope = TenantScope::from_verified_token(requester, requester.region.clone());
         match directory.get_principal(&scope, &PrincipalId(reviewer.into())) {
-            Ok(Some(row)) if row.status == PrincipalStatus::Active => {
-                Ok(matches!(row.kind, PrincipalKind::Agent { .. }))
-            }
+            Ok(Some(row)) if row.status == PrincipalStatus::Active => match row.kind {
+                PrincipalKind::Human => Ok(false),
+                PrincipalKind::Agent { .. } => Ok(true),
+                PrincipalKind::Service => Err(DurableError::InvalidInput(format!(
+                    "`{reviewer}` is a service, so it cannot review"
+                ))),
+            },
             Ok(_) => Err(DurableError::InvalidInput(format!(
                 "`{reviewer}` is not an active person or agent here, so they cannot review"
             ))),
@@ -2987,9 +2991,7 @@ impl DurableGitBackend {
                     || intent.actor_subject_id != actor.principal_id.0.trim()
                     || intent.ref_update_provenance != ref_update_provenance
                 {
-                    return Err(DurableError::Git(
-                        "a different merge operation is already pending".into(),
-                    ));
+                    return Err(DurableError::Conflict(MERGE_IN_PROGRESS.into()));
                 }
                 return store
                     .recover_pending_merge_target(

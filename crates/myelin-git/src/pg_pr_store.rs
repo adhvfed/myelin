@@ -519,20 +519,26 @@ pub enum PrMutation {
     Close {
         by: String,
     },
-    /// Bring a closed pull request back as open.
-    Reopen,
+    /// Bring a closed pull request back, as a draft if it was one. Unless `overriding` (a person
+    /// who can push), only whoever closed it may: checked under the row lock.
+    Reopen {
+        by: String,
+        overriding: bool,
+    },
     /// A draft asks for review and becomes mergeable.
     MarkReady,
     Touch,
 }
 
 const CLOSE_REFUSAL: &str = "only an open or draft pull request can be closed";
-const MERGE_IN_PROGRESS: &str =
+pub const MERGE_IN_PROGRESS: &str =
     "a merge is in progress for this pull request; try again once it finishes";
 /// Checked under the row lock, so a merge that lost a race with closing does not land.
 pub const MERGE_REFUSAL: &str = "only an open pull request can be merged";
 const REOPEN_REFUSAL: &str = "only a closed pull request can be reopened";
 const MARK_READY_REFUSAL: &str = "only a draft pull request can be marked ready for review";
+pub const REOPEN_CLOSER_REFUSAL: &str =
+    "someone else closed this pull request; reopening it takes push access";
 
 impl PrMutation {
     fn command_kind(&self) -> &'static str {
@@ -545,7 +551,7 @@ impl PrMutation {
             Self::RequestAutoMerge { .. } => "request-auto-merge",
             Self::CancelAutoMerge { .. } => "cancel-auto-merge",
             Self::Close { .. } => "close",
-            Self::Reopen => "reopen",
+            Self::Reopen { .. } => "reopen",
             Self::MarkReady => "mark-ready",
             Self::Touch => "touch",
         }
@@ -557,7 +563,7 @@ impl PrMutation {
             Self::SynchronizeHead { .. } | Self::AdoptBaseMerge { .. } => GIT_PR_SYNCHRONIZED,
             Self::RequestAutoMerge { .. } => GIT_PR_MERGE_QUEUED,
             Self::Close { .. } => GIT_PR_CLOSED,
-            Self::Reopen => GIT_PR_REOPENED,
+            Self::Reopen { .. } => GIT_PR_REOPENED,
             Self::MarkReady => GIT_PR_MARKED_READY,
             Self::CancelAutoMerge {
                 reason: Some(_), ..
@@ -681,15 +687,29 @@ impl PrMutation {
                 if !matches!(record.state, PrState::Draft | PrState::Open) {
                     return Err(CLOSE_REFUSAL);
                 }
+                record.closed_while_draft = record.state == PrState::Draft;
                 record.state = PrState::Closed;
                 record.auto_merge = None;
                 record.closed_by = Some(by);
             }
-            Self::Reopen => {
+            Self::Reopen { by, overriding } => {
                 if record.state != PrState::Closed {
                     return Err(REOPEN_REFUSAL);
                 }
-                record.state = PrState::Open;
+                if !overriding
+                    && record
+                        .closed_by
+                        .as_deref()
+                        .is_some_and(|closer| closer != by)
+                {
+                    return Err(REOPEN_CLOSER_REFUSAL);
+                }
+                record.state = if record.closed_while_draft {
+                    PrState::Draft
+                } else {
+                    PrState::Open
+                };
+                record.closed_while_draft = false;
                 record.closed_by = None;
                 // Closing withdrew the stopped-merge notice; its banner must not come back.
                 record.auto_merge_stopped = None;
@@ -2104,9 +2124,7 @@ impl PgPrStore {
                 || intent.ref_update_provenance != ref_update_provenance
                 || intent.method != method
             {
-                return Err(DurableError::Git(
-                    "a different merge operation is already pending".into(),
-                ));
+                return Err(DurableError::Conflict(MERGE_IN_PROGRESS.into()));
             }
             return self
                 .recover_pending_merge_target(
@@ -3540,6 +3558,12 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         DurableError::Conflict("the automatic merge changed before it could be stopped".into())
     } else if message.contains("an automatic merge needs the person") {
         DurableError::InvalidInput("an automatic merge needs the person who asked for it".into())
+    } else if message.contains(REOPEN_CLOSER_REFUSAL) {
+        DurableError::Forbidden(REOPEN_CLOSER_REFUSAL.into())
+    } else if message.contains("merge command is pending")
+        || message.contains("a different merge intent is already pending")
+    {
+        DurableError::Conflict(MERGE_IN_PROGRESS.into())
     } else if let Some(refusal) = [
         CLOSE_REFUSAL,
         REOPEN_REFUSAL,
@@ -4076,8 +4100,12 @@ mod tests {
         );
         let mut record = PrRecord::open(&draft, "a".repeat(40));
         assert_eq!(record.state, PrState::Draft);
+        let reopen = |by: &str, overriding| PrMutation::Reopen {
+            by: by.into(),
+            overriding,
+        };
         assert_eq!(
-            PrMutation::Reopen.apply_to_at(&mut record, 100),
+            reopen("author@acme.noreply", false).apply_to_at(&mut record, 100),
             Err(REOPEN_REFUSAL)
         );
         assert_eq!(PrMutation::MarkReady.event_type(), GIT_PR_MARKED_READY);
@@ -4118,8 +4146,18 @@ mod tests {
         );
         assert_eq!(close().apply_to_at(&mut record, 600), Err(CLOSE_REFUSAL));
 
-        assert_eq!(PrMutation::Reopen.event_type(), GIT_PR_REOPENED);
-        PrMutation::Reopen.apply_to_at(&mut record, 700).unwrap();
+        assert_eq!(
+            reopen("carol@acme.noreply", false).event_type(),
+            GIT_PR_REOPENED
+        );
+        assert_eq!(
+            reopen("author@acme.noreply", false).apply_to_at(&mut record, 650),
+            Err(REOPEN_CLOSER_REFUSAL),
+            "under the row lock, only the closer or someone who can push reopens"
+        );
+        reopen("author@acme.noreply", true)
+            .apply_to_at(&mut record, 700)
+            .unwrap();
         assert_eq!(
             (record.state, record.closed_by.as_deref()),
             (PrState::Open, None)
@@ -4136,10 +4174,33 @@ mod tests {
         record.state = PrState::Merged;
         for (mutation, refusal) in [
             (close(), CLOSE_REFUSAL),
-            (PrMutation::Reopen, REOPEN_REFUSAL),
+            (reopen("author@acme.noreply", true), REOPEN_REFUSAL),
             (PrMutation::MarkReady, MARK_READY_REFUSAL),
         ] {
             assert_eq!(mutation.apply_to_at(&mut record, 800), Err(refusal));
+        }
+        record.state = PrState::Draft;
+        close().apply_to_at(&mut record, 900).unwrap();
+        reopen("carol@acme.noreply", false)
+            .apply_to_at(&mut record, 1000)
+            .unwrap();
+        assert_eq!(
+            (record.state, record.closed_while_draft),
+            (PrState::Draft, false),
+            "a closed draft comes back as a draft"
+        );
+        assert!(matches!(
+            pg_error(myelin_storage::PgError::Query(REOPEN_CLOSER_REFUSAL.into())),
+            DurableError::Forbidden(_)
+        ));
+        for pending in [
+            "merge command is pending a durable ref outcome",
+            "a different merge intent is already pending",
+        ] {
+            assert!(matches!(
+                pg_error(myelin_storage::PgError::Query(pending.into())),
+                DurableError::Conflict(message) if message == MERGE_IN_PROGRESS
+            ));
         }
         for refusal in [CLOSE_REFUSAL, MERGE_REFUSAL, MERGE_IN_PROGRESS] {
             assert!(matches!(
@@ -4934,7 +4995,11 @@ mod tests {
         let close = PrMutation::Close {
             by: "author@tenant.noreply".into(),
         };
-        for (change, still_asked) in [(close, 0), (PrMutation::Reopen, 1)] {
+        let reopen = PrMutation::Reopen {
+            by: "author@tenant.noreply".into(),
+            overriding: false,
+        };
+        for (change, still_asked) in [(close, 0), (reopen, 1)] {
             store
                 .apply_mutation(
                     &scope_a,

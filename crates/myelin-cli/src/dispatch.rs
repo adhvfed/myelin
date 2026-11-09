@@ -194,13 +194,16 @@ impl EdgeCall {
 fn usage_from_git(e: CliParseError) -> CliError {
     let m = match e {
         CliParseError::Empty => {
-            "no git command given (try: repo list | pr view <n> | search code <q>)".to_string()
+            "no git command given (try: repo list | pr list <repo> | pr view <repo> <n> | search \
+             code <q>)"
+                .to_string()
         }
         CliParseError::Unknown { token } => format!("unknown git command token `{token}`"),
         CliParseError::MissingArg { what } => format!("missing argument: {what}"),
         CliParseError::DuplicateFlag { flag } => format!("duplicate flag: {flag}"),
         CliParseError::MissingValue { flag } => format!("missing value for flag: {flag}"),
         CliParseError::BadArg { value } => format!("malformed argument: `{value}`"),
+        CliParseError::Use { hint } => hint.to_string(),
     };
     CliError::Usage(m)
 }
@@ -660,6 +663,10 @@ mod tests {
         assert_eq!(cross_repo.path, "/v1/git/prs");
         assert!(cross_repo.query.is_none() && cross_repo.payload.is_none());
 
+        assert!(git_dispatch(&["pr", "list", "--repo", "platform/api"])
+            .unwrap_err()
+            .to_string()
+            .contains("pr list takes the repository directly: pr list <repo>"));
         let repo = git_dispatch(&["pr", "list", "platform/api"]).unwrap();
         assert_eq!(repo.method, HttpMethod::Get);
         assert_eq!(repo.path, "/v1/git/repos/platform/api/prs");

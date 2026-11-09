@@ -340,6 +340,9 @@ impl DurableGitBackend {
                 stop(format!("the branch could not merge: {reason}"))
             }
             Err(DurableError::Io(error)) => Err(DurableError::Io(error)),
+            Err(DurableError::Conflict(message)) if message == MERGE_IN_PROGRESS => {
+                Ok(QueueStep::Holding)
+            }
             Err(error) => stop(format!(
                 "the merge failed: {}",
                 map_durable_err(error).client_message()
@@ -448,6 +451,10 @@ impl DurableGitBackend {
             queue,
         ) {
             Ok(_) => Ok(QueueStep::Stopped(reason)),
+            // Someone is merging it by hand; the base waits for that outcome.
+            Err(DurableError::Conflict(message)) if message == MERGE_IN_PROGRESS => {
+                Ok(QueueStep::Holding)
+            }
             // Someone cancelled or scheduled again first; their decision stands.
             Err(DurableError::Conflict(_)) => Ok(QueueStep::WaitingForReview),
             Err(error) => Err(error),

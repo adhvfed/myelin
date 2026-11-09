@@ -282,6 +282,9 @@ pub struct PrRecord {
     /// Who closed it, so its author cannot undo a maintainer's decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_by: Option<String>,
+    /// A draft that was closed comes back as a draft.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed_while_draft: bool,
 }
 
 impl PrRecord {
@@ -310,6 +313,7 @@ impl PrRecord {
             auto_merge_stopped: None,
             merged_oid: None,
             closed_by: None,
+            closed_while_draft: false,
         }
     }
 

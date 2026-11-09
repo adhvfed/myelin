@@ -57,7 +57,13 @@ impl DurableGitBackend {
                 .closed_by
                 .as_deref()
                 .is_some_and(|closer| closer != me);
-        if record.author_pseudonym != me || closed_by_someone_else {
+        // Pushing to the repository is a person's authority over its pull requests; agents never
+        // borrow it.
+        let can_push = !Self::is_agent(principal)
+            && self
+                .repo_authz
+                .authorize_repo_permission(principal, &loc, RepoPermission::Push);
+        if (record.author_pseudonym != me || closed_by_someone_else) && !can_push {
             let refusal = match (Self::is_agent(principal), closed_by_someone_else) {
                 (true, false) => "an agent changes only the pull requests it opened".into(),
                 (true, true) => {
@@ -72,13 +78,7 @@ impl DurableGitBackend {
                      else closed"
                 ),
             };
-            if Self::is_agent(principal)
-                || !self
-                    .repo_authz
-                    .authorize_repo_permission(principal, &loc, RepoPermission::Push)
-            {
-                return Err(DurableError::Forbidden(refusal));
-            }
+            return Err(DurableError::Forbidden(refusal));
         }
         let head_ref = branch_ref(&record.head_ref);
         let same_repository = record.head_repo_slug == slug;
@@ -98,7 +98,11 @@ impl DurableGitBackend {
         }
         let mutation = match change {
             PrStateChange::Close => PrMutation::Close { by: me },
-            PrStateChange::Reopen => PrMutation::Reopen,
+            // The store checks the closer again under its row lock.
+            PrStateChange::Reopen => PrMutation::Reopen {
+                by: me,
+                overriding: can_push,
+            },
             PrStateChange::MarkReady => PrMutation::MarkReady,
         };
         let changed = self.pr_mutate(&loc, number, mutation, operation_id, principal)?;

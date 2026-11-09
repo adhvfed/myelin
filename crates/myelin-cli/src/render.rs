@@ -15,20 +15,26 @@ mod pull_request;
 mod refs;
 mod tool;
 
-/// Unicode format characters that reorder or hide the text around them: bidirectional controls
-/// and invisible separators. Zero-width joiners stay, since emoji and some scripts need them.
+/// Characters that reorder or hide the text around them: bidirectional embeddings, overrides
+/// and isolates, invisible separators and fillers, and tag characters. The weak direction marks
+/// and zero-width joiners stay, since right-to-left text, emoji and some scripts need them.
 fn reorders_or_hides_text(character: char) -> bool {
     matches!(
         character,
-        '\u{061c}'
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{115f}'
+            | '\u{1160}'
             | '\u{180e}'
             | '\u{200b}'
-            | '\u{200e}'
-            | '\u{200f}'
             | '\u{202a}'..='\u{202e}'
             | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{3164}'
             | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
     )
 }
 
@@ -1213,6 +1219,16 @@ mod tests {
         assert_eq!(
             terminal_safe_log_bytes("a\u{2066}b\n".as_bytes()),
             "a\\u{2066}b\n"
+        );
+        assert_eq!(
+            terminal_safe_single_line("ok\u{e0041}"),
+            "ok\\u{e0041}",
+            "tag characters show"
+        );
+        assert_eq!(
+            terminal_safe_single_line("שלום\u{200f}!"),
+            "שלום\u{200f}!",
+            "right-to-left text keeps its direction marks"
         );
 
         let json = render(&issue, true);

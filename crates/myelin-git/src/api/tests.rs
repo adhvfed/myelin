@@ -265,7 +265,7 @@ fn git_cli_rejects_every_unconsumed_operand_flag_and_counterfeit_feature() {
         vec!["repo", "create", "core", "second-slug"],
         vec!["repo", "create", "../outside"],
         vec!["repo", "view", "core", "extra"],
-        vec!["pr", "list", "--repo", "core"],
+        vec!["pr", "list", "--repo"],
         vec!["pr", "list", "core", "extra"],
         vec!["pr", "list", "../outside"],
         vec!["pr", "open", "core", "--title", "Change", "extra"],

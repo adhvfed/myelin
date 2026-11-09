@@ -2020,7 +2020,6 @@ describe.sequential("the CLI authentication journey", () => {
           "git",
           "pr",
           "list",
-          "--repo",
           sourceRepository.slug,
         );
         expect(listed.exitCode, listed.stderr).toBe(0);

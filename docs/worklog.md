@@ -4,6 +4,45 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Closing rules hold under the row lock
+
+A third independent pass re-checked the two review-fix commits. It confirmed all six earlier
+findings fixed on every path that reaches them, and found these:
+- **Race in the closer rule.** The edge decided "only the closer or someone who can push reopens"
+  from a record it read before the write. A reopen that stalled could land on a maintainer's
+  newer close. The reopen mutation now carries who asks and whether they can push, and the store
+  enforces the rule under its row lock.
+- **A reopened draft skipped the ready step.** A closed draft reopened as open, and so was
+  mergeable without ever being marked ready. It now comes back as a draft.
+- **In-flight merges answered badly.**
+  - A second merge, or the queue, meeting a merge already in flight got a 500 or the
+    idempotency-key message. All such paths now say a merge is in progress.
+  - The queue moved on to later pull requests while someone's merge was in flight, or stopped the
+    automatic merge outright. It now holds the base until that merge settles.
+- **Services as reviewers.** A service principal could be requested as a reviewer and was
+  recorded as a person. Services are refused.
+- **Escaping set.** Tag characters, the deprecated format controls and invisible fillers are now
+  escaped in terminal output. The weak direction marks are no longer escaped, so Hebrew and Arabic
+  titles read correctly.
+- **`pr list --repo`.** It now answers with the form that works, and the empty-command hint names
+  `pr view <repo> <n>` correctly.
+
+The full system sweep (159 tests) also caught a journey still using `pr list --repo`. It is
+updated.
+
+Proof:
+- Store tests cover the closer refusal under the lock, a closed draft reopening as a draft, and
+  the merge-in-progress mappings.
+- A new edge test, with an in-memory principal directory, refuses suspended, service, foreign and
+  unknown reviewers, and records an agent reviewer as an agent.
+- The live Postgres PR store test passes.
+- The CLI-authentication, close-and-reopen, CLI, merge-queue and Git lifecycle journeys pass (33
+  tests).
+
+Known gap: an idempotent retry of an open whose reviewer was deactivated after the first attempt
+gets the reviewer refusal instead of the original success. Reviewers are checked before the
+ledger replay.
+
 ## 2026-11-09 — A maintainer's close sticks, and reviewers must exist
 
 A second independent review, of the edge, routes, and CLI, confirmed:

@@ -298,3 +298,118 @@ fn reopening_follows_a_branch_that_moved_and_refuses_one_that_is_gone() {
             if message == "its branch feature no longer exists; push it again to reopen this pull request"
     ));
 }
+
+#[test]
+fn only_active_people_and_agents_of_the_tenant_can_be_asked_to_review() {
+    let directory = myelin_identity_service::PrincipalStore::new(Arc::new(KmsEngine::new()));
+    let author = principal("author", PrincipalKind::Human);
+    let here = TenantScope::from_verified_token(&author, author.region.clone());
+    let mut outsider = principal("mallory", PrincipalKind::Human);
+    outsider.tenant = TenantId("elsewhere".into());
+    let elsewhere = TenantScope::from_verified_token(&outsider, outsider.region.clone());
+    for (scope, id, kind, status) in [
+        (&here, "bob", PrincipalKind::Human, PrincipalStatus::Active),
+        (
+            &here,
+            "triage",
+            agent("triage").kind,
+            PrincipalStatus::Active,
+        ),
+        (
+            &here,
+            "gone",
+            PrincipalKind::Human,
+            PrincipalStatus::Suspended,
+        ),
+        (
+            &here,
+            "queue",
+            PrincipalKind::Service,
+            PrincipalStatus::Active,
+        ),
+        (
+            &elsewhere,
+            "mallory",
+            PrincipalKind::Human,
+            PrincipalStatus::Active,
+        ),
+    ] {
+        directory
+            .put_principal(
+                scope,
+                PrincipalId(id.into()),
+                kind,
+                DataRole::Controller,
+                status,
+                None,
+            )
+            .unwrap();
+    }
+    let root = std::env::temp_dir().join(format!(
+        "myelin-pr-reviewers-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let backend =
+        DurableGitBackend::rooted_inmem_for_test(&root).with_principal_directory(directory);
+    backend.create_repo(TENANT, REGION, REPO).unwrap();
+    let repo = backend.store.open_repo(&loc()).unwrap();
+    land(&repo, "refs/heads/main", None, "README.md", b"# start\n");
+    let head = land(
+        &repo,
+        "refs/heads/feature",
+        Some("refs/heads/main"),
+        "feature.txt",
+        b"one\n",
+    );
+    let open = |reviewers: &[&str]| {
+        backend.open_pr_with_operation(
+            TENANT,
+            REGION,
+            REPO,
+            &serde_json::json!({
+                "title": "Feature",
+                "base_ref": "refs/heads/main",
+                "head_ref": "refs/heads/feature",
+                "head_oid": head.0,
+                "reviewers": reviewers,
+            }),
+            &author,
+            &backend.fresh_operation_id().unwrap(),
+        )
+    };
+
+    let opened = open(&["bob", "triage"]).unwrap();
+    let requested: Vec<(&str, bool)> = opened
+        .reviews
+        .iter()
+        .map(|review| (review.reviewer_pseudonym.as_str(), review.is_agent))
+        .collect();
+    assert_eq!(
+        requested,
+        [("bob@acme.noreply", false), ("triage@acme.noreply", true)]
+    );
+    for (reviewer, refusal) in [
+        (
+            "gone",
+            "`gone` is not an active person or agent here, so they cannot review",
+        ),
+        ("queue", "`queue` is a service, so it cannot review"),
+        (
+            "mallory",
+            "`mallory` is not an active person or agent here, so they cannot review",
+        ),
+        (
+            "nobody",
+            "`nobody` is not an active person or agent here, so they cannot review",
+        ),
+    ] {
+        assert!(
+            matches!(open(&[reviewer]), Err(DurableError::InvalidInput(message)) if message == refusal),
+            "{reviewer}"
+        );
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
