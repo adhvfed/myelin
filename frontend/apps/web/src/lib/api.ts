@@ -376,7 +376,12 @@ export interface PrVM {
   /** The base moved past this open branch; it must be updated before it can merge. */
   behind_base?: boolean;
   /** Waiting in its base branch's merge queue with this person's merge authority. */
-  auto_merge?: { requested_by: string; requested_at: number } | null;
+  auto_merge?: {
+    requested_by: string;
+    requested_at: number;
+    /** Pull requests scheduled for the same base before this one. */
+    ahead?: number;
+  } | null;
   /** Why the merge queue gave up, until someone asks again. */
   auto_merge_stopped?: { reason: string; at: number } | null;
   /** The branch lives in a fork, which Myelin does not update or queue. */

@@ -1287,7 +1287,7 @@ export function devPost(repo, n, tail, body, viewer = "u_dev_operator@acme.norep
       return { status: 409, json: { error: { code: "conflict", message: "only an open pull request can merge automatically" } } };
     }
     const current = AUTO_MERGES.get(n)?.auto_merge;
-    const auto_merge = current ?? { requested_by: viewer, requested_at: 1719450100 };
+    const auto_merge = current ?? { requested_by: viewer, requested_at: 1719450100, ahead: 0 };
     AUTO_MERGES.set(n, { auto_merge, auto_merge_stopped: null });
     return { status: 200, json: { applied: { action: "git.pr.auto_merge.request", auto_merge }, durable: true } };
   }

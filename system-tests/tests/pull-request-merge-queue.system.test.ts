@@ -88,6 +88,11 @@ describe("the merge queue", () => {
       });
     }
 
+    // The first is still waiting for its required check, so the second knows its place.
+    expect(await pullRequest(project, second.number)).toMatchObject({
+      auto_merge: { ahead: 1 },
+    });
+
     const merged = await eventually(async () => {
       const states = await Promise.all([first, second].map((change) =>
         pullRequest(project, change.number)));

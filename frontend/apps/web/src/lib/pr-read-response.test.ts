@@ -125,6 +125,10 @@ describe("PR read response projection", () => {
     });
     expect(parsePr({ ...record, auto_merge: null, auto_merge_stopped: { reason: "a check failed", at: 3 } }))
       .toMatchObject({ auto_merge: null, auto_merge_stopped: { reason: "a check failed", at: 3 } });
+    expect(parsePr({ ...record, auto_merge: { requested_by: "a@acme.noreply", requested_at: 1, ahead: 2 } }))
+      .toMatchObject({ auto_merge: { ahead: 2 } });
+    expect(parsePr({ ...record, auto_merge: { requested_by: "a@acme.noreply", requested_at: 1, ahead: -1 } }))
+      .toBeNull();
     expect(parsePr({ ...record, auto_merge: { requested_by: "", requested_at: 1 } })).toBeNull();
     expect(parsePr({ ...record, auto_merge_stopped: { reason: "x", at: -1 } })).toBeNull();
   });

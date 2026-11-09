@@ -140,7 +140,8 @@ export function parsePrListPage(value: unknown, scope: "repo" | "cross"): PrList
 function autoMergeShape(value: unknown): boolean {
   if (value === undefined || value === null) return true;
   const input = record(value);
-  return input !== null && bounded(input.requested_by, 4 * 1024) && uint(input.requested_at);
+  return input !== null && bounded(input.requested_by, 4 * 1024) && uint(input.requested_at) &&
+    (input.ahead === undefined || uint(input.ahead));
 }
 
 function autoMergeStoppedShape(value: unknown): boolean {
@@ -188,6 +189,9 @@ export function parsePr(value: unknown): PrVM | null {
       auto_merge: input.auto_merge === null ? null : {
         requested_by: (input.auto_merge as Record<string, unknown>).requested_by as string,
         requested_at: (input.auto_merge as Record<string, unknown>).requested_at as number,
+        ...((input.auto_merge as Record<string, unknown>).ahead === undefined
+          ? {}
+          : { ahead: (input.auto_merge as Record<string, unknown>).ahead as number }),
       },
     }),
     ...(input.auto_merge_stopped === undefined ? {} : {

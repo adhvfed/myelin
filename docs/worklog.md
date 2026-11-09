@@ -4,6 +4,19 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — A scheduled pull request shows its place in line
+
+A pull request scheduled to merge when ready said what would happen, but not when. Its overview now
+reports `auto_merge.ahead`, the number of open pull requests scheduled for the same base before it.
+The web card reads "Next in line for main." or "2 scheduled earlier for main." The count includes
+earlier pull requests that are still waiting for review. The queue skips those, so the count is an
+upper bound and never a promise.
+
+Proof: the merge-queue journey sees the second of two scheduled pull requests report one ahead while
+the first waits for its required check, and then both merge. A unit test covers first in line and no
+place once cancelled. The mocked browser test reads "Next in line for main." The frontend check and
+strict Clippy pass.
+
 ## 2026-11-09 — Squash merges
 
 Merging was fast-forward only. With Update branch and the merge queue, that put a "Merge branch

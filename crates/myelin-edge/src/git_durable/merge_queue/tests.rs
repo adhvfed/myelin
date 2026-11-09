@@ -332,3 +332,34 @@ fn a_squash_merge_lands_one_commit_with_the_reviewed_tree() {
     assert_eq!(record.state, PrState::Merged);
     assert_eq!(record.merged_oid, Some(new_oid));
 }
+
+#[test]
+fn a_queued_pull_request_knows_how_many_were_scheduled_before_it() {
+    let fixture = pull_request_behind_its_base(("feature.txt", b"feature\n"));
+    let record = fixture.request(&fixture.author).unwrap();
+    assert_eq!(
+        fixture
+            .backend
+            .auto_merge_ahead(&loc(), &record, &fixture.author)
+            .unwrap(),
+        Some(0),
+        "first in line"
+    );
+    let unqueued = fixture.record();
+    fixture
+        .backend
+        .cancel_auto_merge_with_operation(
+            RepoActorContext::new(TENANT, REGION, REPO, &fixture.author).for_pr(fixture.number),
+            &fixture.backend.fresh_operation_id().unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .backend
+            .auto_merge_ahead(&loc(), &fixture.record(), &fixture.author)
+            .unwrap(),
+        None,
+        "not queued, so no place in line"
+    );
+    assert!(unqueued.auto_merge.is_some());
+}

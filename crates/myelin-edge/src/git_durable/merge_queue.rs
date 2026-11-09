@@ -96,6 +96,50 @@ impl DurableGitBackend {
         )
     }
 
+    /// How many pull requests were scheduled for the same base before this one, if it is queued.
+    pub(super) fn auto_merge_ahead(
+        &self,
+        loc: &RepoLoc,
+        record: &PrRecord,
+        principal: &Principal,
+    ) -> Result<Option<u64>, DurableError> {
+        let Some(request) = record
+            .auto_merge
+            .as_ref()
+            .filter(|_| record.state == PrState::Open)
+        else {
+            return Ok(None);
+        };
+        if let Some(store) = &self.pg_prs {
+            return store
+                .auto_merge_ahead(
+                    &Self::verified_pr_scope(principal, loc)?,
+                    &loc.repo,
+                    &record.base_ref,
+                    request.requested_at,
+                    record.number,
+                )
+                .map(Some);
+        }
+        let earlier = self
+            .prs
+            .list_bounded(
+                loc,
+                PR_LIST_PER_REPO_MAX_RECORDS,
+                PR_LIST_PER_REPO_MAX_BYTES,
+            )?
+            .into_iter()
+            .filter(|other| other.state == PrState::Open && other.base_ref == record.base_ref)
+            .filter_map(|other| {
+                other
+                    .auto_merge
+                    .map(|queued| (queued.requested_at, other.number))
+            })
+            .filter(|position| *position < (request.requested_at, record.number))
+            .count();
+        Ok(Some(earlier as u64))
+    }
+
     /// Asks the merge queue to look again soon, after anything that can make a pull request ready.
     pub(crate) fn wake_merge_queue(&self) {
         self.merge_queue_wakeup.notify_one();

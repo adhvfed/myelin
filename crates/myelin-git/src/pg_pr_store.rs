@@ -1117,6 +1117,54 @@ impl PgPrStore {
             .collect()
     }
 
+    /// How many open pull requests were scheduled to merge into `base_ref` before this one.
+    pub fn auto_merge_ahead(
+        &self,
+        scope: &TenantScope,
+        repo: &str,
+        base_ref: &str,
+        requested_at: i64,
+        number: u64,
+    ) -> Result<u64, DurableError> {
+        let target = self.scoped_target(scope, repo)?;
+        let provider = self.provider.clone();
+        let tenant_id = target.tenant_id;
+        let region = target.region;
+        let loc = target.loc;
+        let transaction_tenant = tenant_id.0.clone();
+        let base_ref = base_ref.to_owned();
+        let number = db_number(number)?;
+        let ahead: i64 = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            sqlx::query_scalar(
+                                "SELECT count(*) FROM git_pr \
+                                 WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 \
+                                   AND record->>'state' = 'Open' \
+                                   AND record->'auto_merge' IS NOT NULL \
+                                   AND record->>'base_ref' = $4 \
+                                   AND ((record->'auto_merge'->>'requested_at')::bigint, number) \
+                                       < ($5, $6)",
+                            )
+                            .bind(&tenant_id.0)
+                            .bind(&region.0)
+                            .bind(&loc.repo)
+                            .bind(&base_ref)
+                            .bind(requested_at)
+                            .bind(number)
+                            .fetch_one(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("count the merge queue ahead"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        u64::try_from(ahead).map_err(|_| DurableError::Io("merge queue count malformed".into()))
+    }
+
     pub fn open_heads_for_ref(
         &self,
         scope: &TenantScope,

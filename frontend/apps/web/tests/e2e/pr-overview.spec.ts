@@ -389,6 +389,7 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     const queued = page.getByTestId("auto-merge-queued");
     await expect(queued).toContainText("Merging automatically when ready.");
     await expect(queued).toContainText("merge rights of u_dev_operator@acme.noreply, who asked.");
+    await expect(page.getByTestId("auto-merge-position")).toHaveText("Next in line for main.");
     await queued.getByRole("button", { name: "Cancel automatic merge" }).click();
     await expect(page.getByText("Automatic merge cancelled")).toBeVisible();
     await expect(page.getByRole("button", { name: "Merge when ready" })).toBeVisible();

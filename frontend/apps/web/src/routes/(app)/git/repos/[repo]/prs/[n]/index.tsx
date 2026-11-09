@@ -1166,6 +1166,13 @@ function MergeCard(props: {
                   of {request().requested_by}, who asked.
                 </span>
               </span>
+              <Show when={request().ahead !== undefined}>
+                <span data-testid="auto-merge-position" style={{ color: "var(--text-muted)" }}>
+                  {request().ahead === 0
+                    ? `Next in line for ${baseName()}.`
+                    : `${request().ahead} scheduled earlier for ${baseName()}.`}
+                </span>
+              </Show>
               <button type="button" data-testid="cancel-auto-merge-button" disabled={scheduling()} aria-busy={scheduling()} onClick={() => void doAutoMerge(false)} class="btn-secondary" style={{ ...barBtn, "align-self": "flex-start" }}>
                 Cancel automatic merge
               </button>

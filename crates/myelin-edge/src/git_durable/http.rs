@@ -624,6 +624,14 @@ impl Handler for DPrOverview {
             if let Some(behind) = self.be.pr_behind_base(&loc, &rec) {
                 obj.insert("behind_base".into(), json!(behind));
             }
+            if let (Some(ahead), Some(Value::Object(queued))) = (
+                self.be
+                    .auto_merge_ahead(&loc, &rec, ctx.principal)
+                    .map_err(map_durable_err)?,
+                obj.get_mut("auto_merge"),
+            ) {
+                queued.insert("ahead".into(), json!(ahead));
+            }
         }
         Ok(EdgeResponse::json(200, &vm))
     }
