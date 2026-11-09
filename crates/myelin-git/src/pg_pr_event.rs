@@ -4,11 +4,13 @@ use myelin_events::{
     AggregateKey, ArtifactRef, DataRole, EmitContextBase, EventDraft, EventType, IdMinter,
     OutboxTransaction, OutboxTx, Visibility,
 };
+use myelin_query::SignalState;
 use myelin_storage::pgrelay::PgRelay;
 
 use crate::core::RepoLoc;
 use crate::events::{
-    GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REVIEW_SUBMITTED,
+    GIT_PR_CLOSED, GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_MARKED_READY, GIT_PR_MERGED,
+    GIT_PR_OPENED, GIT_PR_REOPENED, GIT_PR_SYNCHRONIZED, GIT_REVIEW_SUBMITTED,
 };
 use crate::notif_rules::{
     outstanding_review_request_signal_drafts, review_request_resolved_signal_draft,
@@ -116,15 +118,28 @@ pub(crate) async fn co_commit_event(
         .first()
         .map(|row| row.envelope.clone())
         .ok_or_else(|| pg_query("missing PR envelope"))?;
-    let signal_drafts = if matches!(event_type, GIT_PR_OPENED | GIT_PR_SYNCHRONIZED) {
+    let signal_drafts = if matches!(
+        event_type,
+        GIT_PR_OPENED | GIT_PR_SYNCHRONIZED | GIT_PR_MARKED_READY | GIT_PR_REOPENED
+    ) {
         outstanding_review_request_signal_drafts(
             &signal_ctx.tenant,
             &signal_ctx.region,
             &loc.repo,
             record,
             &signal_ctx.recorded_at.0,
+            SignalState::Open,
         )
         .map_err(|_| pg_query("derive outstanding PR review-request signals"))?
+    } else if matches!(event_type, GIT_PR_MERGED | GIT_PR_CLOSED) {
+        crate::notif_rules::ended_pull_request_signal_drafts(
+            &signal_ctx.tenant,
+            &signal_ctx.region,
+            &loc.repo,
+            record,
+            &signal_ctx.recorded_at.0,
+        )
+        .map_err(|_| pg_query("derive ended PR signals"))?
     } else if event_type == GIT_REVIEW_SUBMITTED {
         review_request_resolved_signal_draft(
             &signal_ctx.tenant,

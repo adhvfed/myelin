@@ -1580,6 +1580,37 @@ impl Handler for DUpdateBranch {
     }
 }
 
+struct DPrState {
+    be: Arc<DurableGitBackend>,
+    change: PrStateChange,
+}
+impl Handler for DPrState {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        optional_json::<EmptyMutationBody>(&ctx.request.body, self.change.action())?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
+        let repo = param(ctx, "repo")?;
+        let record = self
+            .be
+            .change_pr_state_with_operation(
+                RepoActorContext::new(tenant_of(ctx), region_of(ctx), repo, ctx.principal)
+                    .for_pr(pull_request_number_param(ctx, "n")?),
+                self.change,
+                &operation_id,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({
+                "applied": {
+                    "action": self.change.action(),
+                    "pr": DurableGitBackend::pr_json(tenant_of(ctx), repo, &record),
+                },
+                "durable": true,
+            }),
+        ))
+    }
+}
+
 struct DAutoMerge {
     be: Arc<DurableGitBackend>,
     request: bool,
@@ -1993,6 +2024,25 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         "git.pr.update_branch",
         guarded(&be, Push, Arc::new(DUpdateBranch { be: be.clone() })),
     );
+    // The author may change their own pull request with only read access; the backend decides.
+    for change in PrStateChange::ALL {
+        b = b.route(
+            post,
+            &reroot(&format!(
+                "/api/git/repos/{{repo}}/prs/{{n}}/{}",
+                change.verb()
+            )),
+            change.action(),
+            guarded(
+                &be,
+                Pull,
+                Arc::new(DPrState {
+                    be: be.clone(),
+                    change,
+                }),
+            ),
+        );
+    }
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),

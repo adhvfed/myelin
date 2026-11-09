@@ -132,6 +132,36 @@ pub enum MergeMethod {
     Squash,
 }
 
+/// Whether a pull request is under consideration: closing it, reopening it, or marking a draft
+/// ready for review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PrStateChange {
+    Close,
+    Reopen,
+    MarkReady,
+}
+
+impl PrStateChange {
+    pub const ALL: [Self; 3] = [Self::Close, Self::Reopen, Self::MarkReady];
+
+    /// The word for it in `myelin repo pr <verb>` and in `/prs/{n}/<verb>`.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Reopen => "reopen",
+            Self::MarkReady => "ready",
+        }
+    }
+
+    pub fn action(self) -> &'static str {
+        match self {
+            Self::Close => "git.pr.close",
+            Self::Reopen => "git.pr.reopen",
+            Self::MarkReady => "git.pr.ready",
+        }
+    }
+}
+
 /// Squashed commit summaries beyond this many are counted rather than listed.
 const SQUASH_SUMMARY_LINES: usize = 50;
 

@@ -453,6 +453,12 @@ fn render_pull_request_change(value: &Value, call: Option<&EdgeCall>) -> Option<
             .map(|oid| &oid[..12])
     };
     let action = applied.get("action")?.as_str()?;
+    if let Some(rendered) = applied
+        .get("pr")
+        .and_then(|pr| pull_request::render_state_change(path, action, pr))
+    {
+        return Some(rendered);
+    }
     if path.ends_with("/prs") && action == "git.pr.open" {
         return Some(format!(
             "opened {}\n",
@@ -811,6 +817,25 @@ mod tests {
             render(&list, false),
             "platform #48 Ship it [open]  ship → main · approved · checks running (4/5)\n"
         );
+    }
+
+    #[test]
+    fn closing_reopening_and_readying_read_as_sentences() {
+        let pr = json!({ "number": 7, "title": "Ship it\u{1b}[2J", "pr_state": "closed" });
+        for (verb, action, expected) in [
+            ("close", "git.pr.close", "closed #7 Ship it\\x1b[2J\n"),
+            ("reopen", "git.pr.reopen", "reopened #7 Ship it\\x1b[2J\n"),
+            (
+                "ready",
+                "git.pr.ready",
+                "#7 Ship it\\x1b[2J is ready for review\n",
+            ),
+        ] {
+            let call = crate::dispatch::git_dispatch(&["pr", verb, "alpha", "7"]).unwrap();
+            assert_eq!(call.path, format!("/v1/git/repos/alpha/prs/7/{verb}"));
+            let receipt = json!({ "applied": { "action": action, "pr": pr }, "durable": true });
+            assert_eq!(render_for_call(&receipt, false, &call), expected);
+        }
     }
 
     #[test]

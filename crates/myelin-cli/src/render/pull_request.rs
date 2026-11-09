@@ -1,5 +1,6 @@
 //! Pull requests in the terminal: one readable view, and one line per pull request in a list.
 
+use myelin_git::pr_store::PrStateChange;
 use serde_json::Value;
 
 use crate::dispatch::EdgeCall;
@@ -102,6 +103,25 @@ pub(super) fn render_view(value: &Value, call: Option<&EdgeCall>) -> Option<Stri
         out.push_str(&format!("  merged as {}\n", short_oid(merged)));
     }
     Some(out)
+}
+
+/// The receipt for closing, reopening, or marking a pull request ready for review.
+pub(super) fn render_state_change(path: &str, action: &str, pr: &Value) -> Option<String> {
+    let change = PrStateChange::ALL
+        .into_iter()
+        .find(|change| change.action() == action)?;
+    if !path.ends_with(&format!("/{}", change.verb())) {
+        return None;
+    }
+    let number = pr.get("number")?.as_u64()?;
+    let title = text(pr, "title")
+        .map(terminal_safe_single_line)
+        .unwrap_or_else(|| "(untitled)".into());
+    Some(match change {
+        PrStateChange::Close => format!("closed #{number} {title}\n"),
+        PrStateChange::Reopen => format!("reopened #{number} {title}\n"),
+        PrStateChange::MarkReady => format!("#{number} {title} is ready for review\n"),
+    })
 }
 
 /// One pull request in a list.

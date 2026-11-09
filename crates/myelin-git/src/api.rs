@@ -222,6 +222,11 @@ pub enum CliCommand {
         repo: String,
         number: u64,
     },
+    PrChangeState {
+        repo: String,
+        number: u64,
+        change: crate::pr_store::PrStateChange,
+    },
     SearchCode {
         query: String,
         repo: Option<String>,
@@ -235,7 +240,8 @@ impl CliCommand {
             CliCommand::RepoCreate { .. }
             | CliCommand::PrOpen { .. }
             | CliCommand::PrReview { .. }
-            | CliCommand::PrUpdateBranch { .. } => Handler::Lifecycle,
+            | CliCommand::PrUpdateBranch { .. }
+            | CliCommand::PrChangeState { .. } => Handler::Lifecycle,
             CliCommand::RepoView { .. } | CliCommand::PrView { .. } => Handler::Project,
             CliCommand::PrChecks { .. } => Handler::CheckStatus,
             CliCommand::PrMerge { .. }
@@ -257,6 +263,7 @@ impl CliCommand {
                 | CliCommand::PrAutoMerge { .. }
                 | CliCommand::PrDisableAutoMerge { .. }
                 | CliCommand::PrEndorseForkCi { .. }
+                | CliCommand::PrChangeState { .. }
         )
     }
 }
@@ -435,9 +442,22 @@ fn parse_pr(rest: &[&str]) -> Result<CliCommand, CliParseError> {
             let (repo, number) = repo_and_number(args)?;
             Ok(CliCommand::PrEndorseForkCi { repo, number })
         }
-        other => Err(CliParseError::Unknown {
-            token: other.to_string(),
-        }),
+        other => match crate::pr_store::PrStateChange::ALL
+            .into_iter()
+            .find(|change| change.verb() == other)
+        {
+            Some(change) => {
+                let (repo, number) = repo_and_number(args)?;
+                Ok(CliCommand::PrChangeState {
+                    repo,
+                    number,
+                    change,
+                })
+            }
+            None => Err(CliParseError::Unknown {
+                token: other.to_string(),
+            }),
+        },
     }
 }
 

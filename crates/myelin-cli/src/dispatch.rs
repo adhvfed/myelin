@@ -326,6 +326,14 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/update-branch"),
             json!({}),
         )),
+        CliCommand::PrChangeState {
+            repo,
+            number,
+            change,
+        } => Ok(EdgeCall::post_json(
+            format!("/v1/git/repos/{repo}/prs/{number}/{}", change.verb()),
+            json!({}),
+        )),
         CliCommand::PrAutoMerge {
             repo,
             number,

@@ -143,6 +143,23 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         parse_cli(&["pr", "open", "core", "--title", "Ship", "--reviewer"]),
         Err(CliParseError::MissingValue { flag: "--reviewer" })
     ));
+    for (verb, change) in [
+        ("close", crate::pr_store::PrStateChange::Close),
+        ("reopen", crate::pr_store::PrStateChange::Reopen),
+        ("ready", crate::pr_store::PrStateChange::MarkReady),
+    ] {
+        let command = parse_cli(&["pr", verb, "core", "7"]).unwrap();
+        assert_eq!(
+            command,
+            CliCommand::PrChangeState {
+                repo: "core".into(),
+                number: 7,
+                change,
+            }
+        );
+        assert!(command.is_write());
+        assert!(parse_cli(&["pr", verb, "core", "7", "--now"]).is_err());
+    }
     assert!(matches!(
         parse_cli(&["pr", "open", "core", "--head-oid", "abc"]),
         Err(CliParseError::MissingArg { what: "title" })

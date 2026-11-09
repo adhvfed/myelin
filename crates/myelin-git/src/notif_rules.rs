@@ -78,6 +78,26 @@ pub(crate) fn auto_merge_signal_drafts(
         }
         _ => return Ok(Vec::new()),
     };
+    auto_merge_stopped_signal(
+        tenant,
+        region,
+        repo,
+        record,
+        requested_by,
+        recorded_at,
+        state,
+    )
+}
+
+fn auto_merge_stopped_signal(
+    tenant: &TenantId,
+    region: &Region,
+    repo: &str,
+    record: &PrRecord,
+    requested_by: &str,
+    recorded_at: &str,
+    state: SignalState,
+) -> Result<Vec<EventDraft>, ReviewSignalError> {
     if requested_by.is_empty() {
         return Ok(Vec::new());
     }
@@ -99,6 +119,37 @@ pub(crate) fn auto_merge_signal_drafts(
     .collect())
 }
 
+/// A merged or closed pull request no longer asks anyone for review, and a merge the queue
+/// stopped no longer waits on the person who scheduled it.
+pub(crate) fn ended_pull_request_signal_drafts(
+    tenant: &TenantId,
+    region: &Region,
+    repo: &str,
+    record: &PrRecord,
+    recorded_at: &str,
+) -> Result<Vec<EventDraft>, ReviewSignalError> {
+    let mut drafts = outstanding_review_request_signal_drafts(
+        tenant,
+        region,
+        repo,
+        record,
+        recorded_at,
+        SignalState::Resolved,
+    )?;
+    if let Some(stopped) = &record.auto_merge_stopped {
+        drafts.extend(auto_merge_stopped_signal(
+            tenant,
+            region,
+            repo,
+            record,
+            &stopped.requested_by,
+            recorded_at,
+            SignalState::Resolved,
+        )?);
+    }
+    Ok(drafts)
+}
+
 pub fn register_git_notif_rules(
     registry: &mut NotifRuleRegistry,
 ) -> Result<&mut NotifRuleRegistry, myelin_notif::DefineRuleError> {
@@ -108,12 +159,15 @@ pub fn register_git_notif_rules(
     Ok(registry)
 }
 
+/// One signal in `state` for each review request that no later review from the same person
+/// answered.
 pub(crate) fn outstanding_review_request_signal_drafts(
     tenant: &TenantId,
     region: &Region,
     repo: &str,
     record: &PrRecord,
     recorded_at: &str,
+    state: SignalState,
 ) -> Result<Vec<EventDraft>, ReviewSignalError> {
     let rule = review_requested_rule()?;
     let subject = ArtifactRef(format!(
@@ -140,7 +194,7 @@ pub(crate) fn outstanding_review_request_signal_drafts(
             &subject,
             &review.reviewer_pseudonym,
             recorded_at,
-            SignalState::Open,
+            state,
         )? {
             drafts.push(draft);
         }
@@ -380,6 +434,7 @@ mod tests {
             "core",
             &record,
             "2026-08-09T12:00:00Z",
+            SignalState::Open,
         )
         .unwrap();
         assert_eq!(drafts.len(), 1, "only the outstanding request is signalled");
@@ -424,6 +479,7 @@ mod tests {
             "core",
             &record,
             "2026-08-09T12:10:00Z",
+            SignalState::Open,
         )
         .unwrap();
         assert!(
@@ -483,6 +539,74 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].type_.0, "signal.resolved");
         assert_eq!(resolved[0].aggregate, stopped[0].aggregate);
+    }
+
+    #[test]
+    fn an_ended_pull_request_withdraws_what_it_still_asked_of_people() {
+        let pr = PullRequest::open(
+            7,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pr, "1".repeat(40));
+        record.reviews = vec![
+            ReviewRecord {
+                reviewer_pseudonym: "alice@acme.noreply".into(),
+                state: ReviewState::Requested,
+                is_agent: false,
+            },
+            ReviewRecord {
+                reviewer_pseudonym: "bob@acme.noreply".into(),
+                state: ReviewState::Requested,
+                is_agent: false,
+            },
+            ReviewRecord {
+                reviewer_pseudonym: "bob@acme.noreply".into(),
+                state: ReviewState::Submitted(crate::lifecycle::ReviewVerdict::Approve),
+                is_agent: false,
+            },
+        ];
+        record.auto_merge_stopped = Some(crate::pr_store::AutoMergeStopped {
+            reason: "a required check failed: ci/test".into(),
+            at: 10,
+            requested_by: "carol".into(),
+        });
+        let drafts = ended_pull_request_signal_drafts(
+            &tenant(),
+            &Region("fr-par".into()),
+            "core",
+            &record,
+            "2026-11-09T00:00:00Z",
+        )
+        .unwrap();
+        let withdrawn: Vec<(&str, &str, &serde_json::Value)> = drafts
+            .iter()
+            .map(|draft| {
+                (
+                    draft.type_.0.as_str(),
+                    draft.subject.0.as_str(),
+                    &draft.payload["mentions"][0]["Mention"]["principal_id"],
+                )
+            })
+            .collect();
+        assert_eq!(
+            withdrawn,
+            vec![
+                (
+                    "signal.resolved",
+                    "sig.acme.notice.git.review_requested",
+                    &serde_json::json!("alice")
+                ),
+                (
+                    "signal.resolved",
+                    "sig.acme.notice.git.auto_merge_stopped",
+                    &serde_json::json!("carol")
+                ),
+            ],
+            "bob already answered; alice's request and carol's stopped merge are withdrawn"
+        );
     }
 
     #[test]

@@ -4,6 +4,44 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Pull requests can be closed, reopened, and marked ready
+
+A pull request could not be abandoned, and a draft could never become ready. The pure lifecycle
+model had all three transitions and the event names existed, but no durable mutation, route,
+command, or event reached them. A draft could also merge whenever its gate passed, so "draft"
+promised nothing.
+
+- **Who can do it.** `POST /prs/{n}/close`, `/reopen` and `/ready` are its author's call, or that
+  of a person who can push to the repository. An agent changes only the pull requests it opened.
+  The CLI gained `pr close`, `pr reopen` and `pr ready`, each with a one-line receipt.
+- **What each does.**
+  - Closing also takes the pull request out of the merge queue.
+  - Reopening refuses when its branch or base is gone ("push it again to reopen"). Otherwise it
+    follows the branch to its tip, so an approval of the old head does not carry over to commits
+    pushed while it was closed.
+  - Merging a draft is refused until it is marked ready.
+- **Who hears about it.**
+  - Marking ready and reopening raise the outstanding review requests again.
+  - A merged or closed pull request withdraws them.
+  - It also resolves the "automatic merge stopped" notice, which used to linger after a merge.
+  - A stopped notice no longer shows on a pull request that has ended.
+
+One state-change enum in `myelin-git` serves the CLI verbs, the routes, and the store mutation.
+Refusals surface as 409s that say why.
+
+Proof: a new TypeScript journey drives it on the real stack:
+1. A draft with a requested reviewer refuses to merge.
+2. `pr ready` makes it open, and the reviewer's request is unread.
+3. `pr close` closes it, and the request moves to done.
+4. The branch moves while closed. `pr reopen` brings the pull request back at the new tip, and the
+   request is unread again.
+5. After the branch is deleted, reopening is refused with the push-it-again message.
+
+Unit tests cover the transitions and their refusals, the authorization matrix (reader, a pushing
+agent, writer, author, an agent's own draft), the draft merge refusal, the signals an ended pull
+request withdraws, and the CLI grammar and receipts. Strict Clippy passes on the CLI, Git and
+edge crates.
+
 ## 2026-11-09 — Pull requests read as sentences in the terminal
 
 `myelin repo pr view` and `pr list` printed raw single-line JSON. Opening a pull request did too.

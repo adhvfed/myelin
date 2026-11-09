@@ -2976,6 +2976,9 @@ impl DurableGitBackend {
             let rec = self
                 .pr_get(&loc, number, actor)?
                 .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
+            if rec.state == PrState::Draft {
+                return Err(DurableError::Conflict(pr_state::DRAFT_MERGE_REFUSAL.into()));
+            }
             let source_loc = Self::loc(&actor.tenant.0, &actor.region.0, &rec.head_repo_slug);
             if !self.repo_authz.authorize_repo_permission(
                 repo_reader,
@@ -3003,6 +3006,13 @@ impl DurableGitBackend {
                 self.checks.is_some(),
                 method,
             );
+        }
+        if self
+            .prs
+            .get(&loc, number)?
+            .is_some_and(|record| record.state == PrState::Draft)
+        {
+            return Err(DurableError::Conflict(pr_state::DRAFT_MERGE_REFUSAL.into()));
         }
         merge_pr(
             &self.prs,
@@ -3347,7 +3357,7 @@ impl DurableGitBackend {
                 "requested_by": format!("{}@{tenant}.noreply", request.requested_by),
                 "requested_at": request.requested_at,
             })),
-            "auto_merge_stopped": rec.auto_merge_stopped.as_ref().map(|stopped| json!({
+            "auto_merge_stopped": rec.auto_merge_stopped.as_ref().filter(|_| matches!(rec.state, PrState::Open | PrState::Draft)).map(|stopped| json!({
                 "reason": stopped.reason,
                 "at": stopped.at,
             })),
@@ -3882,6 +3892,7 @@ mod http;
 mod mutation_input;
 mod mutation_support;
 mod pr_queries;
+mod pr_state;
 mod recovery;
 mod reference_cards;
 pub(crate) use reference_cards::{GitPrCommentLocation, GitReferenceCardRequest};
@@ -3897,6 +3908,7 @@ use http::{cross_pr_before_key, mint_pr_list_cursors, BlobViewOptions, RawRespon
 pub use merge_queue::{
     merge_queue_interval_from_env, spawn_merge_queue, MergeQueueHandle, QueueStep, QueueTenants,
 };
+pub use pr_state::PrStateChange;
 pub use recovery::{recover_placed_git_at_boot, GitBootRecoveryReport, GitCellBootRecoveryReport};
 pub(crate) use update_branch::describe_conflicts;
 pub use update_branch::BranchUpdate;

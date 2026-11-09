@@ -15,8 +15,9 @@ use crate::core::{Oid as CoreOid, RepoLoc};
 use crate::dek::{encrypt_free_text, is_git_subject_key_class, GitFreeText};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
-    event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_MERGE_BLOCKED,
-    GIT_PR_MERGE_QUEUED, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
+    event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_CLOSED, GIT_PR_MARKED_READY,
+    GIT_PR_MERGED, GIT_PR_MERGE_BLOCKED, GIT_PR_MERGE_QUEUED, GIT_PR_OPENED, GIT_PR_REOPENED,
+    GIT_PR_SYNCHRONIZED, GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
 };
 use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
@@ -513,8 +514,29 @@ pub enum PrMutation {
         reason: Option<String>,
         requested_at: Option<i64>,
     },
+    /// Stop considering a draft or open pull request; it also leaves the merge queue.
+    Close,
+    /// Bring a closed pull request back as open.
+    Reopen,
+    /// A draft asks for review and becomes mergeable.
+    MarkReady,
     Touch,
 }
+
+impl From<crate::pr_store::PrStateChange> for PrMutation {
+    fn from(change: crate::pr_store::PrStateChange) -> Self {
+        use crate::pr_store::PrStateChange;
+        match change {
+            PrStateChange::Close => Self::Close,
+            PrStateChange::Reopen => Self::Reopen,
+            PrStateChange::MarkReady => Self::MarkReady,
+        }
+    }
+}
+
+const CLOSE_REFUSAL: &str = "only an open pull request can be closed";
+const REOPEN_REFUSAL: &str = "only a closed pull request can be reopened";
+const MARK_READY_REFUSAL: &str = "only a draft pull request can be marked ready for review";
 
 impl PrMutation {
     fn command_kind(&self) -> &'static str {
@@ -526,6 +548,9 @@ impl PrMutation {
             Self::AdoptBaseMerge { .. } => "adopt-base-merge",
             Self::RequestAutoMerge { .. } => "request-auto-merge",
             Self::CancelAutoMerge { .. } => "cancel-auto-merge",
+            Self::Close => "close",
+            Self::Reopen => "reopen",
+            Self::MarkReady => "mark-ready",
             Self::Touch => "touch",
         }
     }
@@ -535,6 +560,9 @@ impl PrMutation {
             Self::SubmitReview(_) => GIT_REVIEW_SUBMITTED,
             Self::SynchronizeHead { .. } | Self::AdoptBaseMerge { .. } => GIT_PR_SYNCHRONIZED,
             Self::RequestAutoMerge { .. } => GIT_PR_MERGE_QUEUED,
+            Self::Close => GIT_PR_CLOSED,
+            Self::Reopen => GIT_PR_REOPENED,
+            Self::MarkReady => GIT_PR_MARKED_READY,
             Self::CancelAutoMerge {
                 reason: Some(_), ..
             } => GIT_PR_MERGE_BLOCKED,
@@ -652,6 +680,25 @@ impl PrMutation {
                         at: updated_at_unix,
                         requested_by,
                     });
+            }
+            Self::Close => {
+                if !matches!(record.state, PrState::Draft | PrState::Open) {
+                    return Err(CLOSE_REFUSAL);
+                }
+                record.state = PrState::Closed;
+                record.auto_merge = None;
+            }
+            Self::Reopen => {
+                if record.state != PrState::Closed {
+                    return Err(REOPEN_REFUSAL);
+                }
+                record.state = PrState::Open;
+            }
+            Self::MarkReady => {
+                if record.state != PrState::Draft {
+                    return Err(MARK_READY_REFUSAL);
+                }
+                record.state = PrState::Open;
             }
             Self::Touch => {}
         }
@@ -3492,6 +3539,11 @@ fn pg_error(error: impl std::fmt::Display) -> DurableError {
         DurableError::Conflict("the automatic merge changed before it could be stopped".into())
     } else if message.contains("an automatic merge needs the person") {
         DurableError::InvalidInput("an automatic merge needs the person who asked for it".into())
+    } else if let Some(refusal) = [CLOSE_REFUSAL, REOPEN_REFUSAL, MARK_READY_REFUSAL]
+        .into_iter()
+        .find(|refusal| message.contains(refusal))
+    {
+        DurableError::Conflict(refusal.into())
     } else if message.contains("different repository")
         || message.contains("different command")
         || message.contains("different merge")
@@ -4004,6 +4056,69 @@ mod tests {
             request("alice").apply_to_at(&mut record, 1000),
             Err("only an open pull request can merge automatically")
         );
+    }
+
+    #[test]
+    fn a_draft_becomes_ready_and_a_closed_pull_request_can_come_back() {
+        let draft = crate::lifecycle::PullRequest::open(
+            1,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            true,
+        );
+        let mut record = PrRecord::open(&draft, "a".repeat(40));
+        assert_eq!(record.state, PrState::Draft);
+        assert_eq!(
+            PrMutation::Reopen.apply_to_at(&mut record, 100),
+            Err(REOPEN_REFUSAL)
+        );
+        assert_eq!(PrMutation::MarkReady.event_type(), GIT_PR_MARKED_READY);
+        PrMutation::MarkReady.apply_to_at(&mut record, 200).unwrap();
+        assert_eq!(
+            (record.state, record.updated_at),
+            (PrState::Open, Some(200))
+        );
+        assert_eq!(
+            PrMutation::MarkReady.apply_to_at(&mut record, 300),
+            Err(MARK_READY_REFUSAL)
+        );
+
+        PrMutation::RequestAutoMerge {
+            requested_by: "alice".into(),
+            method: crate::pr_store::MergeMethod::FastForward,
+        }
+        .apply_to_at(&mut record, 400)
+        .unwrap();
+        assert_eq!(PrMutation::Close.event_type(), GIT_PR_CLOSED);
+        PrMutation::Close.apply_to_at(&mut record, 500).unwrap();
+        assert_eq!(record.state, PrState::Closed);
+        assert_eq!(record.auto_merge, None, "closing leaves the merge queue");
+        assert_eq!(
+            PrMutation::Close.apply_to_at(&mut record, 600),
+            Err(CLOSE_REFUSAL)
+        );
+
+        assert_eq!(PrMutation::Reopen.event_type(), GIT_PR_REOPENED);
+        PrMutation::Reopen.apply_to_at(&mut record, 700).unwrap();
+        assert_eq!(record.state, PrState::Open);
+        assert_eq!(
+            record.auto_merge, None,
+            "reopening does not schedule a merge again"
+        );
+
+        record.state = PrState::Merged;
+        for (mutation, refusal) in [
+            (PrMutation::Close, CLOSE_REFUSAL),
+            (PrMutation::Reopen, REOPEN_REFUSAL),
+            (PrMutation::MarkReady, MARK_READY_REFUSAL),
+        ] {
+            assert_eq!(mutation.apply_to_at(&mut record, 800), Err(refusal));
+        }
+        assert!(matches!(
+            pg_error(myelin_storage::PgError::Query(CLOSE_REFUSAL.into())),
+            DurableError::Conflict(message) if message == CLOSE_REFUSAL
+        ));
     }
 
     #[test]
