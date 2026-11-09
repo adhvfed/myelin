@@ -98,6 +98,7 @@ pub enum BootstrapError {
     RuntimeElevatedMembership,
     MigrationCannotManageSchema,
     MigrationCannotUseAdvisoryLock,
+    MigrationCannotSeeEveryTenant,
 }
 
 impl core::fmt::Display for BootstrapError {
@@ -144,6 +145,10 @@ impl core::fmt::Display for BootstrapError {
             }
             BootstrapError::MigrationCannotUseAdvisoryLock => {
                 "migration database role cannot use the advisory migration lock"
+            }
+            BootstrapError::MigrationCannotSeeEveryTenant => {
+                "migration database role cannot bypass row-level security, so data migrations \
+                 would silently skip every tenant's rows"
             }
         };
         f.write_str(message)
@@ -394,6 +399,12 @@ async fn validate_bootstrap_pair(
     }
     if runtime.create_role {
         return Err(BootstrapError::RuntimeCreateRole);
+    }
+    // Forward data migrations backfill tenant-scoped tables across every tenant. Under forced
+    // row-level security a role that cannot bypass it would apply them to no rows, and record
+    // them as applied.
+    if !migration.superuser && !migration.bypass_rls {
+        return Err(BootstrapError::MigrationCannotSeeEveryTenant);
     }
 
     let migration_schema = schema_access(migration_pool).await?;

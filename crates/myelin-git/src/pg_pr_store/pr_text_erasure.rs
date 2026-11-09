@@ -403,6 +403,14 @@ impl PgPrStore {
                         )
                         .bind(&tenant).bind(&region).bind(&repo).bind(number).bind(ERASED_COMMAND_DIGEST)
                         .execute(&mut *conn).await.map_err(|_| pg_query("scrub erased PR command digests"))?;
+                        // The issue keys a merge recorded came from the erased description too.
+                        sqlx::query(
+                            "UPDATE git_pr_command SET result=jsonb_set(result,'{closes}','[]'::jsonb) \
+                             WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND pr_number=$4 \
+                               AND command_kind='merge' AND result ? 'closes'",
+                        )
+                        .bind(&tenant).bind(&region).bind(&repo).bind(number)
+                        .execute(&mut *conn).await.map_err(|_| pg_query("scrub erased PR merge closes"))?;
                         co_commit_event(
                             conn,
                             minter.clone(),

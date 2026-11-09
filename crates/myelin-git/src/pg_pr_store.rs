@@ -466,9 +466,10 @@ struct MergeAdmission {
     ctx: PrOperationContext,
     ruleset: BranchProtectionRuleset,
     project_checks: bool,
-    /// For the merge queue: the schedule it merges for, which must still stand under the row
-    /// lock. Once the intent is written, edits wait for the merge to finish.
-    scheduled_at: Option<i64>,
+    /// For the merge queue: the schedule it merges for, which must still stand exactly under the
+    /// row lock (a re-request keeps its time but changes who and how). Once the intent is
+    /// written, edits wait for the merge to finish.
+    schedule: Option<crate::pr_store::AutoMerge>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -2214,7 +2215,7 @@ impl PgPrStore {
         ref_update_provenance: PushProvenance,
         project_checks: bool,
         method: crate::pr_store::MergeMethod,
-        scheduled_at: Option<i64>,
+        schedule: Option<crate::pr_store::AutoMerge>,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
         if &loc != target_loc {
@@ -2416,7 +2417,7 @@ impl PgPrStore {
                 ctx: ctx.clone(),
                 ruleset,
                 project_checks,
-                scheduled_at,
+                schedule,
             },
         )? {
             return Ok(attempt);
@@ -2864,7 +2865,7 @@ impl PgPrStore {
             ctx,
             ruleset,
             project_checks,
-            scheduled_at,
+            schedule,
         } = admission;
         validate_merge_intent(&intent)?;
         let intent_json = serde_json::to_value(&intent)
@@ -2928,13 +2929,7 @@ impl PgPrStore {
                         if matches!(record.state, PrState::Draft | PrState::Closed) {
                             return Err(pg_query(MERGE_REFUSAL));
                         }
-                        if scheduled_at.is_some()
-                            && record
-                                .auto_merge
-                                .as_ref()
-                                .map(|request| request.requested_at)
-                                != scheduled_at
-                        {
+                        if schedule.is_some() && record.auto_merge != schedule {
                             return Err(pg_query(SCHEDULE_CHANGED_REFUSAL));
                         }
                         if record.state == PrState::Merged
@@ -3087,11 +3082,14 @@ impl PgPrStore {
                 let closes = crate::typed_edges::closes_issue_targets(
                     &loc.tenant,
                     record.body_md.as_deref().unwrap_or_default(),
-                )
-                .unwrap_or_default()
-                .into_iter()
-                .map(|issue| issue.0)
-                .collect();
+                );
+                // Opening and editing refuse descriptions past the parser's limits.
+                debug_assert!(closes.is_ok(), "a stored description exceeds the Closes limits");
+                let closes = closes
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|issue| issue.0)
+                    .collect();
                 record.state = PrState::Merged;
                 record.updated_at = Some(ctx.unix_seconds);
                 record.merged_oid = Some(target.clone());
@@ -5012,7 +5010,7 @@ mod tests {
                             )
                             .unwrap(),
                         project_checks: true,
-                        scheduled_at: None,
+                        schedule: None,
                     },
                 )
                 .unwrap(),
@@ -5514,7 +5512,7 @@ mod tests {
                         allow_force_push: false,
                     },
                     project_checks: false,
-                    scheduled_at: None,
+                    schedule: None,
                 },
             );
             assert!(
@@ -5569,7 +5567,7 @@ mod tests {
                 slug,
                 store.operation_context(&scope_a, &actor).unwrap().emit,
             );
-            let merge = |key: &str, scheduled_at: Option<i64>| {
+            let merge = |key: &str, schedule: Option<crate::pr_store::AutoMerge>| {
                 store.merge_pr_durable(
                     &scope_a,
                     slug,
@@ -5585,7 +5583,7 @@ mod tests {
                     PushProvenance::NonAgent,
                     false,
                     crate::pr_store::MergeMethod::FastForward,
-                    scheduled_at,
+                    schedule,
                 )
             };
             let issue = |key: &str| format!("myelin://{tenant_a}/issue/issue/{key}");
@@ -5597,14 +5595,38 @@ mod tests {
                 },
                 "schedule-merge-closes",
             );
-            let scheduled_at = scheduled.auto_merge.unwrap().requested_at;
+            let schedule = scheduled.auto_merge;
             mutate(describe("Closes ENG-2"), "edit-merge-closes");
             assert!(
                 matches!(
-                    merge("merge-stale-schedule", Some(scheduled_at)),
+                    merge("merge-stale-schedule", schedule),
                     Err(DurableError::Conflict(message)) if message == SCHEDULE_CHANGED_REFUSAL
                 ),
                 "the queue cannot merge for a schedule that the edit stopped"
+            );
+            let request = |by: &str, key: &str| {
+                mutate(
+                    PrMutation::RequestAutoMerge {
+                        requested_by: by.into(),
+                        method: crate::pr_store::MergeMethod::FastForward,
+                    },
+                    key,
+                )
+                .auto_merge
+            };
+            let carols = request("carol", "reschedule-merge-closes");
+            let daves = request("dave", "take-over-merge-closes");
+            assert_eq!(
+                daves.as_ref().map(|schedule| schedule.requested_at),
+                carols.as_ref().map(|schedule| schedule.requested_at),
+                "a re-request keeps its place in line"
+            );
+            assert!(
+                matches!(
+                    merge("merge-taken-over-schedule", carols),
+                    Err(DurableError::Conflict(message)) if message == SCHEDULE_CHANGED_REFUSAL
+                ),
+                "a merge for carol's schedule cannot land under dave's"
             );
 
             let merged = merge("merge-closes-now", None).unwrap();
@@ -5726,7 +5748,7 @@ mod tests {
                             )
                             .unwrap(),
                         project_checks: false,
-                        scheduled_at: None,
+                        schedule: None,
                     },
                 )
                 .unwrap()

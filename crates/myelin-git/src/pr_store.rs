@@ -1339,11 +1339,16 @@ pub fn merge_pr<P: RepoPathResolver>(
             let closes = crate::typed_edges::closes_issue_targets(
                 &repo_loc.tenant,
                 rec.body_md.as_deref().unwrap_or_default(),
-            )
-            .unwrap_or_default()
-            .into_iter()
-            .map(|issue| issue.0)
-            .collect();
+            );
+            debug_assert!(
+                closes.is_ok(),
+                "a stored description exceeds the Closes limits"
+            );
+            let closes = closes
+                .unwrap_or_default()
+                .into_iter()
+                .map(|issue| issue.0)
+                .collect();
             Ok(MergeAttempt::Merged {
                 base_ref: rec.base_ref,
                 new_oid: head.0,

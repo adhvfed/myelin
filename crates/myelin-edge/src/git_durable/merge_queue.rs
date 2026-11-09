@@ -325,8 +325,7 @@ impl DurableGitBackend {
         let attempt = self.merge_scheduled_with_operation(
             actor.for_pr(number),
             &self.fresh_operation_id()?,
-            request.method,
-            request.requested_at,
+            request.clone(),
         );
         match attempt {
             Ok(MergeAttempt::Merged { .. }) => Ok(QueueStep::Merged),

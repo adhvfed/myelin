@@ -4,6 +4,34 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — The merge binding holds under takeover, and migrations see every tenant
+
+A third independent pass confirmed the `Closes` list is bound to the text that lands on every path.
+It found these:
+- **The queue's lock-time check was weaker than its own pre-check.** It compared only when the
+  schedule was made. A re-request keeps that time, so the person who asks and the merge method can
+  change while it still matches. Someone could take a schedule over and have the in-flight merge
+  land under the first requester's authority. The queue now hands the exact schedule it read to the
+  merge, and the merge refuses under the row lock unless the stored schedule is identical.
+- **Backfills rely on an unchecked assumption.** Data migrations, the new `git_0019` scrub and the
+  existing Issues backfills, update tenant-scoped tables that force row-level security. Under a
+  migration role that cannot bypass it, they would match no rows and still be recorded as applied.
+  The database bootstrap now refuses to start with a migration role that is neither superuser nor
+  `BYPASSRLS`.
+- **A merge result kept erased text's issue keys.** It kept the issue keys from a description that
+  was later erased. The erasure batch now empties a merge result's `closes` along with the open and
+  edit digests.
+- **Silent defaults.** The parser-limit defaults in merge finalization are now debug assertions.
+  Opening and editing already refuse such descriptions.
+- **An overstated worklog claim.** The previous entry overstated crash recovery, and it is
+  corrected.
+
+Proof:
+- The live Postgres store test passes with a takeover case: Dave's re-request keeps Carol's place,
+  and a merge for Carol's schedule is refused. It also exercises the new bootstrap check.
+- The privacy, merge-queue, closes-issue, CLI and agent-merge journeys pass.
+- Unit suites and strict Clippy pass.
+
 ## 2026-11-09 — A merge closes only what its own description named
 
 A re-check of the edit fixes showed the description-change stop was not enough. Merging closes the
@@ -20,9 +48,10 @@ Issue closing is now bound to the merge itself:
 - **Captured under the lock.** The merge transaction records the `Closes` list from the
   description that lands, while holding the row lock. Edits already wait while a merge intent is
   pending, so that list is the text that merged. It travels in the durable merge result, and the
-  follow-up closes exactly that list without re-reading anything. A replay closes the same list,
-  which also completes a follow-up that crashed. A merge of an already-merged pull request closes
-  nothing.
+  follow-up closes exactly that list without re-reading anything. A client's replay of the same
+  merge closes the same list. A merge of an already-merged pull request closes nothing. A crash
+  between the merge and its follow-up still leaves the issues open, as before: boot recovery and
+  the queue's fresh operations do not re-run it.
 - **Schedule checked under the lock.** A queue merge carries the time of the schedule it merges
   for. The merge refuses under the lock if that schedule no longer stands, and the queue treats
   the refusal as waiting.

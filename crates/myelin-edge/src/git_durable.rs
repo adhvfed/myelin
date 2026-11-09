@@ -42,7 +42,7 @@ use myelin_git::pr_list_pagination::{
     PrListDirection, PrListKey, PrListPage, PR_LIST_CURSOR_PREFIX,
 };
 use myelin_git::pr_store::{
-    effective_ruleset, merge_pr, BranchProtectionConfig, ChecksSummary, DurablePrStore,
+    effective_ruleset, merge_pr, AutoMerge, BranchProtectionConfig, ChecksSummary, DurablePrStore,
     MergeAttempt, MergeMethod, PrCrossListQuery, PrListBucket, PrListCounts, PrListQuery,
     PrListSlice, PrListSort, PrListState, PrRecord, ReviewRecord, MAX_PR_TITLE_BYTES,
     PR_LIST_OFFSET_MAX,
@@ -120,10 +120,10 @@ pub struct PrActorContext<'a> {
     number: u64,
 }
 
-/// How a merge lands, and for the merge queue, the schedule it merges for.
+/// How a merge lands, and for the merge queue, the exact schedule it merges for.
 struct MergeTerms {
     method: MergeMethod,
-    scheduled_at: Option<i64>,
+    schedule: Option<AutoMerge>,
 }
 
 /// A branch shared by more open pull requests than this is not a review workflow worth syncing.
@@ -2883,19 +2883,18 @@ impl DurableGitBackend {
             PushProvenance::direct(Self::is_agent(principal)),
             MergeTerms {
                 method,
-                scheduled_at: None,
+                schedule: None,
             },
         )
     }
 
-    /// The merge queue's merge for the schedule made at `scheduled_at`; refused if that schedule
-    /// no longer stands when the merge begins.
+    /// The merge queue's merge for `schedule`; refused if that schedule no longer stands exactly
+    /// when the merge begins.
     pub(super) fn merge_scheduled_with_operation(
         &self,
         target: PrActorContext<'_>,
         operation_id: &PrOperationId,
-        method: MergeMethod,
-        scheduled_at: i64,
+        schedule: AutoMerge,
     ) -> Result<MergeAttempt, DurableError> {
         let principal = target.repo.principal;
         self.merge_for_actor_with_operation(
@@ -2904,8 +2903,8 @@ impl DurableGitBackend {
             operation_id,
             PushProvenance::direct(Self::is_agent(principal)),
             MergeTerms {
-                method,
-                scheduled_at: Some(scheduled_at),
+                method: schedule.method,
+                schedule: Some(schedule),
             },
         )
     }
@@ -2929,7 +2928,7 @@ impl DurableGitBackend {
             PushProvenance::HumanApprovedAgent,
             MergeTerms {
                 method,
-                scheduled_at: None,
+                schedule: None,
             },
         )
     }
@@ -2991,10 +2990,7 @@ impl DurableGitBackend {
         ref_update_provenance: PushProvenance,
         terms: MergeTerms,
     ) -> Result<MergeAttempt, DurableError> {
-        let MergeTerms {
-            method,
-            scheduled_at,
-        } = terms;
+        let MergeTerms { method, schedule } = terms;
         let PrActorContext { repo, number } = target;
         let RepoActorContext {
             tenant,
@@ -3059,7 +3055,7 @@ impl DurableGitBackend {
                 ref_update_provenance,
                 self.checks.is_some(),
                 method,
-                scheduled_at,
+                schedule,
             );
         }
         let record = self.prs.get(&loc, number)?;
@@ -3069,12 +3065,7 @@ impl DurableGitBackend {
         {
             return Err(DurableError::Conflict(refusal.into()));
         }
-        if scheduled_at.is_some()
-            && record
-                .and_then(|record| record.auto_merge)
-                .map(|request| request.requested_at)
-                != scheduled_at
-        {
+        if schedule.is_some() && record.and_then(|record| record.auto_merge) != schedule {
             return Err(DurableError::Conflict(SCHEDULE_CHANGED_REFUSAL.into()));
         }
         merge_pr(
