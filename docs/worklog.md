@@ -4,6 +4,25 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-09 — Pull requests converge on their branch after a crash
+
+Pull requests follow their branch synchronously after every accepted branch update. Two things
+could leave one recording an old head until the next push to that branch: a crash between the ref
+compare-and-swap and the follow-up, or a follow-up that failed and was only logged. A pull request
+in that state shows stale commits, and its approvals refer to a head the branch no longer has.
+
+The Edge background loop that runs the merge queue now also sweeps branches. It runs on its first
+pass and then every minute. It reads every open or draft pull request whose branch lives in its own
+repository, up to 10,000 per tenant in pages. Any branch whose tip differs from a recorded head is
+followed exactly as after a push, and the sweep stops between branches on shutdown.
+
+Proof: a unit test moves a branch without its follow-up, as a crash would. The sweep then moves the
+pull request onto the new tip, and leaves alone a pull request already on its tip. On the dogfood
+stack, the first sweep after restart found one pull request left behind by an earlier run and
+reported "moved pull requests on 1 branch(es) back onto their tips". The follow-branch, merge
+queue, update-branch, Git, pull-request, and collaboration journeys pass, along with strict
+Clippy.
+
 ## 2026-11-09 — Agents can read a pull request
 
 Agents could comment on a pull request, reply, resolve threads, submit reviews, update its branch,

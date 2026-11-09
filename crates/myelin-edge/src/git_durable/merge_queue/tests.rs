@@ -363,3 +363,59 @@ fn a_queued_pull_request_knows_how_many_were_scheduled_before_it() {
     );
     assert!(unqueued.auto_merge.is_some());
 }
+
+#[test]
+fn a_sweep_brings_a_pull_request_left_behind_by_a_crash_onto_its_branch() {
+    let fixture = pull_request_behind_its_base(("feature.txt", b"feature\n"));
+    let recorded = fixture.record();
+    // A branch update whose follow-up never ran, as after a crash between the two.
+    let (moved, _, prior) = fixture
+        .repo
+        .build_file_commit(
+            "refs/heads/feature",
+            "more.txt",
+            b"more\n",
+            "more",
+            "psn",
+            AUTHOR_PSN,
+        )
+        .unwrap();
+    fixture
+        .repo
+        .update_ref_cas(
+            "refs/heads/feature",
+            prior.as_ref(),
+            Some(&moved),
+            "push",
+            AUTHOR_PSN,
+        )
+        .unwrap();
+    assert_eq!(fixture.record().head_oid, recorded.head_oid);
+
+    let heads = [myelin_git::pg_pr_store::FollowedHead {
+        repo: REPO.into(),
+        number: fixture.number,
+        head_ref: recorded.head_ref.clone(),
+        head_oid: recorded.head_oid.clone(),
+    }];
+    let follower = service_principal(TENANT, REGION, BRANCH_FOLLOWER_PRINCIPAL);
+    let stopping = AtomicBool::new(false);
+    assert_eq!(
+        fixture
+            .backend
+            .settle_stale_heads(TENANT, REGION, &heads, &follower, &stopping),
+        1
+    );
+    assert_eq!(fixture.record().head_oid, moved.0);
+    let settled = [myelin_git::pg_pr_store::FollowedHead {
+        head_oid: moved.0.clone(),
+        ..heads[0].clone()
+    }];
+    assert_eq!(
+        fixture
+            .backend
+            .settle_stale_heads(TENANT, REGION, &settled, &follower, &stopping),
+        0,
+        "a pull request already on its tip is left alone"
+    );
+}

@@ -471,14 +471,7 @@ fn name_some(items: &[String]) -> String {
 }
 
 fn merge_queue_principal(tenant: &str, region: &str) -> Principal {
-    Principal::new(
-        TenantId(tenant.into()),
-        Region(region.into()),
-        PrincipalId(MERGE_QUEUE_PRINCIPAL.into()),
-        PrincipalKind::Service,
-        DataRole::Processor,
-        PrincipalStatus::Active,
-    )
+    service_principal(tenant, region, MERGE_QUEUE_PRINCIPAL)
 }
 
 /// The same step on the same state is the same operation, so a repeated pass replays rather
@@ -493,6 +486,87 @@ fn queue_operation(
     let mut parts: Vec<&[u8]> = vec![loc.repo.as_bytes(), number.as_bytes()];
     parts.extend(state.iter().map(|part| part.as_bytes()));
     PrOperationId::derive(domain, &parts)
+}
+
+/// Open pull requests one branch-follow sweep reads per tenant, in pages.
+const MAX_FOLLOWED_PER_SWEEP: usize = 10_000;
+const FOLLOW_PAGE: usize = 500;
+const BRANCH_FOLLOWER_PRINCIPAL: &str = "service:git-branch-follower";
+/// How often the background loop checks that pull requests sit on their branch's tip.
+const BRANCH_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl DurableGitBackend {
+    /// Brings open pull requests back onto their branch's tip when a crash or an outage
+    /// interrupted the follow-up of a branch update. Returns how many branches it settled.
+    pub fn reconcile_followed_branches(
+        &self,
+        tenant: &str,
+        region: &str,
+        stopping: &AtomicBool,
+    ) -> Result<usize, DurableError> {
+        let Some(store) = &self.pg_prs else {
+            return Ok(0);
+        };
+        let follower = service_principal(tenant, region, BRANCH_FOLLOWER_PRINCIPAL);
+        let scope = TenantScope::from_verified_token(&follower, follower.region.clone());
+        let mut heads = Vec::new();
+        let mut after: Option<(String, u64)> = None;
+        while heads.len() < MAX_FOLLOWED_PER_SWEEP {
+            let page = store.open_pull_request_heads(&scope, after.as_ref(), FOLLOW_PAGE)?;
+            let full = page.len() == FOLLOW_PAGE;
+            after = page.last().map(|head| (head.repo.clone(), head.number));
+            heads.extend(page);
+            if !full {
+                break;
+            }
+        }
+        Ok(self.settle_stale_heads(tenant, region, &heads, &follower, stopping))
+    }
+
+    /// Follows every branch whose tip differs from a pull request's recorded head.
+    fn settle_stale_heads(
+        &self,
+        tenant: &str,
+        region: &str,
+        heads: &[myelin_git::pg_pr_store::FollowedHead],
+        follower: &Principal,
+        stopping: &AtomicBool,
+    ) -> usize {
+        let mut stale = std::collections::BTreeSet::new();
+        for head in heads {
+            let loc = Self::loc(tenant, region, &head.repo);
+            let branch = branch_ref(&head.head_ref);
+            let tip = self
+                .store
+                .open_repo(&loc)
+                .and_then(|repo| repo.read_ref(&branch));
+            if let Ok(Some(tip)) = tip {
+                if tip.0 != head.head_oid {
+                    stale.insert((head.repo.clone(), branch));
+                }
+            }
+        }
+        let mut settled = 0;
+        for (repo, branch) in stale {
+            if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            self.follow_branch(&Self::loc(tenant, region, &repo), follower, &branch);
+            settled += 1;
+        }
+        settled
+    }
+}
+
+fn service_principal(tenant: &str, region: &str, id: &str) -> Principal {
+    Principal::new(
+        TenantId(tenant.into()),
+        Region(region.into()),
+        PrincipalId(id.into()),
+        PrincipalKind::Service,
+        DataRole::Processor,
+        PrincipalStatus::Active,
+    )
 }
 
 /// The background merge queue: a pass after anything that can make a pull request ready, and at
@@ -530,7 +604,14 @@ pub fn spawn_merge_queue(
     let halt = Arc::new(AtomicBool::new(false));
     let pass_halt = halt.clone();
     let join = tokio::spawn(async move {
+        // The first pass also settles anything a crash left behind.
+        let mut swept_branches_at: Option<tokio::time::Instant> = None;
         loop {
+            let sweep_branches =
+                swept_branches_at.is_none_or(|at| at.elapsed() >= BRANCH_SWEEP_INTERVAL);
+            if sweep_branches {
+                swept_branches_at = Some(tokio::time::Instant::now());
+            }
             let (pass_backend, pass_tenants, pass_region, halt) = (
                 backend.clone(),
                 tenants.clone(),
@@ -539,6 +620,17 @@ pub fn spawn_merge_queue(
             );
             let pass = tokio::task::spawn_blocking(move || {
                 for tenant in &pass_tenants {
+                    if sweep_branches {
+                        match pass_backend.reconcile_followed_branches(tenant, &pass_region, &halt)
+                        {
+                            Ok(0) => {}
+                            Ok(settled) => eprintln!(
+                                "edge: moved pull requests on {settled} branch(es) back onto \
+                                 their tips"
+                            ),
+                            Err(error) => eprintln!("edge: a branch-follow sweep failed: {error}"),
+                        }
+                    }
                     if let Err(error) =
                         pass_backend.advance_merge_queues(tenant, &pass_region, &halt)
                     {

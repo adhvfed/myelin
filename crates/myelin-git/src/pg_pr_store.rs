@@ -298,6 +298,15 @@ pub fn git_pr_hot_tables() -> HotTables {
     ])
 }
 
+/// An open pull request's recorded head and the branch it follows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FollowedHead {
+    pub repo: String,
+    pub number: u64,
+    pub head_ref: String,
+    pub head_oid: String,
+}
+
 /// One pull request waiting in a base branch's merge queue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedPullRequest {
@@ -1110,6 +1119,73 @@ impl PgPrStore {
                         .ok_or_else(malformed)?,
                     requested_at: row
                         .try_get::<Option<i64>, _>("requested_at")
+                        .map_err(|_| malformed())?
+                        .ok_or_else(malformed)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Open pull requests whose branch lives in their own repository, across the tenant, in
+    /// (repository, number) order after `after`.
+    pub fn open_pull_request_heads(
+        &self,
+        scope: &TenantScope,
+        after: Option<&(String, u64)>,
+        maximum: usize,
+    ) -> Result<Vec<FollowedHead>, DurableError> {
+        let cell = self.scoped_cell(scope)?;
+        let provider = self.provider.clone();
+        let tenant_id = cell.tenant_id;
+        let region = cell.region;
+        let transaction_tenant = tenant_id.0.clone();
+        let limit = i64::try_from(maximum).unwrap_or(i64::MAX);
+        let (after_repo, after_number) = match after {
+            Some((repo, number)) => (repo.clone(), db_number(*number)?),
+            None => (String::new(), -1),
+        };
+        let rows = self
+            .block_on(async move {
+                provider
+                    .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
+                        Box::pin(async move {
+                            sqlx::query(
+                                "SELECT repo_slug, number, record->>'head_ref' AS head_ref, \
+                                        record->>'head_oid' AS head_oid \
+                                 FROM git_pr \
+                                 WHERE tenant_id=$1 AND region=$2 \
+                                   AND head_repo_slug = repo_slug \
+                                   AND record->>'state' IN ('Open','Draft') \
+                                   AND (repo_slug, number) > ($3, $4) \
+                                 ORDER BY repo_slug, number \
+                                 LIMIT $5",
+                            )
+                            .bind(&tenant_id.0)
+                            .bind(&region.0)
+                            .bind(&after_repo)
+                            .bind(after_number)
+                            .bind(limit)
+                            .fetch_all(&mut *conn)
+                            .await
+                            .map_err(|_| pg_query("list followed pull-request heads"))
+                        })
+                    })
+                    .await
+            })
+            .map_err(pg_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let malformed = || DurableError::Io("followed head row malformed".into());
+                let number: i64 = row.try_get("number").map_err(|_| malformed())?;
+                Ok(FollowedHead {
+                    repo: row.try_get("repo_slug").map_err(|_| malformed())?,
+                    number: u64::try_from(number).map_err(|_| malformed())?,
+                    head_ref: row
+                        .try_get::<Option<String>, _>("head_ref")
+                        .map_err(|_| malformed())?
+                        .ok_or_else(malformed)?,
+                    head_oid: row
+                        .try_get::<Option<String>, _>("head_oid")
                         .map_err(|_| malformed())?
                         .ok_or_else(malformed)?,
                 })
