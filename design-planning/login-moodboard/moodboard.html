@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Myelin sign-in — moodboard</title>
+<style>
+  :root {
+    --mb-fg: var(--foreground, #e7e9ee);
+    --mb-muted: var(--muted-foreground, #9aa1ad);
+    --mb-line: var(--border, #2a2e37);
+    --mb-card: var(--card, #14161b);
+    --mb-accent: var(--primary, #7ea6ff);
+    --mb-r: var(--radius, 6px);
+  }
+  html.standalone { background: #0c0d10; }
+  html.standalone body { max-width: 960px; margin: 0 auto; padding: 40px 24px 96px; }
+  body { margin: 0; color: var(--mb-fg); font-family: var(--font-sans, Inter, system-ui, sans-serif); font-size: 14px; line-height: 1.5; }
+  h1 { font-size: 30px; line-height: 1.1; letter-spacing: -0.02em; margin: 0 0 8px; text-wrap: balance; }
+  h2 { font-size: 20px; letter-spacing: -0.01em; margin: 56px 0 6px; }
+  h3 { font-size: 14px; margin: 0 0 4px; }
+  p { margin: 0 0 12px; max-width: 68ch; }
+  .lede { color: var(--mb-muted); font-size: 15px; }
+  .muted { color: var(--mb-muted); }
+  .num { font-family: var(--font-mono, ui-monospace, monospace); font-size: 12px; color: var(--mb-muted); }
+
+  .refs { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px 12px; margin-top: 16px; }
+  .ref img { display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; object-position: top; border: 1px solid var(--mb-line); border-radius: var(--mb-r); }
+  .ref figcaption { margin-top: 6px; font-size: 12.5px; color: var(--mb-muted); }
+  .ref figcaption b { color: var(--mb-fg); font-weight: 600; }
+  .ref { margin: 0; }
+  .ref.keep img { border-color: var(--mb-accent); }
+  .tag { display: inline-block; font-size: 11px; padding: 0 6px; border: 1px solid var(--mb-line); border-radius: 999px; margin-left: 4px; }
+  .ref.keep .tag { border-color: var(--mb-accent); color: var(--mb-accent); }
+
+  .findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 12px; }
+  .finding { padding: 16px; background: var(--mb-card); border-radius: var(--mb-r); }
+  .finding p { margin: 0; color: var(--mb-muted); font-size: 13px; }
+
+  .designers { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 12px; margin-top: 16px; }
+  .designer { padding: 16px; background: var(--mb-card); border-radius: var(--mb-r); }
+  .designer svg { display: block; width: 100%; height: auto; margin-bottom: 12px; border-radius: 3px; }
+  .designer p { font-size: 13px; color: var(--mb-muted); margin: 0 0 8px; }
+  .designer p b { color: var(--mb-fg); }
+
+  .sketch { margin: 20px 0 8px; }
+  .sketch-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  .verdict { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--mb-line); color: var(--mb-muted); }
+  .verdict.yes { border-color: var(--mb-accent); color: var(--mb-accent); }
+  .frame { position: relative; overflow: hidden; border: 1px solid var(--mb-line); border-radius: var(--mb-r); }
+  .frame.desk { aspect-ratio: 1280 / 800; }
+  .frame.phone { aspect-ratio: 390 / 780; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .trio { display: grid; grid-template-columns: 2.05fr 0.62fr; gap: 12px; align-items: start; }
+  @media (max-width: 560px) { .pair, .trio { grid-template-columns: 1fr; } }
+  .notes { margin: 10px 0 0; padding: 0 0 0 18px; color: var(--mb-muted); font-size: 13px; max-width: 72ch; }
+  .notes li { margin-bottom: 4px; }
+  .notes b { color: var(--mb-fg); font-weight: 600; }
+
+  /* ── Artboards: the product, drawn at 1280×800 (or 390×780) and scaled to the frame ── */
+  .ab { position: absolute; left: 0; top: 0; transform-origin: 0 0; transform: scale(var(--s, 0.5)); font-family: Inter, system-ui, sans-serif; font-size: 14px; line-height: 1.45; }
+  .ab.desk { width: 1280px; height: 800px; }
+  .ab.phone { width: 390px; height: 780px; }
+  .ab.dark { --bg: #0c0d10; --fg: #e7e9ee; --mut: #aeb3be; --sub: #868d99; --ln: #3a3f47; --acc: #5b8cff; --btn: #e7e9ee; --btn-t: #0c0d10; --field: #101116; --danger: #e0695c; }
+  .ab.light { --bg: #f4f2ec; --fg: #15171c; --mut: #4a505b; --sub: #646b78; --ln: #9aa1ac; --acc: #2f6bff; --btn: #15171c; --btn-t: #f4f2ec; --field: #fbfaf6; --danger: #c0392b; }
+  .ab { background: var(--bg); color: var(--fg); }
+  .ab svg.art { position: absolute; left: 0; top: 0; }
+  .ab .wm { position: absolute; left: 48px; top: 44px; font-weight: 600; font-size: 16px; letter-spacing: 0.02em; color: #fff; mix-blend-mode: difference; }
+  .ab .region { position: absolute; left: 48px; bottom: 40px; font-size: 12px; color: #fff; mix-blend-mode: difference; opacity: 0.8; }
+  .ab .form { position: absolute; right: 120px; top: 50%; transform: translateY(-50%); width: 344px; }
+  .ab.phone .wm { left: 24px; top: 22px; }
+  .ab.phone .form { position: absolute; left: 24px; right: 24px; top: 288px; transform: none; width: auto; }
+  .ab h4 { font-size: 30px; line-height: 1.1; letter-spacing: -0.025em; margin: 0 0 8px; font-weight: 600; }
+  .ab .sub { color: var(--mut); margin: 0 0 28px; max-width: none; }
+  .ab .sub b { color: var(--fg); font-weight: 500; }
+  .ab label { display: block; font-size: 13px; font-weight: 500; margin: 0 0 6px; }
+  .ab .row { display: flex; justify-content: space-between; align-items: baseline; }
+  .ab .row a, .ab .foot a { color: var(--mut); font-size: 12px; text-decoration: underline; text-underline-offset: 3px; }
+  .ab input { display: block; width: 100%; box-sizing: border-box; height: 44px; padding: 0 12px; margin: 0 0 18px; border: 1px solid var(--ln); border-radius: 3px; background: var(--field); color: var(--fg); font: inherit; font-size: 15px; }
+  .ab input:focus { outline: 2px solid var(--acc); outline-offset: 1px; }
+  .ab input[readonly] { color: var(--mut); border-style: dashed; }
+  .ab button { display: block; width: 100%; height: 44px; margin-top: 6px; border: 0; border-radius: 3px; background: var(--btn); color: var(--btn-t); font: inherit; font-weight: 600; }
+  .ab .foot { margin: 22px 0 0; padding-top: 18px; border-top: 1px solid color-mix(in srgb, var(--ln) 55%, transparent); color: var(--sub); font-size: 12.5px; max-width: none; }
+  .ab .hint { color: var(--sub); font-size: 12px; margin: -10px 0 18px; max-width: none; display: flex; justify-content: space-between; }
+  .ab .hint .ok { color: var(--acc); }
+  .ab .under input { border-width: 0 0 1px; border-radius: 0; background: transparent; padding: 0; }
+</style>
+</head>
+<body>
+
+<h1>Sign-in, reconsidered</h1>
+<p class="lede">Fourteen sign-in pages from products people already use, three designers worth stealing a principle from, and the sketches that came out of it. The last sketch is the one being built.</p>
+
+<h2>1 · What everyone else does</h2>
+<p class="muted">Captured live on 24 Nov 2026 at 1280×800. Blue border marks the ones I'm taking something from.</p>
+
+<div class="refs">
+  <figure class="ref"><img src="shots/_myelin-before.jpg" alt="Myelin sign-in before this work"><figcaption><b>Myelin, this morning</b> — tidy, token-first, forgettable. The baseline to beat.</figcaption></figure>
+  <figure class="ref keep"><img src="shots/resend.jpg" alt="Resend login"><figcaption><b>Resend</b><span class="tag">take</span> — one sculptural form owns the page; the form floats in the dark beside it.</figcaption></figure>
+  <figure class="ref keep"><img src="shots/planetscale.jpg" alt="PlanetScale sign in"><figcaption><b>PlanetScale</b><span class="tag">take</span> — asymmetric. Form hard left, brand alone in the empty half. Confident.</figcaption></figure>
+  <figure class="ref keep"><img src="shots/render.jpg" alt="Render login"><figcaption><b>Render</b><span class="tag">take</span> — a rule-based pattern (grid cells) instead of an illustration. A system, not a picture.</figcaption></figure>
+  <figure class="ref keep"><img src="shots/github.jpg" alt="GitHub sign in"><figcaption><b>GitHub</b><span class="tag">take</span> — email and password on one screen, password first. Nobody has to learn it.</figcaption></figure>
+  <figure class="ref"><img src="shots/stripe.jpg" alt="Stripe login"><figcaption><b>Stripe</b> — the ribbon is beautiful and unmistakable. Too soft for an instrument.</figcaption></figure>
+  <figure class="ref"><img src="shots/fly.jpg" alt="Fly.io sign in"><figcaption><b>Fly.io</b> — a whole illustrated world. Proof a login can have a personality.</figcaption></figure>
+  <figure class="ref"><img src="shots/supabase.jpg" alt="Supabase sign in"><figcaption><b>Supabase</b> — split with a testimonial. Selling to someone who already bought.</figcaption></figure>
+  <figure class="ref"><img src="shots/linear.jpg" alt="Linear login"><figcaption><b>Linear</b> — four pills and a logo. Calm, but it is a method menu, not a page.</figcaption></figure>
+  <figure class="ref"><img src="shots/vercel.jpg" alt="Vercel login"><figcaption><b>Vercel</b> — email first, then six ways in. The menu grows with every provider.</figcaption></figure>
+  <figure class="ref"><img src="shots/tailscale.jpg" alt="Tailscale login"><figcaption><b>Tailscale</b> — same column, same stack of providers.</figcaption></figure>
+  <figure class="ref"><img src="shots/notion.jpg" alt="Notion login"><figcaption><b>Notion</b> — provider tiles as a grid. Same idea, denser.</figcaption></figure>
+  <figure class="ref"><img src="shots/railway.jpg" alt="Railway login"><figcaption><b>Railway</b> — dark card on dark. Closest to where Myelin was.</figcaption></figure>
+  <figure class="ref"><img src="shots/figma.jpg" alt="Figma login"><figcaption><b>Figma</b> — plain to the point of anonymity.</figcaption></figure>
+  <figure class="ref"><img src="shots/sourcehut.jpg" alt="sourcehut login"><figcaption><b>sourcehut</b> — two fields and a button. Honest; no joy.</figcaption></figure>
+</div>
+
+<div class="findings">
+  <div class="finding"><h3>Ten of fourteen are the same page</h3><p>A logo, a centred column, a stack of buttons. Swap the logos and you could not tell them apart. This is what "boring" looks like, and it is where my first redesign landed.</p></div>
+  <div class="finding"><h3>The memorable ones commit to one form</h3><p>Resend's fold, Stripe's ribbon, Fly's landscape, Render's cells. One strong shape, given real room, and a quiet form beside it.</p></div>
+  <div class="finding"><h3>Nobody asks for a token</h3><p>Every one of them signs in a person: an email, then a password, a provider, or a passkey. A pasted capability token appears nowhere.</p></div>
+</div>
+
+<h2>2 · Three designers</h2>
+<p class="muted">The drawings below are my own studies of each principle, not reproductions of their work.</p>
+
+<div class="designers">
+  <div class="designer">
+    <svg id="study-jmb" viewBox="0 0 240 150" role="img" aria-label="Study: concentric arcs whose thickness grows outward"></svg>
+    <h3>Josef Müller-Brockmann</h3>
+    <p>His 1955 Beethoven concert poster is nothing but concentric arcs on a measured angular grid, thickening as they move outward. Mathematical, and louder than any illustration.</p>
+    <p><b>Taking:</b> the arc composition itself. A myelin sheath in cross-section <i>is</i> concentric layers wrapped around a nerve fibre, so the form is the product's name drawn literally.</p>
+  </div>
+  <div class="designer">
+    <svg id="study-kg" viewBox="0 0 240 150" role="img" aria-label="Study: six different cuts generated by one rule"></svg>
+    <h3>Karl Gerstner</h3>
+    <p><i>Designing Programmes</i> (1964): don't draw one solution, write the rule that generates every solution.</p>
+    <p><b>Taking:</b> the arcs are computed, not drawn. One rule, different cuts: sign-in gets a settled sheath, the invitation page gets one that is still open and closes as you set a password.</p>
+  </div>
+  <div class="designer">
+    <svg id="study-dr" viewBox="0 0 240 150" role="img" aria-label="Study: two fields and one button, nothing else"></svg>
+    <h3>Dieter Rams</h3>
+    <p>"Good design is as little design as possible." His Braun faces carry only the controls you need, each labelled with what it does.</p>
+    <p><b>Taking:</b> the form. Two fields, one button, plain labels. No method menu, no icons in buttons, no helper paragraph explaining a concept the visitor should never have met.</p>
+  </div>
+</div>
+
+<h2>3 · Sketches</h2>
+
+<div class="sketch">
+  <div class="sketch-head"><h3>Sketch A — the arcs arrive</h3><span class="verdict">rejected</span></div>
+  <div class="frame desk"><div class="ab desk dark" id="ab-a">
+    <svg class="art" width="1280" height="800" viewBox="0 0 1280 800"></svg>
+    <div class="wm">Myelin</div>
+    <div class="form under"><h4>Sign in</h4><p class="sub">to Myelin</p><label>Email</label><input tabindex="-1"><button tabindex="-1">Continue</button></div>
+  </div></div>
+  <ul class="notes">
+    <li><b>Works:</b> the page finally has a face. The arcs read as a poster, and the single blue layer gives the eye a place to land.</li>
+    <li><b>Doesn't:</b> the arcs and the form are strangers. The art is wallpaper; nothing you do changes it. The underlined field looks borrowed from another system, and "Continue" hides a second step.</li>
+    <li><b>Doesn't:</b> too much white mass. The two outer layers shout over the form.</li>
+  </ul>
+</div>
+
+<div class="sketch">
+  <div class="sketch-head"><h3>Sketch B — a lighter cut, a real form</h3><span class="verdict">rejected</span></div>
+  <div class="frame desk"><div class="ab desk dark" id="ab-b">
+    <svg class="art" width="1280" height="800" viewBox="0 0 1280 800"></svg>
+    <div class="wm">Myelin</div><div class="region">Data region: EU-West</div>
+    <div class="form"><h4>Sign in</h4><p class="sub">Welcome back to Myelin.</p>
+      <label>Email</label><input tabindex="-1" value="ada@acme.dev">
+      <div class="row"><label>Password</label><a>Forgot password?</a></div><input tabindex="-1" type="password" value="correcthorse">
+      <button tabindex="-1">Sign in</button>
+      <p class="foot">New here? Accounts are created by invitation. Ask a teammate for a link.</p>
+    </div>
+  </div></div>
+  <ul class="notes">
+    <li><b>Works:</b> the form. Email and password together, boxed fields from Myelin's own system, a button that says what it does, one line about how accounts are made.</li>
+    <li><b>Doesn't:</b> I over-corrected the art. Chopping the layers into short runs removed the weight and the sweep with it; what's left reads as debris, and a slab now sits on the region label.</li>
+  </ul>
+</div>
+
+<div class="sketch">
+  <div class="sketch-head"><h3>Sketch C — the sheath responds <span class="muted">(sign in)</span></h3><span class="verdict yes">chosen</span></div>
+  <div class="frame desk"><div class="ab desk dark" id="ab-c">
+    <svg class="art" width="1280" height="800" viewBox="0 0 1280 800"></svg>
+    <div class="wm">Myelin</div><div class="region">Data region: EU-West</div>
+    <div class="form"><h4>Sign in</h4><p class="sub">Welcome back to Myelin.</p>
+      <label>Email</label><input tabindex="-1" value="ada@acme.dev">
+      <div class="row"><label>Password</label><a>Forgot password?</a></div><input tabindex="-1" type="password" value="correcthorse">
+      <button tabindex="-1">Sign in</button>
+      <p class="foot">New here? Accounts are created by invitation. Ask a teammate for a link.</p>
+    </div>
+  </div></div>
+  <ul class="notes">
+    <li><b>A's sweep, B's form.</b> The long runs are back; only the slab that crowded the wordmark is gone, and the centre moves up so the core sits level with the fields.</li>
+    <li><b>One screen, one decision.</b> Single sign-on appears under the button only where a deployment has it. No operator token anywhere.</li>
+    <li><b>Motion with a job.</b> On load each layer rotates into place, inner first. While a sign-in is in flight the layers turn: that is the loading state. Reduced-motion gets the settled drawing.</li>
+  </ul>
+</div>
+
+<div class="sketch">
+  <div class="sketch-head"><h3>Sketch C — the invitation <span class="muted">(type in the password field)</span></h3><span class="verdict yes">chosen</span></div>
+  <div class="frame desk"><div class="ab desk dark" id="ab-join">
+    <svg class="art" width="1280" height="800" viewBox="0 0 1280 800"></svg>
+    <div class="wm">Myelin</div><div class="region">Data region: EU-West</div>
+    <div class="form"><h4>Join acme</h4><p class="sub">You've been invited to <b>acme</b> on Myelin.</p>
+      <label>Email</label><input tabindex="-1" readonly value="grace@acme.dev">
+      <label>Your name</label><input tabindex="-1" value="Grace Hopper">
+      <label for="join-pw">Choose a password</label><input id="join-pw" type="password" autocomplete="off" placeholder="Try typing here">
+      <p class="hint"><span>At least 10 characters.</span><span id="join-count">0 / 10</span></p>
+      <button tabindex="-1">Create account</button>
+    </div>
+  </div></div>
+  <ul class="notes">
+    <li><b>The same rule, an unfinished cut.</b> The sheath starts as faint guide rings with short stubs. Each character wraps it further, inside out; the blue layer closes last, on the tenth character. The drawing is the password meter, and it only claims what the policy checks: length.</li>
+    <li><b>The link is the credential.</b> The email is fixed by the invitation, so the person only names themselves and picks a password. Nothing to paste, ever.</li>
+  </ul>
+</div>
+
+<div class="sketch">
+  <div class="sketch-head"><h3>Sketch C — light theme and phone</h3><span class="verdict yes">chosen</span></div>
+  <div class="trio">
+    <div class="frame desk"><div class="ab desk light" id="ab-light">
+      <svg class="art" width="1280" height="800" viewBox="0 0 1280 800"></svg>
+      <div class="wm">Myelin</div><div class="region">Data region: EU-West</div>
+      <div class="form"><h4>Sign in</h4><p class="sub">Welcome back to Myelin.</p>
+        <label>Email</label><input tabindex="-1">
+        <div class="row"><label>Password</label><a>Forgot password?</a></div><input tabindex="-1">
+        <button tabindex="-1">Sign in</button>
+        <p class="foot">New here? Accounts are created by invitation. Ask a teammate for a link.</p>
+      </div>
+    </div></div>
+    <div class="frame phone"><div class="ab phone dark" id="ab-phone">
+      <svg class="art" width="390" height="260" viewBox="110 130 620 413" preserveAspectRatio="xMidYMid slice"></svg>
+      <div class="wm">Myelin</div>
+      <div class="form"><h4>Sign in</h4><p class="sub">Welcome back to Myelin.</p>
+        <label>Email</label><input tabindex="-1">
+        <div class="row"><label>Password</label><a>Forgot password?</a></div><input tabindex="-1">
+        <button tabindex="-1">Sign in</button>
+      </div>
+    </div></div>
+  </div>
+  <ul class="notes">
+    <li><b>Light is the poster.</b> Ink arcs on warm paper is the composition in its native register; dark is the same drawing inverted.</li>
+    <li><b>Phone:</b> the art becomes a cropped band above the form, so the fields sit at thumb height and nothing scrolls.</li>
+  </ul>
+</div>
+
+<h2>4 · The journey this sketch commits to</h2>
+<div class="findings">
+  <div class="finding"><h3>Sign in</h3><p>Email and password. Single sign-on beside it where a deployment has configured one. No operator token on the page at all.</p></div>
+  <div class="finding"><h3>Get an account</h3><p>Open an invitation link, choose a name and a password, and you are in. The first link comes from whoever runs the deployment; after that, any member can make one for a teammate.</p></div>
+  <div class="finding"><h3>Forget a password</h3><p>There is no mail server to send a reset, so the page says so plainly: ask your administrator for a reset link. It opens the same page as an invitation.</p></div>
+</div>
+
+<script>
+(() => {
+  if (!getComputedStyle(document.documentElement).getPropertyValue("--background").trim()) {
+    document.documentElement.classList.add("standalone");
+  }
+
+  // The programme: rings around a centre, thickness on a Fibonacci scale, runs on a 24-step angular grid.
+  const STEP = 360 / 24;
+  const polar = (cx, cy, r, deg) => [cx + r * Math.cos(deg * Math.PI / 180), cy + r * Math.sin(deg * Math.PI / 180)];
+  function draw(svg, cut, { cx, cy, unit, fg, accent, fill = () => 1, core = true, guides = false }) {
+    let r = cut.inner * unit, out = "";
+    cut.rings.forEach(([t, runs], i) => {
+      const w = t * unit, rad = r + w / 2;
+      if (guides) out += `<circle cx="${cx}" cy="${cy}" r="${rad}" fill="none" stroke="${fg}" stroke-width="1" opacity="0.16"/>`;
+      runs.forEach(([start, sweep], j) => {
+        const n = sweep * fill(i);
+        if (n <= 0.02) return;
+        const [x0, y0] = polar(cx, cy, rad, start * STEP), [x1, y1] = polar(cx, cy, rad, (start + n) * STEP);
+        const isAccent = cut.accent[0] === i && cut.accent[1] === j;
+        out += `<path d="M${x0.toFixed(1)} ${y0.toFixed(1)} A${rad} ${rad} 0 ${n * STEP > 180 ? 1 : 0} 1 ${x1.toFixed(1)} ${y1.toFixed(1)}" fill="none" stroke="${isAccent ? accent : fg}" stroke-width="${w}"/>`;
+      });
+      r += w + cut.gap * unit;
+    });
+    if (core) out += `<circle cx="${cx}" cy="${cy}" r="${unit * 1.3}" fill="${fg}"/>`;
+    svg.innerHTML = out;
+  }
+
+  const CUT_A = { inner: 6.3, gap: 1.5, accent: [4, 1], rings: [
+    [1, [[2, 9]]], [1, [[14, 7]]], [2, [[5, 8], [19, 3]]], [3, [[9, 9]]],
+    [5, [[3, 5], [13, 6]]], [8, [[7, 7], [20, 2]]], [13, [[11, 8]]], [21, [[5, 5], [16, 3]]] ] };
+  const CUT_B = { inner: 6.3, gap: 1.6, accent: [4, 1], rings: [
+    [1, [[1, 10]]], [1, [[13, 8]]], [2, [[4, 7], [18, 4]]], [3, [[8, 9]]],
+    [5, [[2, 4], [12, 6]]], [8, [[6, 5], [14, 3]]], [13, [[9, 4], [15, 2]]], [21, [[7, 2], [11, 3]]] ] };
+  const CUT_C = { inner: 6.3, gap: 1.5, accent: [4, 1], rings: [
+    [1, [[2, 9]]], [1, [[14, 7]]], [2, [[5, 8], [19, 3]]], [3, [[9, 9]]],
+    [5, [[3, 5], [13, 6]]], [8, [[7, 7], [20, 2]]], [13, [[11, 8]]], [21, [[5, 5]]] ] };
+  const CUT_JOIN = { inner: 6.3, gap: 1.6, accent: [5, 0], rings: [
+    [1, [[3, 21]]], [1, [[15, 21]]], [2, [[6, 20]]], [3, [[10, 20]]], [5, [[2, 19]]], [5, [[13, 22]]], [8, [[8, 10]]], [13, [[11, 5]]] ] };
+
+  const DARK = { fg: "#e7e9ee", accent: "#5b8cff" }, LIGHT = { fg: "#15171c", accent: "#2f6bff" };
+  const art = (id) => document.querySelector(`#${id} svg.art`);
+  draw(art("ab-a"), CUT_A, { cx: 430, cy: 470, unit: 7, ...DARK });
+  draw(art("ab-b"), CUT_B, { cx: 400, cy: 470, unit: 7, ...DARK });
+  const C = { cx: 420, cy: 440, unit: 7 };
+  draw(art("ab-c"), CUT_C, { ...C, ...DARK });
+  draw(art("ab-light"), CUT_C, { ...C, ...LIGHT });
+  draw(art("ab-phone"), CUT_C, { ...C, ...DARK });
+
+  const pw = document.getElementById("join-pw"), count = document.getElementById("join-count");
+  const joinArt = () => {
+    const len = [...pw.value].length, layers = CUT_JOIN.rings.length, progress = Math.min(len / 10, 1) * layers;
+    const accent = CUT_JOIN.accent[0], turn = (i) => (i === accent ? layers - 1 : i > accent ? i - 1 : i);
+    draw(art("ab-join"), CUT_JOIN, { ...C, ...DARK, guides: true,
+      fill: (i) => 0.1 + 0.9 * Math.max(0, Math.min(1, progress - turn(i))) });
+    count.textContent = `${Math.min(len, 10)} / 10`; count.className = len >= 10 ? "ok" : "";
+  };
+  pw.addEventListener("input", joinArt); joinArt();
+
+  // Designer studies.
+  draw(document.getElementById("study-jmb"), CUT_A, { cx: 96, cy: 86, unit: 1.35, fg: "currentColor", accent: "#5b8cff" });
+  const kg = document.getElementById("study-kg"); let cells = "";
+  for (let k = 0; k < 6; k++) {
+    let seed = 7 + k * 13; const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const cut = { inner: 3, gap: 1.5, accent: [2 + (k % 3), 0], rings: [1, 1, 2, 3, 5].map((t) => [t, [[Math.floor(rnd() * 24), 4 + Math.floor(rnd() * 12)]]]) };
+    const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    draw(g, cut, { cx: 40 + (k % 3) * 80, cy: 38 + Math.floor(k / 3) * 74, unit: 1.45, fg: "currentColor", accent: "#5b8cff" });
+    cells += g.innerHTML;
+  }
+  kg.innerHTML = cells;
+  document.getElementById("study-dr").innerHTML =
+    `<rect x="60" y="34" width="120" height="16" rx="2" fill="none" stroke="currentColor" opacity=".55"/>` +
+    `<rect x="60" y="62" width="120" height="16" rx="2" fill="none" stroke="currentColor" opacity=".55"/>` +
+    `<rect x="60" y="94" width="120" height="18" rx="2" fill="currentColor"/>` +
+    `<circle cx="196" cy="103" r="4" fill="#5b8cff"/>`;
+
+  const fit = () => document.querySelectorAll(".frame").forEach((f) => {
+    const ab = f.querySelector(".ab"); ab.style.setProperty("--s", f.clientWidth / (ab.classList.contains("phone") ? 390 : 1280));
+  });
+  new ResizeObserver(fit).observe(document.body); fit();
+})();
+</script>
+</body>
+</html>

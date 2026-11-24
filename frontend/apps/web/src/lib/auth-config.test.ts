@@ -6,7 +6,7 @@ import { toAuthConfig } from "./auth-config";
 // so — exactly like `devSeamAllowed`/`gateway-core` — the testable logic is this pure mapper.)
 const devEnv = { NODE_ENV: "development", MYELIN_DEV_LOGIN: "1" };
 
-describe("toAuthConfig — carries token_login_enabled (R4.0)", () => {
+describe("toAuthConfig — carries password_login_enabled (R4.0)", () => {
   it("advertises SSO only when both the edge verifier and web code flow are configured", () => {
     const edge = {
       sso_configured: true,
@@ -22,35 +22,35 @@ describe("toAuthConfig — carries token_login_enabled (R4.0)", () => {
     });
   });
 
-  it("passes the edge's token_login_enabled=true through", () => {
+  it("passes the edge's password_login_enabled=true through", () => {
     const cfg = toAuthConfig(
-      { sso_configured: false, providers: [], dev_login_enabled: false, token_login_enabled: true },
+      { sso_configured: false, providers: [], dev_login_enabled: false, password_login_enabled: true },
       {},
       false,
     );
-    expect(cfg.token_login_enabled).toBe(true);
+    expect(cfg.password_login_enabled).toBe(true);
   });
 
-  it("defaults token_login_enabled to false when the edge omits it (fail-closed)", () => {
+  it("defaults password_login_enabled to false when the edge omits it (fail-closed)", () => {
     const cfg = toAuthConfig({ sso_configured: false, providers: [] }, {}, false);
-    expect(cfg.token_login_enabled).toBe(false);
+    expect(cfg.password_login_enabled).toBe(false);
   });
 
-  it("fail-closed: the edge-unreachable stub ({}) yields token_login_enabled=false", () => {
+  it("fail-closed: the edge-unreachable stub ({}) yields password_login_enabled=false", () => {
     const cfg = toAuthConfig({}, {}, false);
-    expect(cfg.token_login_enabled).toBe(false);
+    expect(cfg.password_login_enabled).toBe(false);
     expect(cfg.sso_configured).toBe(false);
   });
 
-  it("token_login_enabled is INDEPENDENT of the dev-seam gates (a real path, no build/env kill switch)", () => {
-    // A production build kills the dev seam, but the operator-token flag still rides the edge truth.
+  it("password_login_enabled is INDEPENDENT of the dev-seam gates (a real path, no build/env kill switch)", () => {
+    // A production build kills the dev seam, but password sign-in still follows the edge.
     const cfg = toAuthConfig(
-      { token_login_enabled: true, dev_login_enabled: true },
+      { password_login_enabled: true, dev_login_enabled: true },
       devEnv,
       /* isProdBuild */ true,
     );
     expect(cfg.dev_login_enabled).toBe(false); // dev seam killed in a prod build
-    expect(cfg.token_login_enabled).toBe(true); // operator-token unaffected
+    expect(cfg.password_login_enabled).toBe(true); // password sign-in unaffected
   });
 
   it("still composes the dev seam via devSeamAllowed (unchanged behaviour)", () => {
@@ -63,7 +63,7 @@ describe("toAuthConfig — carries token_login_enabled (R4.0)", () => {
       sso_configured: false,
       providers: [],
       dev_login_enabled: false,
-      token_login_enabled: false,
+      password_login_enabled: false,
     });
   });
 
@@ -71,7 +71,7 @@ describe("toAuthConfig — carries token_login_enabled (R4.0)", () => {
     const cfg = toAuthConfig({
       sso_configured: true,
       dev_login_enabled: "true",
-      token_login_enabled: 1,
+      password_login_enabled: 1,
       providers: [
         { id: "oidc", label: "Work SSO" },
         { id: "Bad ID", label: "Invalid" },
@@ -85,7 +85,7 @@ describe("toAuthConfig — carries token_login_enabled (R4.0)", () => {
       sso_configured: true,
       providers: [{ id: "oidc", label: "Work SSO" }],
       dev_login_enabled: false,
-      token_login_enabled: false,
+      password_login_enabled: false,
     });
   });
 });

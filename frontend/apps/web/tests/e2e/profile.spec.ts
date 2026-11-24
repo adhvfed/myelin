@@ -25,6 +25,6 @@ test.describe("Profile", () => {
     await expect(page.getByRole("radio", { name: /Light/ })).toHaveAttribute("aria-checked", "true");
     await page.getByRole("button", { name: "Sign out of Myelin" }).click();
     await page.waitForURL("**/login");
-    await expect(page.getByRole("heading", { name: "Sign in to Myelin" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
   });
 });

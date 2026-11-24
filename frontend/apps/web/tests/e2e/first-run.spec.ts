@@ -44,31 +44,14 @@ test.afterEach(async () => {
 });
 
 test.describe("R3.5 first-run — login", () => {
-  test("login shows the OIDC/SSO PRIMARY (rides --c-btn-primary-bg) with a visible unavailable reason; dev seam relegated; axe green", async ({ page }) => {
+  test("login is email and password, with no dead SSO button and no token field; dev seam relegated; axe green", async ({ page }) => {
     await setEdgeConfig({ devLoginEnabled: true });
     await page.goto("/login");
 
-    // The SSO button is THE primary affordance and rides the derived button token (never raw accent).
-    const sso = page.getByTestId("sso-login");
-    await expect(sso).toBeVisible();
-    const { got, token } = await page.evaluate(() => {
-      const btn = document.querySelector('[data-testid="sso-login"]') as HTMLElement;
-      const probe = document.createElement("div");
-      document.body.appendChild(probe);
-      probe.style.background = "var(--c-btn-primary-bg)";
-      const token = getComputedStyle(probe).backgroundColor;
-      probe.remove();
-      return { got: getComputedStyle(btn).backgroundColor, token };
-    });
-    expect(got).toBe(token); // primary rides --c-btn-primary-bg
-
-    // SSO is not configured on this deployment → the reason is VISIBLE text (not a title tooltip),
-    // referenced by aria-describedby on the disabled button.
-    await expect(sso).toHaveAttribute("aria-disabled", "true");
-    const reasonId = await sso.getAttribute("aria-describedby");
-    expect(reasonId).toBe("sso-reason");
-    await expect(page.getByTestId("sso-reason")).toBeVisible();
-    await expect(page.getByTestId("sso-reason")).toContainText(/administrator/i);
+    // People sign in as themselves. A method this deployment doesn't have is simply absent.
+    await expect(page.getByTestId("password-login-form")).toBeVisible();
+    await expect(page.getByTestId("sso-login")).toHaveCount(0);
+    await expect(page.getByText(/operator token|capability token/i)).toHaveCount(0);
 
     // The dev seam is present (relegated) — the harness has it enabled.
     await expect(page.getByTestId("dev-seam")).toBeVisible();
@@ -80,8 +63,8 @@ test.describe("R3.5 first-run — login", () => {
   test("the dev seam is HIDDEN when the server flag is off (dev_login_enabled=false)", async ({ page }) => {
     await setEdgeConfig({ devLoginEnabled: false });
     await page.goto("/login");
-    // The SSO primary still renders; the dev seam does NOT.
-    await expect(page.getByTestId("sso-login")).toBeVisible();
+    // Sign-in still renders; the dev seam does NOT.
+    await expect(page.getByTestId("password-login")).toBeVisible();
     await expect(page.getByTestId("dev-seam")).toHaveCount(0);
     await expect(page.getByTestId("dev-login")).toHaveCount(0);
   });

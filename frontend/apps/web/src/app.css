@@ -7,6 +7,7 @@
 @import "./knowledge.css";
 @import "./profile.css";
 @import "./shared-composer.css";
+@import "./auth.css";
 
 *,
 *::before,
@@ -73,10 +74,6 @@ button {
 .app-shell {
   height: 100vh;
   height: 100dvh;
-}
-.login-main {
-  min-height: 100vh;
-  min-height: 100dvh;
 }
 
 /* Interactive chrome colour lives in CSS classes, never inline styles — inline colour beats

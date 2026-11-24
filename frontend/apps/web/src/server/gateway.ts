@@ -92,6 +92,9 @@ export interface EdgeWhoami {
   region: string;
   kind: string;
   expires_at: number;
+  /** The person's profile name; absent on older edges and for non-human principals. */
+  display_name?: string;
+  email?: string;
 }
 
 function validEdgeWhoami(value: unknown): value is EdgeWhoami {

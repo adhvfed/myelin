@@ -1,0 +1,378 @@
+/* The logged-out pages (sign in, invitation). One bold form — the sheath — beside a plain form.
+   Colour for interactive controls lives here, not inline, so hover and focus states can win. */
+
+.auth-main {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(24rem, 1fr);
+}
+
+/* ── The sheath ─────────────────────────────────────────────────────────── */
+
+.auth-art {
+  position: relative;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.sheath {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.sheath-run {
+  fill: none;
+  stroke: var(--text-primary);
+  transition: stroke-dasharray 520ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.sheath-run--accent {
+  stroke: var(--accent);
+}
+
+.sheath-guide {
+  fill: none;
+  stroke: var(--text-primary);
+  stroke-width: 1;
+  opacity: 0.16;
+}
+
+.sheath-core {
+  fill: var(--text-primary);
+}
+
+/* Each layer turns about the core. On load they settle into place, inner first, alternating
+   direction; while a request is in flight they keep turning. */
+.sheath-ring {
+  transform-box: view-box;
+  transform-origin: 420px 440px;
+  animation: sheath-settle calc(900ms + var(--i) * 70ms) cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: calc(var(--i) * 45ms);
+}
+
+.sheath-ring:nth-child(odd) {
+  --from: calc(-38deg - var(--i) * 9deg);
+}
+
+.sheath-ring:nth-child(even) {
+  --from: calc(38deg + var(--i) * 9deg);
+}
+
+.sheath[data-busy] .sheath-ring {
+  animation: sheath-turn calc(5s + var(--i) * 1.6s) linear infinite;
+}
+
+.sheath[data-busy] .sheath-ring:nth-child(even) {
+  animation-direction: reverse;
+}
+
+@keyframes sheath-settle {
+  from { transform: rotate(var(--from)); }
+  to { transform: rotate(0deg); }
+}
+
+@keyframes sheath-turn {
+  to { transform: rotate(360deg); }
+}
+
+/* Text set over the art inverts against whatever passes beneath it. */
+.auth-wordmark,
+.auth-region {
+  position: absolute;
+  inset-inline-start: var(--space-7);
+  margin: 0;
+  color: #fff;
+  mix-blend-mode: difference;
+}
+
+.auth-wordmark {
+  inset-block-start: var(--space-7);
+  font-size: var(--fs-h3);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.02em;
+}
+
+.auth-region {
+  inset-block-end: var(--space-6);
+  font-size: var(--fs-caption);
+  opacity: 0.8;
+}
+
+.auth-region strong {
+  font-weight: var(--weight-medium);
+}
+
+/* ── The form ───────────────────────────────────────────────────────────── */
+
+.auth-pane {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-7) var(--space-5);
+}
+
+.auth-form {
+  width: 100%;
+  max-width: 21.5rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.auth-heading {
+  margin: 0;
+  font-size: var(--fs-display);
+  font-weight: var(--weight-semibold);
+  line-height: 1.1;
+  letter-spacing: -0.025em;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+
+.auth-sub {
+  margin: var(--space-2) 0 var(--space-5);
+  color: var(--text-muted);
+  text-wrap: pretty;
+}
+
+.auth-sub strong {
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+}
+
+.auth-fields {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.auth-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* A field with a link beside its label. The link sits outside the <label> so clicking it never
+   focuses the input. */
+.auth-field--linked {
+  position: relative;
+}
+
+.auth-field--linked > .auth-link {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+}
+
+.auth-label {
+  font-size: var(--fs-body-sm);
+  font-weight: var(--weight-medium);
+}
+
+.auth-link {
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.auth-link:hover {
+  color: var(--text-primary);
+}
+
+.auth-input {
+  width: 100%;
+  min-height: 2.75rem;
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--fs-h3);
+  transition: border-color var(--dur-fast) var(--ease-standard);
+}
+
+.auth-input::placeholder {
+  color: var(--text-subtle);
+  opacity: 1;
+}
+
+.auth-input:hover {
+  border-color: var(--text-subtle);
+}
+
+.auth-input[readonly] {
+  border-style: dashed;
+  color: var(--text-muted);
+}
+
+.auth-input[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.auth-hint {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: var(--fs-caption);
+}
+
+.auth-hint [data-met] {
+  color: var(--accent);
+}
+
+.auth-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 2.75rem;
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-standard),
+    border-color var(--dur-fast) var(--ease-standard);
+}
+
+.auth-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--text-subtle);
+}
+
+.auth-btn:active {
+  background: var(--surface-overlay);
+}
+
+/* The one primary action: ink on paper, like the sheath itself. */
+.auth-btn--primary {
+  border-color: transparent;
+  background: var(--text-primary);
+  color: var(--surface);
+  font-weight: var(--weight-semibold);
+}
+
+.auth-btn--primary:hover {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--text-primary) 86%, var(--surface));
+}
+
+.auth-btn--primary:active {
+  background: color-mix(in srgb, var(--text-primary) 74%, var(--surface));
+}
+
+.auth-btn[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.75;
+}
+
+.auth-or {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-4) 0;
+  color: var(--text-subtle);
+  font-size: var(--fs-caption);
+}
+
+.auth-or::before,
+.auth-or::after {
+  content: "";
+  flex: 1;
+  border-block-start: var(--hairline) solid var(--border);
+}
+
+.auth-alert,
+.auth-note {
+  margin: 0 0 var(--space-4);
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--border-strong);
+  border-radius: var(--radius-1);
+  font-size: var(--fs-body-sm);
+  text-wrap: pretty;
+}
+
+.auth-alert {
+  border-color: var(--danger);
+  background: var(--danger-subtle);
+}
+
+.auth-note {
+  background: var(--surface-raised);
+  color: var(--text-muted);
+}
+
+.auth-foot {
+  margin: var(--space-5) 0 0;
+  padding-block-start: var(--space-4);
+  border-block-start: var(--hairline) solid var(--border);
+  color: var(--text-subtle);
+  font-size: var(--fs-body-sm);
+  text-wrap: pretty;
+}
+
+/* The development seam: set apart and quiet, never styled as a real way in. */
+.auth-seam {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-block-start: var(--space-5);
+}
+
+.auth-seam form {
+  margin: 0;
+}
+
+.auth-seam p {
+  margin: 0;
+  color: var(--text-subtle);
+  font-size: var(--fs-caption);
+}
+
+/* ── Narrow screens: the sheath becomes a band above the form ───────────── */
+
+@media (max-width: 56rem) {
+  .auth-main {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 15rem 1fr;
+  }
+
+  .auth-wordmark {
+    inset-block-start: var(--space-5);
+    inset-inline-start: var(--space-5);
+  }
+
+  .auth-region {
+    inset-block-end: var(--space-3);
+    inset-inline-start: var(--space-5);
+  }
+
+  .auth-pane {
+    align-items: flex-start;
+    padding: var(--space-6) var(--space-5) var(--space-7);
+  }
+
+  .auth-form {
+    max-width: 26rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheath-ring,
+  .sheath[data-busy] .sheath-ring {
+    animation: none;
+  }
+
+  .sheath-run {
+    transition: none;
+  }
+}

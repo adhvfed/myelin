@@ -13,8 +13,8 @@ export interface AuthConfig {
   sso_configured: boolean;
   providers: AuthProvider[];
   dev_login_enabled: boolean;
-  /** Whether the edge accepts operator-token login. Defaults to false when config is unavailable. */
-  token_login_enabled: boolean;
+  /** Whether the edge accepts email + password sign-in. False when config is unavailable. */
+  password_login_enabled: boolean;
 }
 
 /** The edge's raw `/v1/auth/config` response. */
@@ -22,13 +22,13 @@ export interface EdgeAuthConfig {
   sso_configured?: boolean;
   providers?: AuthProvider[];
   dev_login_enabled?: boolean;
-  token_login_enabled?: boolean;
+  password_login_enabled?: boolean;
 }
 
 /**
  * Map the edge's raw config to the login page's render source.
  * Development login requires the edge flag, frontend environment, and a non-production build.
- * Operator-token login depends only on the edge flag. Missing values default to false.
+ * Password sign-in depends only on the edge flag. Missing values default to false.
  */
 export function toAuthConfig(
   edge: unknown,
@@ -44,7 +44,7 @@ export function toAuthConfig(
     sso_configured: ssoConfigured,
     providers: ssoConfigured ? validProviders(raw.providers) : [],
     dev_login_enabled: devSeamAllowed(raw.dev_login_enabled === true, env, isProdBuild),
-    token_login_enabled: raw.token_login_enabled === true,
+    password_login_enabled: raw.password_login_enabled === true,
   };
 }
 

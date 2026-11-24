@@ -1,9 +1,9 @@
 import { Icon, useToast, type IconName } from "@myelin/design-system";
 import { Title } from "@solidjs/meta";
-import { useAction } from "@solidjs/router";
-import { createSignal, For, onMount, type JSX } from "solid-js";
+import { useAction, useSubmission } from "@solidjs/router";
+import { createSignal, For, onMount, Show, type JSX } from "solid-js";
 import { useAppViewer } from "~/components/AppShell";
-import { logout } from "~/lib/auth";
+import { createInvitation, logout } from "~/lib/auth";
 import { applyTheme, restoreTheme, THEMES, type Theme } from "~/lib/theme";
 
 const THEME_COPY: Record<Theme, { label: string; copy: string }> = {
@@ -34,10 +34,69 @@ export default function Profile() {
         <ProfileCard icon="team" title="Workspace" copy="Your current organization boundary. Data from another tenant is never mixed into this session."><dl><div><dt>Tenant</dt><dd><code>{viewer.tenant}</code></dd></div><div><dt>Role</dt><dd>Member</dd></div></dl></ProfileCard>
         <ProfileCard icon="gate" title="Data residency" copy="Myelin keeps execution and durable product data inside the assigned region."><dl><div><dt>Active region</dt><dd><strong>{viewer.region}</strong></dd></div><div><dt>Residency</dt><dd>EU sovereign boundary</dd></div></dl></ProfileCard>
         <ProfileCard icon="settings" title="Appearance" copy="Choose a mode for this browser. The setting persists without changing your organization profile."><div class="profile-theme-options" role="radiogroup" aria-label="Appearance"><For each={THEMES}>{(option) => <button type="button" role="radio" aria-checked={theme() === option} disabled={!interactive()} onClick={() => chooseTheme(option)}><span class={`profile-theme-swatch ${option}`} aria-hidden="true" /><strong>{THEME_COPY[option].label}</strong><small>{THEME_COPY[option].copy}</small></button>}</For></div></ProfileCard>
+        <InviteCard />
         <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button></ProfileCard>
       </div>
     </div>
   </>;
+}
+
+const INVITE_ERRORS: Record<string, string> = {
+  account_exists: "Someone with that email already has an account here.",
+  invalid_email: "That doesn't look like an email address.",
+  rate_limited: "Too many invitations just now. Wait a minute, then try again.",
+};
+
+/** Make an invitation link for a teammate. There is no mail server, so the link is copied by hand. */
+function InviteCard() {
+  const inviting = useSubmission(createInvitation);
+  const toast = useToast();
+  const copy = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      toast.show({ title: "Invitation link copied", variant: "success" });
+    } catch {
+      toast.show({ title: "Couldn't copy. Select the link and copy it by hand.", variant: "danger" });
+    }
+  };
+  return (
+    <ProfileCard icon="team" title="Invite a teammate" copy="Create a link that lets one person join your organization. Send it to them yourself; Myelin doesn't email it.">
+      <form action={createInvitation} method="post" class="profile-invite-form">
+        <div>
+          <label>
+            <span>Their email</span>
+            <input name="email" type="email" required autocomplete="off" data-testid="invite-email" />
+          </label>
+          <button type="submit" data-testid="invite-submit" aria-busy={inviting.pending ? "true" : undefined}>
+            {inviting.pending ? "Creating…" : "Create link"}
+          </button>
+        </div>
+      </form>
+      <Show when={inviting.result} keyed>
+        {(result) => (
+          <Show
+            when={result.ok ? result : undefined}
+            keyed
+            fallback={
+              <p role="alert" class="profile-invite-error" data-testid="invite-error">
+                {INVITE_ERRORS[result.ok ? "" : result.reason] ?? "The link couldn't be created. Try again in a moment."}
+              </p>
+            }
+          >
+            {(created) => (
+              <div role="status" class="profile-invite-result" data-testid="invite-result">
+                <p>Link for <strong>{created.email}</strong>. It works once, until {new Date(created.expiresAt * 1_000).toLocaleDateString(undefined, { day: "numeric", month: "long" })}.</p>
+                <div>
+                  <input readonly aria-label="Invitation link" value={created.url} data-testid="invite-url" onFocus={(event) => event.currentTarget.select()} />
+                  <button type="button" onClick={() => void copy(created.url)}>Copy</button>
+                </div>
+              </div>
+            )}
+          </Show>
+        )}
+      </Show>
+    </ProfileCard>
+  );
 }
 
 function ProfileCard(props: { icon: IconName; title: string; copy: string; children?: JSX.Element }) {

@@ -25,16 +25,15 @@ import {
 } from "../../dev-edge/dev-contract.mjs";
 import { devLoginAllowed, type DevLoginEnv } from "./dev-login-guard";
 import {
-  runTokenLogin,
-  TOKEN_LOGIN_DISABLED,
-  TOKEN_LOGIN_ERROR,
-  TOKEN_LOGIN_SUCCESS,
-} from "./token-login";
-import {
-  authFailureDestination,
-  authenticationDestination,
-  safeAuthReturnTo,
-} from "./auth-return";
+  AccountError,
+  edgeAcceptInvitation,
+  edgeCreateInvitation,
+  edgeGetInvitation,
+  edgePasswordLogin,
+  validInvitationCode,
+} from "../server/account-gateway";
+import type { AccountFailure, EdgeInvitation, EdgeSessionGrant } from "../server/account-gateway";
+import { authFailureDestination, DEFAULT_AUTH_RETURN_TO, safeAuthReturnTo } from "./auth-return";
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
 import {
   toAuthConfig,
@@ -160,7 +159,7 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
     // Keep both SSO and development login disabled when config is unavailable.
     edge = { sso_configured: false, providers: [], dev_login_enabled: false };
   }
-  // The mapping (dev-seam composition + the token-login edge flag) is the pure {@link toAuthConfig}.
+  // The mapping (dev-seam composition + the edge flags) is the pure {@link toAuthConfig}.
   return toAuthConfig(
     edge,
     process.env as DevLoginEnv,
@@ -169,40 +168,112 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
   );
 }, "auth-config");
 
-/**
- * Verify a pasted capability token against the edge, then issue a server-side session carrying the
- * returned principal, tenant, and region. The token is never logged, returned to the client, or put
- * in a URL. The auth mode is checked again here because actions can be invoked without rendering the
- * login form first.
- */
-export const loginWithToken = action(async (formData: FormData) => {
+/** The region this deployment keeps its data in, for the logged-out pages. Null when unknown. */
+export const getDeploymentRegion = query(async (): Promise<string | null> => {
   "use server";
-  const token = String(formData.get("token") ?? "");
-  const schemeRaw = formData.get("scheme");
-  const result = await runTokenLogin(
-    token,
-    schemeRaw != null ? String(schemeRaw) : undefined,
-    {
-      isEnabled: async () => {
-        const config = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
-        return config.token_login_enabled === true;
-      },
-      verify: (t, s) => edgeWhoamiWithToken(t, s),
-      issue: async (rec) => { await issueSession(rec); },
-    },
-  );
+  const region = process.env.MYELIN_REGION?.trim() ?? "";
+  return /^[a-z0-9][a-z0-9-]{0,62}$/.test(region) ? region : null;
+}, "deployment-region");
+
+/** Turn a fresh human session grant into the browser's server-side session. */
+async function signInWithGrant(grant: EdgeSessionGrant): Promise<void> {
+  const who = await edgeWhoamiWithToken(grant.accessToken, grant.scheme);
+  await issueSession({
+    token: grant.accessToken,
+    refreshToken: "",
+    scheme: grant.scheme,
+    credentialExpiresAtMs: Math.min(
+      Math.min(grant.expiresAt, who.expires_at) * 1_000,
+      Date.now() + SESSION_ABSOLUTE_TTL_MS,
+    ),
+    principalId: who.principal_id,
+    displayName: who.display_name?.trim() || who.principal_id,
+    region: who.region,
+    tenant: who.tenant,
+  });
+}
+
+function accountFailure(error: unknown): AccountFailure {
+  return error instanceof AccountError ? error.reason : "unavailable";
+}
+
+/** Sign in with an email and password. The password is never logged or returned to the client. */
+export const loginWithPassword = action(async (formData: FormData) => {
+  "use server";
+  const email = String(formData.get("email") ?? "").trim();
+  const password = String(formData.get("password") ?? "");
   const returnTo = formData.get("return_to");
-  if (result.redirectTo === TOKEN_LOGIN_SUCCESS) {
-    throw redirect(safeAuthReturnTo(returnTo));
+  let failure: AccountFailure | null = null;
+  if (!email || !password || email.length > 320 || password.length > 4_096) {
+    failure = "credentials";
+  } else {
+    try {
+      await signInWithGrant(await edgePasswordLogin(email, password));
+    } catch (error) {
+      failure = accountFailure(error);
+    }
   }
-  if (result.redirectTo === TOKEN_LOGIN_ERROR) {
-    throw redirect(authFailureDestination("token_invalid", returnTo));
+  if (failure) throw redirect(authFailureDestination(failure, returnTo));
+  throw redirect(safeAuthReturnTo(returnTo));
+}, "login-with-password");
+
+/** What the invitation page needs to render: the invitation, or why it cannot be shown. */
+export type InvitationView =
+  | { state: "ready"; invitation: EdgeInvitation }
+  | { state: "invalid" }
+  | { state: "unavailable" };
+
+export const getInvitation = query(async (code: string): Promise<InvitationView> => {
+  "use server";
+  if (!validInvitationCode(code)) return { state: "invalid" };
+  try {
+    const invitation = await edgeGetInvitation(code);
+    return invitation ? { state: "ready", invitation } : { state: "invalid" };
+  } catch {
+    return { state: "unavailable" };
   }
-  if (result.redirectTo === TOKEN_LOGIN_DISABLED) {
-    throw redirect(authenticationDestination(returnTo));
+}, "invitation");
+
+/** Accept an invitation link: create the account or set the new password, then sign in. */
+export const acceptInvitation = action(async (formData: FormData) => {
+  "use server";
+  const code = String(formData.get("code") ?? "");
+  if (!validInvitationCode(code)) throw redirect("/login");
+  const password = String(formData.get("password") ?? "");
+  const rawName = formData.get("display_name");
+  const displayName = rawName == null ? undefined : String(rawName).trim();
+  let failure: AccountFailure | null = null;
+  if (displayName !== undefined && (displayName.length === 0 || displayName.length > 120)) {
+    failure = "invalid_name";
+  } else {
+    try {
+      await signInWithGrant(await edgeAcceptInvitation(code, { displayName, password }));
+    } catch (error) {
+      failure = accountFailure(error);
+    }
   }
-  throw redirect("/login");
-}, "login-with-token");
+  if (failure) throw redirect(`/join/${code}?${new URLSearchParams({ error: failure })}`);
+  throw redirect(DEFAULT_AUTH_RETURN_TO);
+}, "accept-invitation");
+
+export type InvitationResult =
+  | { ok: true; url: string; email: string; expiresAt: number }
+  | { ok: false; reason: AccountFailure };
+
+/** Create an invitation link for a teammate. The link is shown once, to be passed on by hand. */
+export const createInvitation = action(async (formData: FormData): Promise<InvitationResult> => {
+  "use server";
+  const email = String(formData.get("email") ?? "").trim();
+  if (!email || email.length > 320 || !email.includes("@")) {
+    return { ok: false, reason: "invalid_email" };
+  }
+  try {
+    return { ok: true, ...(await edgeCreateInvitation(email)) };
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    return { ok: false, reason: accountFailure(error) };
+  }
+}, "create-invitation");
 
 /**
  * Begin a one-time OIDC Authorization Code + S256 PKCE transaction. The mode is re-read from both

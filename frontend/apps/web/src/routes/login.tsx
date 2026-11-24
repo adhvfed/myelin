@@ -1,287 +1,161 @@
-// Public login route. The edge config controls the available methods; development login also
-// requires a non-production build.
+// Public sign-in. A person signs in with their email and password; single sign-on appears beside it
+// where the deployment has configured one. The edge config decides which methods render.
 import { Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { createAsync, useSearchParams, useSubmission } from "@solidjs/router";
-import { Icon } from "@myelin/design-system";
-import { getAuthConfig, loginDev, loginWithToken, startSso } from "../lib/auth";
+import { AuthShell } from "../components/auth/AuthShell";
+import { SIGN_IN_CUT } from "../components/auth/Sheath";
+import { getAuthConfig, loginDev, loginWithPassword, startSso } from "../lib/auth";
 import { safeAuthReturnTo } from "../lib/auth-return";
 
-const card = {
-  width: "100%",
-  "max-width": "24rem",
-  display: "flex",
-  "flex-direction": "column",
-  gap: "var(--space-4)",
-  padding: "var(--space-5)",
-  border: "var(--hairline) solid var(--border-strong)",
-  "border-radius": "var(--radius-2)",
-  background: "var(--surface-raised)",
-} as const;
-
-const primaryBtn = {
-  display: "inline-flex",
-  "align-items": "center",
-  "justify-content": "center",
-  gap: "var(--space-2)",
-  width: "100%",
-  padding: "var(--space-2) var(--space-3)",
-  border: "none",
-  "border-radius": "var(--radius-1)",
-  background: "var(--c-btn-primary-bg)",
-  color: "var(--c-btn-primary-text)",
-  "font-weight": "600",
-  cursor: "pointer",
-} as const;
-
-const secondaryBtn = {
-  display: "inline-flex",
-  "align-items": "center",
-  "justify-content": "center",
-  gap: "var(--space-2)",
-  width: "100%",
-  padding: "var(--space-2) var(--space-3)",
-  border: "var(--hairline) solid var(--border-strong)",
-  "border-radius": "var(--radius-1)",
-  background: "var(--surface)",
-  color: "var(--text-primary)",
-  "font-weight": "500",
-  cursor: "pointer",
-} as const;
+/** What went wrong, in the visitor's terms. Unknown codes get the generic line. */
+function errorCopy(code: string): string {
+  switch (code) {
+    case "credentials":
+      return "That email and password don't match an account. Check both and try again.";
+    case "rate_limited":
+      return "Too many attempts. Wait a minute, then try again.";
+    default:
+      return "Sign-in couldn't be completed. Try again, or contact your Myelin administrator if it keeps happening.";
+  }
+}
 
 export default function Login() {
   const config = createAsync(() => getAuthConfig());
   const [params] = useSearchParams();
+  const passwordPending = useSubmission(loginWithPassword);
   const ssoPending = useSubmission(startSso);
-  const tokenPending = useSubmission(loginWithToken);
+  const devPending = useSubmission(loginDev);
 
-  const hasError = () => Boolean(params.error);
-  // Token failures use different guidance from SSO failures.
-  const isTokenError = () => params.error === "token_invalid";
+  const error = () => (typeof params.error === "string" ? params.error : "");
+  const credentialsRejected = () => error() === "credentials";
   const returnTo = () => safeAuthReturnTo(params.return_to);
+  const busy = () => passwordPending.pending || ssoPending.pending || devPending.pending;
+  const resetHelpHref = () => {
+    const query = new URLSearchParams({ help: "password" });
+    if (typeof params.return_to === "string") query.set("return_to", returnTo());
+    return `/login?${query}`;
+  };
 
   return (
-    <main
-      class="login-main"
-      style={{
-        // Account for dynamic mobile browser chrome.
-        "min-height": "100dvh",
-        display: "flex",
-        "flex-direction": "column",
-        "align-items": "center",
-        "justify-content": "center",
-        gap: "var(--space-6)",
-        padding: "var(--space-6) var(--space-4)",
-      }}
-    >
+    <AuthShell cut={SIGN_IN_CUT} busy={busy()}>
       <Title>Sign in · Myelin</Title>
-
-      <section aria-labelledby="login-heading" style={card}>
-        <h1
-          id="login-heading"
-          style={{ "font-size": "var(--fs-h2)", margin: "0", display: "flex", "align-items": "center", gap: "var(--space-2)" }}
-        >
-          <Icon name="human" /> Sign in to Myelin
+      <section aria-labelledby="login-heading" class="auth-form">
+        <h1 id="login-heading" class="auth-heading">
+          Sign in
         </h1>
+        <p class="auth-sub">Welcome back to Myelin.</p>
 
-        {/* Announce login failures without exposing raw server errors. */}
-        <Show when={hasError()}>
-          <p
-            role="alert"
-            id="login-error-msg"
-            data-testid={isTokenError() ? "login-error-token" : "login-error"}
-            style={{
-              margin: "0",
-              display: "flex",
-              gap: "var(--space-2)",
-              "align-items": "flex-start",
-              "font-size": "var(--fs-body-sm)",
-              border: "var(--hairline) solid var(--danger)",
-              "border-radius": "var(--radius-1)",
-              padding: "var(--space-2) var(--space-3)",
-              background: "var(--danger-subtle)",
-            }}
-          >
-            <Icon name="gate" />
-            {/* Token failures blame the token/bootstrap step; every other error keeps the SSO copy. */}
-            <Show
-              when={isTokenError()}
-              fallback={
-                <span>
-                  Sign-in couldn't be completed. You can try again, or contact your Myelin
-                  administrator if the problem continues. Nothing's wrong on your end.
-                </span>
-              }
-            >
-              <span>
-                That operator token didn't work — it's likely invalid or expired. Re-run{" "}
-                <code style={{ "font-family": "var(--font-mono)" }}>edge bootstrap</code> to print a
-                fresh token, then paste it below. Nothing's wrong on your end.
-              </span>
-            </Show>
+        <Show when={error()}>
+          <p role="alert" id="login-error-msg" class="auth-alert" data-testid="login-error">
+            {errorCopy(error())}
+          </p>
+        </Show>
+        <Show when={params.help === "password" && !error()}>
+          <p role="status" class="auth-note" data-testid="password-help">
+            Password resets come from whoever runs this Myelin deployment. Ask them for a reset
+            link; it opens a page where you choose a new password.
           </p>
         </Show>
 
-        <Suspense fallback={<p style={{ margin: "0", color: "var(--text-muted)" }}>Loading sign-in options…</p>}>
+        <Suspense fallback={<p class="auth-note">Loading sign-in…</p>}>
           <Show when={config()} keyed>
             {(cfg) => (
               <>
-                <Show
-                  when={cfg.sso_configured}
-                  fallback={
-                    <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-                      <button
-                        type="button"
-                        data-testid="sso-login"
-                        aria-disabled="true"
-                        aria-describedby="sso-reason"
-                        style={{ ...primaryBtn, cursor: "not-allowed", opacity: "0.6" }}
-                      >
-                        <Icon name="human" /> Continue with single sign-on
-                      </button>
-                      <p
-                        id="sso-reason"
-                        data-testid="sso-reason"
-                        style={{
-                          margin: "0",
-                          display: "flex",
-                          gap: "var(--space-2)",
-                          "align-items": "flex-start",
-                          "font-size": "var(--fs-body-sm)",
-                          color: "var(--text-muted)",
-                          border: "var(--hairline) solid var(--warning)",
-                          "border-radius": "var(--radius-1)",
-                          padding: "var(--space-2) var(--space-3)",
-                          background: "var(--warning-subtle)",
-                        }}
-                      >
-                        <Icon name="gate" />
-                        <span>
-                          Single sign-on isn't available yet on this deployment — an administrator needs
-                          to configure the identity provider. Contact your Myelin administrator.
-                        </span>
-                      </p>
+                <Show when={cfg.password_login_enabled}>
+                  <form
+                    action={loginWithPassword}
+                    method="post"
+                    class="auth-fields"
+                    data-testid="password-login-form"
+                  >
+                    <input type="hidden" name="return_to" value={returnTo()} />
+                    <label class="auth-field">
+                      <span class="auth-label">Email</span>
+                      <input
+                        name="email"
+                        type="email"
+                        required
+                        autocomplete="username"
+                        autocapitalize="off"
+                        spellcheck={false}
+                        class="auth-input"
+                        data-testid="email-input"
+                        aria-invalid={credentialsRejected() ? "true" : undefined}
+                        aria-describedby={credentialsRejected() ? "login-error-msg" : undefined}
+                      />
+                    </label>
+                    <div class="auth-field auth-field--linked">
+                      <label class="auth-field">
+                        <span class="auth-label">Password</span>
+                        <input
+                          name="password"
+                          type="password"
+                          required
+                          autocomplete="current-password"
+                          class="auth-input"
+                          data-testid="password-input"
+                          aria-invalid={credentialsRejected() ? "true" : undefined}
+                          aria-describedby={credentialsRejected() ? "login-error-msg" : undefined}
+                        />
+                      </label>
+                      <a class="auth-link" href={resetHelpHref()} data-testid="forgot-password">
+                        Forgot password?
+                      </a>
                     </div>
-                  }
-                >
-                  <form action={startSso} method="post" style={{ margin: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+                    <button
+                      type="submit"
+                      class="auth-btn auth-btn--primary"
+                      data-testid="password-login"
+                      aria-busy={passwordPending.pending ? "true" : undefined}
+                    >
+                      {passwordPending.pending ? "Signing in…" : "Sign in"}
+                    </button>
+                  </form>
+                </Show>
+
+                <Show when={cfg.sso_configured}>
+                  <Show when={cfg.password_login_enabled}>
+                    <p class="auth-or">or</p>
+                  </Show>
+                  <form action={startSso} method="post" class="auth-fields">
                     <input type="hidden" name="return_to" value={returnTo()} />
                     <button
                       type="submit"
+                      class="auth-btn"
+                      classList={{ "auth-btn--primary": !cfg.password_login_enabled }}
                       data-testid="sso-login"
                       aria-busy={ssoPending.pending ? "true" : undefined}
-                      style={primaryBtn}
                     >
-                      <Icon name="human" />
                       {ssoPending.pending
                         ? "Redirecting to your provider…"
                         : `Continue with ${cfg.providers[0]?.label ?? "single sign-on"}`}
                     </button>
-                    <p style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }} role={ssoPending.pending ? "status" : undefined}>
-                      {ssoPending.pending
-                        ? "Taking you to your identity provider."
-                        : "You'll be redirected to your organization's identity provider, then back to Myelin."}
-                    </p>
                   </form>
                 </Show>
 
-                <Show when={cfg.token_login_enabled}>
-                  <form
-                    action={loginWithToken}
-                    method="post"
-                    data-testid="token-login-form"
-                    style={{ margin: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}
-                  >
-                    <input type="hidden" name="return_to" value={returnTo()} />
-                    <label style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-                      <span style={{ display: "flex", "align-items": "center", gap: "var(--space-1)", "font-size": "var(--fs-body-sm)", "font-weight": "500", color: "var(--text-primary)" }}>
-                        <Icon name="agent" /> Operator token
-                      </span>
-                      <input
-                        id="operator-token"
-                        name="token"
-                        type="password"
-                        required
-                        autocomplete="off"
-                        autocapitalize="off"
-                        autocorrect="off"
-                        spellcheck={false}
-                        data-testid="token-input"
-                        placeholder="Paste your capability token"
-                        aria-describedby={isTokenError() ? "login-error-msg token-help" : "token-help"}
-                        aria-invalid={isTokenError() ? "true" : undefined}
-                        style={{
-                          width: "100%",
-                          padding: "var(--space-2) var(--space-3)",
-                          border: `var(--hairline) solid ${isTokenError() ? "var(--danger)" : "var(--border-strong)"}`,
-                          "border-radius": "var(--radius-1)",
-                          background: "var(--surface)",
-                          color: "var(--text-primary)",
-                          "font-family": "var(--font-mono)",
-                          "font-size": "var(--fs-body-sm)",
-                        }}
-                      />
-                    </label>
-                    <p id="token-help" data-testid="token-help" style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
-                      Paste the token from{" "}
-                      <code style={{ "font-family": "var(--font-mono)" }}>edge bootstrap</code>. It never
-                      leaves your session — it's sent once to verify, then held server-side.
-                    </p>
-                    <button
-                      type="submit"
-                      data-testid="token-login"
-                      aria-busy={tokenPending.pending ? "true" : undefined}
-                      style={cfg.sso_configured ? secondaryBtn : primaryBtn}
-                    >
-                      <Icon name="agent" />
-                      {tokenPending.pending ? "Verifying token…" : "Sign in with operator token"}
-                    </button>
-                  </form>
+                <Show when={!cfg.password_login_enabled && !cfg.sso_configured}>
+                  <p role="status" class="auth-note" data-testid="login-unavailable">
+                    Sign-in isn't available right now. Myelin couldn't reach its sign-in service;
+                    try again in a moment.
+                  </p>
                 </Show>
 
-                <p style={{ margin: "0", display: "flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
-                  <Icon name="database" />
-                  Data region: <strong style={{ color: "var(--text-primary)", "font-weight": "500" }}>EU-West</strong>
-                </p>
+                <Show when={cfg.password_login_enabled}>
+                  <p class="auth-foot" data-testid="invitation-hint">
+                    New here? Accounts are created by invitation. Ask a teammate for a link.
+                  </p>
+                </Show>
 
                 <Show when={cfg.dev_login_enabled}>
-                  <hr style={{ border: "0", "border-block-start": "var(--hairline) solid var(--border)", margin: "0" }} />
-                  <div
-                    data-testid="dev-seam"
-                    style={{
-                      display: "flex",
-                      "flex-direction": "column",
-                      gap: "var(--space-2)",
-                      border: "var(--hairline) dashed var(--border)",
-                      "border-radius": "var(--radius-1)",
-                      padding: "var(--space-3)",
-                    }}
-                  >
-                    <p style={{ margin: "0", display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-subtle)", "font-size": "var(--fs-caption)", "text-transform": "uppercase", "letter-spacing": "0.04em" }}>
-                      <Icon name="gate" /> Development builds only
-                    </p>
-                    <form action={loginDev} method="post" style={{ margin: "0" }}>
+                  <div class="auth-seam" data-testid="dev-seam">
+                    <form action={loginDev} method="post">
                       <input type="hidden" name="return_to" value={returnTo()} />
-                      <button
-                        type="submit"
-                        data-testid="dev-login"
-                        style={{
-                          width: "100%",
-                          padding: "var(--space-2) var(--space-3)",
-                          border: "var(--hairline) solid var(--border-strong)",
-                          "border-radius": "var(--radius-1)",
-                          background: "var(--surface)",
-                          color: "var(--text-primary)",
-                          "font-weight": "500",
-                          cursor: "pointer",
-                        }}
-                      >
+                      <button type="submit" class="auth-btn" data-testid="dev-login">
                         Continue as Dev Operator
                       </button>
                     </form>
-                    <p style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
-                      A local session seam — never issued by a production build.
-                    </p>
+                    <p>Development build only. Production builds never offer this.</p>
                   </div>
                 </Show>
               </>
@@ -289,6 +163,6 @@ export default function Login() {
           </Show>
         </Suspense>
       </section>
-    </main>
+    </AuthShell>
   );
 }

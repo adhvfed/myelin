@@ -9,6 +9,7 @@
 import { createServer } from "node:http";
 import {
   DEV_ACCESS_TOKEN,
+  DEV_PRINCIPAL,
   DEV_REFRESH_TOKEN,
   whoamiJson,
   repoListEnvelope,
@@ -77,11 +78,11 @@ const state = {
   // Whether the login page's dev seam may render (the `dev_login_enabled` server flag). Default on so
   // the harness's dev-login seam is reachable; a test flips it off to assert the seam disappears.
   devLoginEnabled: true,
-  // R4.0 — whether the edge advertises the OPERATOR-TOKEN login (`token_login_enabled`). Default OFF so
-  // the existing first-run spec's login posture is unchanged; the token-login spec flips it on. The
-  // whoami route below already verifies a pasted token (Bearer === DEV_ACCESS_TOKEN), so with this on
-  // the paste→verify→session flow runs end-to-end against this double.
-  tokenLoginEnabled: false,
+  // Accounts and invitation links (see resetAccounts). `loginRateLimited` makes sign-in answer 429.
+  accounts: new Map(),
+  invitations: new Map(),
+  signedInDisplayName: null,
+  loginRateLimited: false,
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
@@ -426,6 +427,91 @@ function releaseHeldIssueListResponses() {
   }
 }
 
+// Fixed accounts and invitation links so browser tests can sign in, join, and reset.
+const E2E_ACCOUNT = { email: "ada@acme.dev", password: "correct horse battery", displayName: "Ada Lovelace" };
+const E2E_JOIN_CODE = "e2e-join-invitation-000000000000";
+const E2E_RESET_CODE = "e2e-reset-invitation-00000000000";
+const MIN_PASSWORD_LENGTH = 10;
+
+function resetAccounts() {
+  state.accounts = new Map([[E2E_ACCOUNT.email, { password: E2E_ACCOUNT.password, displayName: E2E_ACCOUNT.displayName }]]);
+  state.invitations = new Map([
+    [E2E_JOIN_CODE, { kind: "join", email: "grace@acme.dev" }],
+    [E2E_RESET_CODE, { kind: "reset", email: E2E_ACCOUNT.email }],
+  ]);
+  state.signedInDisplayName = null;
+  state.loginRateLimited = false;
+}
+resetAccounts();
+
+function sessionGrant() {
+  return {
+    access_token: DEV_ACCESS_TOKEN,
+    token_type: "Bearer",
+    scheme: "session",
+    expires_at: Math.floor(Date.now() / 1_000) + 60 * 60,
+  };
+}
+
+function readJson(req) {
+  return new Promise((resolve) => {
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      try {
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+function exactKeys(body, keys) {
+  return body !== null && typeof body === "object" && !Array.isArray(body) &&
+    Object.keys(body).length === keys.length && keys.every((key) => typeof body[key] === "string");
+}
+
+/** The public account routes: password sign-in and invitation links. Returns true when handled. */
+async function handleAccountRoute(req, res, method, path) {
+  if (method === "POST" && path === "/v1/auth/password/login") {
+    const body = await readJson(req);
+    if (!exactKeys(body, ["email", "password"])) return send(res, 400, { error: { message: "bad request" } }), true;
+    if (state.loginRateLimited) return send(res, 429, { error: { message: "slow down" } }, { "retry-after": "60" }), true;
+    const account = state.accounts.get(body.email.trim().toLowerCase());
+    if (!account || account.password !== body.password) return send(res, 401, { error: { message: "login failed" } }), true;
+    state.signedInDisplayName = account.displayName;
+    return send(res, 200, sessionGrant()), true;
+  }
+  const match = /^\/v1\/auth\/invitations\/([A-Za-z0-9_-]+)(\/accept)?$/.exec(path);
+  if (!match) return false;
+  const invitation = state.invitations.get(match[1]);
+  if (!invitation) return send(res, 404, { error: { message: "not found" } }), true;
+  if (method === "GET" && !match[2]) {
+    return send(res, 200, {
+      kind: invitation.kind,
+      email: invitation.email,
+      organization: DEV_PRINCIPAL.tenant,
+      expires_at: Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60,
+    }), true;
+  }
+  if (method === "POST" && match[2]) {
+    const body = await readJson(req);
+    const joining = invitation.kind === "join";
+    if (!exactKeys(body, joining ? ["display_name", "password"] : ["password"])) {
+      return send(res, 400, { error: { message: "bad request" } }), true;
+    }
+    if ([...body.password].length < MIN_PASSWORD_LENGTH) return send(res, 422, { error: "weak_password" }), true;
+    if (joining && state.accounts.has(invitation.email)) return send(res, 409, { error: { message: "exists" } }), true;
+    const displayName = joining ? body.display_name : state.accounts.get(invitation.email).displayName;
+    state.accounts.set(invitation.email, { password: body.password, displayName });
+    state.invitations.delete(match[1]);
+    state.signedInDisplayName = displayName;
+    return send(res, 200, sessionGrant()), true;
+  }
+  return false;
+}
+
 function bearer(req) {
   const h = req.headers["authorization"] ?? "";
   const m = /^Bearer (.+)$/.exec(Array.isArray(h) ? h[0] : h);
@@ -447,8 +533,15 @@ const server = createServer((req, res) => {
       sso_configured: false,
       providers: [],
       dev_login_enabled: state.devLoginEnabled,
-      token_login_enabled: state.tokenLoginEnabled,
+      password_login_enabled: true,
     });
+  }
+
+  if (path.startsWith("/v1/auth/password/") || path.startsWith("/v1/auth/invitations/")) {
+    void handleAccountRoute(req, res, method, path).then((handled) => {
+      if (!handled) send(res, 404, { error: { message: "not found" } });
+    });
+    return;
   }
 
   // Test-control seam (dev double ONLY — never a real edge route). Flips the fixture's first-run
@@ -477,7 +570,8 @@ const server = createServer((req, res) => {
           state.repoCreateResponseDelaysMs = [...body.repoCreateResponseDelaysMs];
         }
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
-        if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
+        if (body.resetAccounts === true) resetAccounts();
+        if (typeof body.loginRateLimited === "boolean") state.loginRateLimited = body.loginRateLimited;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
         if (typeof body.whoamiUnavailable === "boolean") {
           state.whoamiUnavailable = body.whoamiUnavailable;
@@ -1517,6 +1611,26 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // A signed-in member creates an invitation link for a teammate.
+  if (method === "POST" && path === "/v1/invitations") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    void readJson(req).then((body) => {
+      if (!exactKeys(body, ["email"]) || !/^[^@\s]+@[^@\s]+$/.test(body.email)) {
+        return send(res, 400, { error: { message: "bad request" } });
+      }
+      const email = body.email.trim().toLowerCase();
+      if (state.accounts.has(email)) return send(res, 409, { error: { message: "exists" } });
+      const code = `e2e-member-invitation-${String(state.invitations.size).padStart(10, "0")}`;
+      state.invitations.set(code, { kind: "join", email });
+      send(res, 201, {
+        url: `http://localhost:${process.env.PORT ?? 3000}/join/${code}`,
+        email,
+        expires_at: Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60,
+      });
+    });
+    return;
+  }
+
   if (method === "GET" && path === "/v1/whoami") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     if (state.whoamiUnavailable) {
@@ -1524,7 +1638,11 @@ const server = createServer((req, res) => {
         error: { message: "viewer verification is temporarily unavailable", code: "unavailable" },
       });
     }
-    return send(res, 200, whoamiJson());
+    return send(res, 200, {
+      ...whoamiJson(),
+      display_name: state.signedInDisplayName ?? DEV_PRINCIPAL.displayName,
+      email: "",
+    });
   }
 
   if (method === "GET" && path === "/v1/notif/inbox") {
