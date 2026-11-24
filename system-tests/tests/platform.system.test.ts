@@ -30,8 +30,8 @@ describe("running edge platform", () => {
       sso_configured: false,
       providers: [],
       dev_login_enabled: true,
-      token_login_enabled: true,
       cli_login_enabled: true,
+      password_login_enabled: true,
     });
     expect(response.headers.get("cache-control")).toContain("no-store");
   });
@@ -86,7 +86,7 @@ describe("running edge platform", () => {
     expect(response.body).toEqual({
       error: {
         code: "not_found",
-        message: "no route for GET /v1/system-test-route-that-does-not-exist",
+        message: "no such route",
       },
     });
     expect(JSON.stringify(response.body).length).toBeLessThan(1024);

@@ -60,11 +60,21 @@ struct EncryptedProfile {
 pub enum PrincipalError {
     InvalidProvisioning,
     InvalidDirectoryPage,
-    CrossTenant { detail: String },
+    CrossTenant {
+        detail: String,
+    },
     Kms(String),
     CorruptProfile,
-    CorruptPrincipal { field: &'static str },
-    UnknownPrincipal { principal_id: String },
+    CorruptPrincipal {
+        field: &'static str,
+    },
+    UnknownPrincipal {
+        principal_id: String,
+    },
+    /// A key discard was asked for a person whose row exists; destroying it would erase them.
+    StoredPrincipal {
+        principal_id: String,
+    },
     Storage(String),
 }
 
@@ -101,6 +111,11 @@ impl core::fmt::Display for PrincipalError {
                 f,
                 "credential link rejected: principal `{principal_id}` does not exist in the verified \
                  (tenant, region) partition (a dangling SSO/SCIM link is refused)"
+            ),
+            PrincipalError::StoredPrincipal { principal_id } => write!(
+                f,
+                "subject key discard refused: principal `{principal_id}` is stored in this tenant, \
+                 and destroying its key would erase its profile"
             ),
             PrincipalError::Storage(why) => write!(
                 f,
@@ -364,6 +379,51 @@ impl PrincipalStore {
                 Ok(row)
             }
         }
+    }
+
+    /// The durable row for a new, active human whose profile is sealed under their own subject
+    /// key. It is for callers that must insert the person in the same transaction as something
+    /// else (a sign-in credential); `put_principal` remains the ordinary write path.
+    pub fn sealed_new_human(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+        profile: &PrincipalProfile,
+    ) -> Result<myelin_storage::DurablePrincipalRow, PrincipalError> {
+        let (key_ref, sealed) = self.seal_profile(scope, principal_id, profile)?;
+        Ok(myelin_storage::DurablePrincipalRow {
+            principal_id: principal_id.0.clone(),
+            kind: serde_json::to_string(&PrincipalKind::Human).expect("principal.kind serializes"),
+            data_role: serde_json::to_string(&myelin_identity::DataRole::Controller)
+                .expect("principal.data_role serializes"),
+            status: serde_json::to_string(&PrincipalStatus::Active)
+                .expect("principal.status serializes"),
+            profile: Some(myelin_storage::DurableProfileBlob {
+                key_ref: key_ref.to_uri(),
+                nonce: sealed.nonce.to_vec(),
+                ciphertext: sealed.ciphertext,
+            }),
+        })
+    }
+
+    /// Destroys the subject key `sealed_new_human` made for a person whose row was never
+    /// stored. It refuses (destroying nothing) when a row with this id exists in the tenant,
+    /// because destroying a stored person's key erases their profile for good.
+    pub fn discard_unstored_subject_key(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+    ) -> Result<bool, PrincipalError> {
+        if self.get_principal(scope, principal_id)?.is_some() {
+            return Err(PrincipalError::StoredPrincipal {
+                principal_id: principal_id.0.clone(),
+            });
+        }
+        let dek = myelin_storage::DekId::new(
+            scope.tenant().clone(),
+            Self::subject_dek_class(principal_id),
+        );
+        Ok(self.kms.destroy_dek(&dek)?)
     }
 
     fn seal_profile(
@@ -758,6 +818,49 @@ mod tests {
             email,
             display_name,
         }
+    }
+
+    #[test]
+    fn discarding_a_key_refuses_a_stored_person_and_destroys_an_unstored_one() {
+        let store = PrincipalStore::new(kms());
+        let s = scope("acme");
+        let stored = PrincipalId("person-stored".into());
+        store
+            .put_principal(
+                &s,
+                stored.clone(),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                Some(&profile("ada@acme.test", "Ada")),
+            )
+            .expect("write");
+        assert_eq!(
+            store.discard_unstored_subject_key(&s, &stored),
+            Err(PrincipalError::StoredPrincipal {
+                principal_id: stored.0.clone()
+            }),
+            "a person with a row keeps their key"
+        );
+        assert_eq!(
+            store
+                .get_profile(&s, &stored)
+                .expect("read")
+                .map(|p| p.display_name),
+            Some("Ada".to_string()),
+            "the profile still decrypts after the refused discard"
+        );
+
+        let unstored = PrincipalId("person-unstored".into());
+        store
+            .sealed_new_human(&s, &unstored, &profile("grace@acme.test", "Grace"))
+            .expect("a sealed row that is never stored");
+        assert_eq!(store.discard_unstored_subject_key(&s, &unstored), Ok(true));
+        assert_eq!(
+            store.discard_unstored_subject_key(&s, &unstored),
+            Ok(false),
+            "the key is already gone"
+        );
     }
 
     #[test]

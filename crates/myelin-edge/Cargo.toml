@@ -46,6 +46,9 @@ rand = "0.8"
 
 blake3.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+argon2.workspace = true
+aes-gcm = "0.10"
 
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 

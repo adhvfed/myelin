@@ -809,6 +809,8 @@ fn requires_large_response_budget(method: &str, path: &str) -> bool {
 fn request_body_cap(path: &str) -> usize {
     if path.ends_with("/git-receive-pack") {
         MAX_REQUEST_BODY_BYTES
+    } else if crate::accounts::http::is_account_path(path) {
+        crate::accounts::http::MAX_ACCOUNT_REQUEST_BYTES
     } else {
         MAX_JSON_REQUEST_BODY_BYTES
     }
@@ -1459,7 +1461,23 @@ mod tests {
             MAX_REQUEST_BODY_BYTES
         );
         for path in [
+            "/v1/auth/password/login",
+            "/v1/auth/invitations/abc",
+            "/v1/auth/invitations/abc/accept",
+            "/v1/invitations",
+            // The router ignores extra slashes, so the cap must too.
+            "/v1/invitations/",
+            "//v1/invitations",
+            "/v1/invitations//",
+            "/v1//invitations",
+            "//v1/auth//password/login/",
+            "/v1/auth/invitations//abc/accept",
+        ] {
+            assert_eq!(request_body_cap(path), 16 * 1024, "{path}");
+        }
+        for path in [
             "/v1/issues",
+            "/v1/invitations/other",
             "/v1/git/repos/widgets",
             "/acme/eu-west/widgets.git/git-upload-pack",
             "/livez",

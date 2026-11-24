@@ -210,7 +210,7 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
             Method::Get,
             "/v1/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler),
+            Arc::new(WhoamiHandler::default()),
         );
     let builder = register_git_durable(builder, backend);
     let gateway = Arc::new(builder.build());

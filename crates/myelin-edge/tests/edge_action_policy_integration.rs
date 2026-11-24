@@ -10,8 +10,8 @@ use myelin_edge::{
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
-    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, CredentialPurpose,
+    HumanSsoAuthenticator, PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
@@ -93,20 +93,20 @@ fn build(root: &std::path::Path) -> (Arc<Gateway>, CellTokenAuthority) {
         Method::Get,
         "/v1/whoami",
         "edge.whoami",
-        Arc::new(WhoamiHandler),
+        Arc::new(WhoamiHandler::default()),
     )
     .route(
         Method::Get,
         "/v1/t/{tenant}/whoami",
         "edge.whoami",
-        Arc::new(WhoamiHandler),
+        Arc::new(WhoamiHandler::default()),
     )
     .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge")
     .route(
         Method::Get,
         "/v1/unmounted-probe",
         "edge.test.unmounted_probe",
-        Arc::new(WhoamiHandler),
+        Arc::new(WhoamiHandler::default()),
     );
     builder = register_git_durable(builder, backend.clone());
     builder = register_git_wire(builder, backend);
@@ -324,4 +324,77 @@ async fn a_mounted_action_without_a_token_is_still_401() {
         st, 401,
         "no token → uniform 401 (never a policy allow): {v}"
     );
+}
+
+fn mint_as(cell: &CellTokenAuthority, jti: &str, purpose: CredentialPurpose) -> String {
+    cell.mint(&CapabilityMintSpec {
+        tenant: "acme".into(),
+        region: REGION.into(),
+        subject_key: "subj-1".into(),
+        jti: jti.into(),
+        exp_unix: now() + 3600,
+        authority: vec!["edge.operator".into()],
+        dpop_jkt: None,
+        purpose,
+        audience: myelin_identity_service::CredentialAudience::Edge,
+    })
+}
+
+/// Only a person's browser session may invite a teammate; the handler behind this route would
+/// answer 200 if anything else were let through.
+#[tokio::test]
+async fn only_a_human_session_reaches_the_invitation_endpoint() {
+    let root = temp_root("invite");
+    let (_, cell) = build(&root);
+    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+    seed_principal(&store, "acme", "svc:agent", "subj-1");
+    let gateway = Gateway::builder(
+        Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        )),
+        Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+            Arc::new(KmsEngine::new()),
+        ))),
+        Arc::new(AuthenticatedActionPolicy::mounted()),
+    )
+    .route(
+        Method::Post,
+        "/v1/invitations",
+        "edge.invitations.create",
+        Arc::new(WhoamiHandler::default()),
+    )
+    .build();
+    let addr = spawn(Arc::new(gateway)).await;
+    for (label, purpose) in [
+        ("operator bootstrap", CredentialPurpose::OperatorBootstrap),
+        ("personal access token", CredentialPurpose::Pat),
+        (
+            "agent run",
+            CredentialPurpose::AgentRun {
+                run_id: "run-1".into(),
+                delegation_snapshot: None,
+            },
+        ),
+    ] {
+        let h = bearer(&mint_as(&cell, &format!("jti-invite-{label}"), purpose));
+        let (status, body) = http(
+            addr,
+            "POST",
+            "/v1/invitations",
+            &hdr(&h),
+            br#"{"email":"grace@example.com"}"#.to_vec(),
+        )
+        .await;
+        // The operator token authenticates and is refused by the purpose gate; the others are
+        // refused earlier here because this harness has no PAT or agent-run records. The gate
+        // itself is covered for every purpose in `authz` unit tests.
+        let expected = if label == "operator bootstrap" {
+            403
+        } else {
+            401
+        };
+        assert_eq!(status, expected, "a {label} token: {body}");
+    }
 }

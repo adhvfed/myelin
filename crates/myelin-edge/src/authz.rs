@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "edge.whoami",
     "edge.auth.device.approve",
+    "edge.invitations.create",
     "edge.events.subscribe",
     "agent.tools.list",
     "agent.tool.view",
@@ -184,6 +185,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         "edge.auth.device.approve",
         "edge.auth.delegate",
         HUMAN_OR_OPERATOR
+    ),
+    requirement!(
+        "edge.invitations.create",
+        "edge.members.invite",
+        HUMAN_SESSION
     ),
     requirement!("edge.events.subscribe", "edge.events.subscribe", OP_PAT),
     requirement!("agent.tools.list", "agent.tools.read", OP_PAT),
@@ -512,6 +518,45 @@ mod tests {
                 expires_at_unix: i64::MAX,
                 dpop: DpopState::Unbound,
             }),
+        }
+    }
+
+    #[test]
+    fn only_a_human_session_may_invite_a_teammate() {
+        let policy = AuthenticatedActionPolicy::mounted();
+        let every_grant = ["edge.members.invite", "edge.operator"];
+        assert!(authorize_edge_action(
+            &policy,
+            &identity(
+                CredentialPurpose::HumanSession,
+                CredentialAudience::Edge,
+                &every_grant
+            ),
+            "edge.invitations.create"
+        ));
+        for (purpose, audience) in [
+            (
+                CredentialPurpose::OperatorBootstrap,
+                CredentialAudience::Edge,
+            ),
+            (CredentialPurpose::Pat, CredentialAudience::Edge),
+            (
+                CredentialPurpose::AgentRun {
+                    run_id: "run-1".into(),
+                    delegation_snapshot: None,
+                },
+                CredentialAudience::Mcp,
+            ),
+            (CredentialPurpose::DeployKey, CredentialAudience::Edge),
+        ] {
+            assert!(
+                !authorize_edge_action(
+                    &policy,
+                    &identity(purpose.clone(), audience, &every_grant),
+                    "edge.invitations.create"
+                ),
+                "{purpose:?} must not invite"
+            );
         }
     }
 

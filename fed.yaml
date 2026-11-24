@@ -147,7 +147,6 @@ services:
       MYELIN_WORKSPACE_SSH_HOST: "127.0.0.1"
       MYELIN_WORKSPACE_SSH_PORT: "{{WORKSPACE_SSH_PORT}}"
       MYELIN_DEV_LOGIN: "1"
-      MYELIN_TOKEN_LOGIN: "1"
       MYELIN_ISSUES_RECONCILE_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
       MYELIN_AGENT_THREAD_RECOVERY_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
       MYELIN_GIT_MERGE_QUEUE_INTERVAL_MS: "1000"
@@ -504,6 +503,7 @@ scripts:
       NATS_URL: "nats://localhost:{{NATS_PORT}}"
       MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
       MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_WEB_PUBLIC_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_SYSTEM_TEST_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_SYSTEM_TEST_TENANT: "integration-{{FED_PROJECT_ID}}"
       MYELIN_SYSTEM_TEST_REGION: fr-par
@@ -564,6 +564,7 @@ scripts:
       MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
       MYELIN_INTEGRATION_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_INTEGRATION_WEB_URL: "http://127.0.0.1:{{WEB_PORT}}"
+      MYELIN_WEB_PUBLIC_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_BROWSER_TENANT: "development-{{FED_PROJECT_ID}}"
       MYELIN_BROWSER_PRINCIPAL: developer
       MYELIN_BROWSER_REVIEWER_PRINCIPAL: reviewer
@@ -584,6 +585,11 @@ scripts:
       --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 --issues-prefix MYL --ttl-days 1)";
       test -n "$browser_reviewer_token";
       export MYELIN_BROWSER_REVIEWER_EDGE_TOKEN="$browser_reviewer_token";
+      invite_email="account-$(date +%s)-$$@myelin.test";
+      invite_url="$(cargo run --quiet -p myelin-edge --bin edge -- invite
+      --tenant "$MYELIN_BROWSER_TENANT" --email "$invite_email")";
+      test -n "$invite_url";
+      export MYELIN_BROWSER_INVITE_EMAIL="$invite_email" MYELIN_BROWSER_INVITE_URL="$invite_url";
       pnpm --dir frontend --filter @myelin/web exec playwright test
       --config playwright.integration.config.ts "$@"' -- "$@"
 

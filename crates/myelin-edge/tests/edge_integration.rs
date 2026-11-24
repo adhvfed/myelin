@@ -162,13 +162,13 @@ fn build_gateway() -> (Arc<Gateway>, CellTokenAuthority, RevocationStore) {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .route(
                 Method::Get,
                 "/v1/t/{tenant}/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .route(
                 Method::Get,
@@ -269,13 +269,13 @@ fn build_cross_tenant_storm_gateway() -> (Arc<Gateway>, CellTokenAuthority) {
                 Method::Post,
                 "/v1/body-storm",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .route(
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build(),
     );

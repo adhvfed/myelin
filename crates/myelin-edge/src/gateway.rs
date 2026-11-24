@@ -1,3 +1,4 @@
+use crate::accounts::AccountService;
 use crate::auth_request::{
     parse_auth_request, require_auth_request_budget, DeviceApprovalRequest, DeviceClaimRequest,
     DeviceStartRequest, LoginRequest,
@@ -17,8 +18,8 @@ use myelin_events::{IdMinter, UlidMinter};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
 use myelin_identity_service::{
     machine_scheme, CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority,
-    CredentialAudience, CredentialPurpose, DpopBinding, HumanSsoAuthenticator, RequestIdentity,
-    VerifiedAssertion,
+    CredentialAudience, CredentialPurpose, DpopBinding, HumanSsoAuthenticator, PrincipalStore,
+    RequestIdentity, VerifiedAssertion,
 };
 use myelin_storage::TenantScope;
 use myelin_substrate::shed::{RunClass, Surface};
@@ -50,9 +51,18 @@ impl HumanSessionIssuer {
         principal: &Principal,
         assertion: &VerifiedAssertion,
     ) -> Result<(String, i64), EdgeError> {
+        self.mint_until(principal, assertion.expires_at_unix)
+    }
+
+    /// A browser session for `principal`, ending at the source credential's expiry or after the
+    /// standard session lifetime, whichever is sooner.
+    fn mint_until(
+        &self,
+        principal: &Principal,
+        source_expires_at_unix: Option<i64>,
+    ) -> Result<(String, i64), EdgeError> {
         let now = self.now_unix()?;
-        let expiry = assertion
-            .expires_at_unix
+        let expiry = source_expires_at_unix
             .unwrap_or_else(|| now.saturating_add(HUMAN_SESSION_TTL_SECS))
             .min(now.saturating_add(HUMAN_SESSION_TTL_SECS));
         if expiry <= now {
@@ -136,7 +146,6 @@ pub struct AuthPublicConfig {
     pub sso_configured: bool,
     pub providers: Vec<AuthProvider>,
     pub dev_login_enabled: bool,
-    pub token_login_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -264,6 +273,7 @@ pub struct GatewayBuilder {
     public_base_url: Option<String>,
     human_session_issuer: Option<HumanSessionIssuer>,
     device_authorization: Option<DeviceAuthorizationBroker>,
+    accounts: Option<AccountService>,
     shed: EdgeShed,
 }
 
@@ -396,6 +406,11 @@ impl GatewayBuilder {
         self
     }
 
+    pub fn with_accounts(mut self, accounts: AccountService) -> GatewayBuilder {
+        self.accounts = Some(accounts);
+        self
+    }
+
     pub fn with_public_base_url(
         mut self,
         public_base_url: impl Into<String>,
@@ -418,6 +433,7 @@ impl GatewayBuilder {
             public_base_url: self.public_base_url,
             human_session_issuer: self.human_session_issuer,
             device_authorization: self.device_authorization,
+            accounts: self.accounts,
             shed: self.shed,
         }
     }
@@ -470,7 +486,7 @@ fn device_approval_response(outcome: ApprovalOutcome) -> Result<EdgeResponse, Ed
     }
 }
 
-fn no_store(response: EdgeResponse) -> EdgeResponse {
+pub(crate) fn no_store(response: EdgeResponse) -> EdgeResponse {
     response
         .with_header("cache-control", "no-store")
         .with_header("pragma", "no-cache")
@@ -488,12 +504,16 @@ pub struct Gateway {
     public_base_url: Option<String>,
     human_session_issuer: Option<HumanSessionIssuer>,
     device_authorization: Option<DeviceAuthorizationBroker>,
+    accounts: Option<AccountService>,
     shed: EdgeShed,
 }
 
 enum PublicEndpoint {
     AuthConfig,
     Login,
+    PasswordLogin,
+    Invitation(String),
+    AcceptInvitation(String),
     BeginDeviceAuthorization,
     ApproveDeviceAuthorization,
     ClaimDeviceAuthorization,
@@ -578,6 +598,7 @@ impl Gateway {
             public_base_url: None,
             human_session_issuer: None,
             device_authorization: None,
+            accounts: None,
             shed: EdgeShed::v1_floor(),
         }
     }
@@ -655,6 +676,9 @@ impl Gateway {
             (Method::Post, "/v1/auth/login") => {
                 return Ok(PreparedKind::Public(PublicEndpoint::Login))
             }
+            (Method::Post, "/v1/auth/password/login") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::PasswordLogin))
+            }
             (Method::Post, "/v1/auth/device/authorization") => {
                 return Ok(PreparedKind::Public(
                     PublicEndpoint::BeginDeviceAuthorization,
@@ -672,10 +696,11 @@ impl Gateway {
             }
             _ => {}
         }
+        if let Some(endpoint) = invitation_endpoint(method, &req.path) {
+            return Ok(PreparedKind::Public(endpoint));
+        }
 
-        let (idx, params) = self.match_route(method, &req.path)?.ok_or_else(|| {
-            EdgeError::NotFound(format!("no route for {} {}", method.as_str(), req.path))
-        })?;
+        let (idx, params) = self.match_route(method, &req.path)?.ok_or_else(no_route)?;
         let route = &self.routes[idx];
 
         let path_tenant = params.get("tenant").map(|t| TenantId(t.clone()));
@@ -751,6 +776,21 @@ impl Gateway {
             return match endpoint {
                 PublicEndpoint::AuthConfig => Ok(self.auth_config_response()),
                 PublicEndpoint::Login => self.login(req),
+                PublicEndpoint::PasswordLogin => Ok(crate::accounts::http::login(
+                    self.accounts.as_ref(),
+                    req,
+                    &|principal| self.mint_password_session(principal),
+                )),
+                PublicEndpoint::Invitation(code) => Ok(crate::accounts::http::invitation(
+                    self.accounts.as_ref(),
+                    code,
+                )),
+                PublicEndpoint::AcceptInvitation(code) => Ok(crate::accounts::http::accept(
+                    self.accounts.as_ref(),
+                    req,
+                    code,
+                    &|principal| self.mint_password_session(principal),
+                )),
                 PublicEndpoint::BeginDeviceAuthorization => self.begin_device_authorization(req),
                 PublicEndpoint::ApproveDeviceAuthorization => {
                     self.approve_device_authorization(req)
@@ -917,10 +957,17 @@ impl Gateway {
                 "sso_configured": self.auth_config.sso_configured,
                 "providers": providers,
                 "dev_login_enabled": self.auth_config.dev_login_enabled,
-                "token_login_enabled": self.auth_config.token_login_enabled,
                 "cli_login_enabled": self.device_authorization.is_some(),
+                "password_login_enabled": self.accounts.is_some(),
             }),
         )
+    }
+
+    fn mint_password_session(&self, principal: &Principal) -> Result<(String, i64), EdgeError> {
+        self.human_session_issuer
+            .as_ref()
+            .ok_or_else(|| EdgeError::Unavailable("human session issuer is unavailable".into()))?
+            .mint_until(principal, None)
     }
 
     fn begin_device_authorization(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
@@ -1135,11 +1182,7 @@ impl Gateway {
     }
 
     fn match_route(&self, method: Method, path: &str) -> Result<Option<RouteMatch>, EdgeError> {
-        let parts: Vec<&str> = path
-            .trim_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
+        let parts: Vec<&str> = route_segments(path).collect();
         'routes: for (i, r) in self.routes.iter().enumerate() {
             if r.method != method {
                 continue;
@@ -1185,6 +1228,35 @@ impl Gateway {
     }
 }
 
+/// The path pieces the router matches on: slashes at either end and empty pieces are ignored, so
+/// `//v1/invitations/` and `/v1/invitations` are the same route. Anything that decides by path
+/// before routing (like body limits) must use this too, or it can disagree with the router.
+pub(crate) fn route_segments(path: &str) -> impl Iterator<Item = &str> {
+    path.trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+}
+
+/// `GET /v1/auth/invitations/{code}` and `POST /v1/auth/invitations/{code}/accept`. The code is
+/// passed on raw; anything that is not a canonical code is answered as an unknown invitation.
+fn invitation_endpoint(method: Method, path: &str) -> Option<PublicEndpoint> {
+    let rest = path.strip_prefix("/v1/auth/invitations/")?;
+    match (method, rest.split_once('/')) {
+        (Method::Get, None) if !rest.is_empty() => Some(PublicEndpoint::Invitation(rest.into())),
+        (Method::Post, Some((code, "accept"))) if !code.is_empty() => {
+            Some(PublicEndpoint::AcceptInvitation(code.into()))
+        }
+        _ => None,
+    }
+}
+
+/// A 404 never repeats the path: paths such as `/v1/auth/invitations/{code}` carry a secret, and
+/// no check on the spelling (extra slashes, case, percent-encoding) can tell every such path
+/// from an ordinary one.
+fn no_route() -> EdgeError {
+    EdgeError::NotFound("no such route".into())
+}
+
 fn decode_route_component(raw: &str) -> Result<String, EdgeError> {
     let bytes = raw.as_bytes();
     let mut index = 0;
@@ -1223,10 +1295,35 @@ fn kind_label(kind: &PrincipalKind) -> &'static str {
     }
 }
 
-pub struct WhoamiHandler;
+/// `/v1/whoami`. With a profile directory it also tells the caller their name and email.
+#[derive(Default)]
+pub struct WhoamiHandler {
+    profiles: Option<PrincipalStore>,
+}
+
+impl WhoamiHandler {
+    pub fn with_profiles(profiles: PrincipalStore) -> Self {
+        Self {
+            profiles: Some(profiles),
+        }
+    }
+}
 
 impl Handler for WhoamiHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        // A missing or unreadable (for example crypto-shredded) profile still identifies the
+        // caller; it just has no name to show.
+        let profile = self.profiles.as_ref().and_then(|profiles| {
+            profiles
+                .get_profile(ctx.scope, &ctx.principal.principal_id)
+                .ok()
+                .flatten()
+        });
+        let display_name = profile
+            .as_ref()
+            .map(|profile| profile.display_name.trim())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&ctx.principal.principal_id.0);
         Ok(EdgeResponse::json(
             200,
             &json!({
@@ -1235,6 +1332,8 @@ impl Handler for WhoamiHandler {
                 "region": ctx.scope.region().0,
                 "kind": kind_label(&ctx.principal.kind),
                 "expires_at": ctx.identity.capability().expires_at_unix,
+                "display_name": display_name,
+                "email": profile.as_ref().map_or("", |profile| profile.email.as_str()),
             }),
         ))
     }
@@ -1317,7 +1416,7 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build()
     }
@@ -1401,7 +1500,7 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
         let request = |material: &str| {
@@ -1462,7 +1561,7 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
 
@@ -1544,7 +1643,7 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .with_shed(shed)
             .build()
@@ -1713,7 +1812,7 @@ mod tests {
                 Method::Get,
                 "/v1/git/repos/{repo}/tree/{ref}/{...path}",
                 "git.tree.read",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
 
@@ -1739,7 +1838,7 @@ mod tests {
                 Method::Get,
                 "/v1/git/repos/{repo}",
                 "git.repo.read",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
 
@@ -1810,13 +1909,13 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .route(
                 Method::Get,
                 "/{tenant}/{region}/{repo}/info/refs",
                 "git.wire.upload_pack",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build()
     }
@@ -1905,7 +2004,6 @@ mod tests {
                     label: "Single sign-on".into(),
                 }],
                 dev_login_enabled: false,
-                token_login_enabled: true,
             })
             .build();
         let resp = gw.handle(EdgeRequest::new(
@@ -1923,7 +2021,14 @@ mod tests {
         let b = resp.json_body().unwrap();
         assert_eq!(b["sso_configured"], true);
         assert_eq!(b["dev_login_enabled"], false);
-        assert_eq!(b["token_login_enabled"], true);
+        assert!(
+            b.get("token_login_enabled").is_none(),
+            "operator-token paste login is not a web sign-in path"
+        );
+        assert_eq!(
+            b["password_login_enabled"], false,
+            "password sign-in is advertised only when accounts are composed"
+        );
         assert_eq!(b["providers"][0]["id"], "oidc");
         assert_eq!(b["providers"][0]["label"], "Single sign-on");
         assert_eq!(b["cli_login_enabled"], false);
@@ -2050,7 +2155,7 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
 
@@ -2152,6 +2257,75 @@ mod tests {
     }
 
     #[test]
+    fn invitation_links_are_public_routes_with_one_exact_shape() {
+        let code = "a".repeat(43);
+        let path = format!("/v1/auth/invitations/{code}");
+        assert!(matches!(
+            invitation_endpoint(Method::Get, &path),
+            Some(PublicEndpoint::Invitation(found)) if found == code
+        ));
+        assert!(matches!(
+            invitation_endpoint(Method::Post, &format!("{path}/accept")),
+            Some(PublicEndpoint::AcceptInvitation(found)) if found == code
+        ));
+        for (method, path) in [
+            (Method::Post, path.clone()),
+            (Method::Get, format!("{path}/accept")),
+            (Method::Post, format!("{path}/accept/again")),
+            (Method::Post, format!("{path}/decline")),
+            (Method::Get, "/v1/auth/invitations/".to_string()),
+            (Method::Post, "/v1/auth/invitations//accept".to_string()),
+        ] {
+            assert!(invitation_endpoint(method, &path).is_none(), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_missed_route_never_echoes_the_path_or_an_invitation_code() {
+        let code = "Zm9vYmFyYmF6cXV4cXV1eHF1dXhxdXV4cXV1eHF1dXg";
+        for (method, path) in [
+            ("POST", format!("/v1/auth/invitations/{code}")),
+            ("DELETE", format!("/v1/auth/invitations/{code}")),
+            ("GET", format!("/v1/auth/invitations/{code}/accept")),
+            // However the path is spelled, a miss never repeats it.
+            ("GET", format!("//v1/auth/invitations/{code}")),
+            ("GET", format!("/v1//auth/invitations/{code}")),
+            ("GET", format!("/V1/auth/invitations/{code}")),
+            ("GET", format!("/v1/auth/%69nvitations/{code}")),
+            ("GET", format!("/v1/auth/invitations/{code}/")),
+            ("POST", format!("//v1/auth/invitations/{code}/accept")),
+            ("GET", format!("/v1/anything/else/{code}")),
+        ] {
+            let response = gw().handle(EdgeRequest::new(method, &path, "", vec![], vec![]));
+            assert_eq!(response.status(), 404, "{method} {path}");
+            let EdgeResponse::Bytes { body, .. } = &response else {
+                panic!("a 404 is a byte body");
+            };
+            assert!(
+                !String::from_utf8_lossy(body).contains(code),
+                "{method} {path} echoed the code"
+            );
+        }
+    }
+
+    #[test]
+    fn password_sign_in_without_composed_accounts_is_unavailable_and_uncached() {
+        let response = gw().handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/password/login",
+            "",
+            vec![],
+            br#"{"email":"ada@example.com","password":"correct horse"}"#.to_vec(),
+        ));
+        assert_eq!(response.status(), 503);
+        assert!(matches!(
+            &response,
+            EdgeResponse::Bytes { headers, .. }
+                if headers.iter().any(|(name, value)| name == "cache-control" && value == "no-store")
+        ));
+    }
+
+    #[test]
     fn auth_config_dev_login_flag_reflects_the_composed_value() {
         for enabled in [true, false] {
             let gw = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
@@ -2159,7 +2333,6 @@ mod tests {
                     sso_configured: false,
                     providers: vec![],
                     dev_login_enabled: enabled,
-                    token_login_enabled: false,
                 })
                 .build();
             let resp = gw.handle(EdgeRequest::new(
@@ -2386,7 +2559,7 @@ mod tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
         let login = gateway.handle(EdgeRequest::new(
@@ -2633,13 +2806,13 @@ mod git_wire_basic_auth_tests {
                 Method::Get,
                 "/v1/whoami",
                 "edge.whoami",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .route(
                 Method::Get,
                 "/{tenant}/{region}/{repo}/info/refs",
                 "git.wire.upload_pack",
-                Arc::new(WhoamiHandler),
+                Arc::new(WhoamiHandler::default()),
             )
             .build();
         (gw, token)

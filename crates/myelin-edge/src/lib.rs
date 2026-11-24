@@ -1,3 +1,4 @@
+pub mod accounts;
 mod agent_delegation;
 pub mod agent_http;
 pub mod agent_mcp_http;
@@ -50,11 +51,14 @@ pub mod sse;
 pub mod tool_http;
 pub mod trigger_http;
 mod trigger_lifecycle;
+mod web_origin;
 mod workspace_access;
 mod workspace_augmentation;
 mod workspace_effect;
 mod workspace_ssh_http;
 
+pub use accounts::http::InviteHandler;
+pub use accounts::{account_migrations, AccountError, AccountService, EmailDigester};
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{
     register_agent_mcp, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,
@@ -148,5 +152,6 @@ pub use server::{
 pub use sse::{SseEvent, SseHub, SseSubscription};
 pub use tool_http::register_tools;
 pub use trigger_http::register_triggers;
+pub use web_origin::validated_web_origin;
 pub use workspace_access::DurableAgentWorkspaceAccess;
 pub use workspace_ssh_http::WorkspaceSshEndpoint;

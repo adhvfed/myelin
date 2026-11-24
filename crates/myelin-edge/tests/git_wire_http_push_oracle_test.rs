@@ -156,7 +156,7 @@ fn build_with_authz(
             Method::Get,
             "/v1/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler),
+            Arc::new(WhoamiHandler::default()),
         );
     let builder = register_git_wire(builder, backend.clone());
     (Arc::new(builder.build()), cell, backend)
@@ -421,7 +421,7 @@ fn build_r21a(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
             Method::Get,
             "/v1/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler),
+            Arc::new(WhoamiHandler::default()),
         );
     let builder = register_git_durable(builder, backend.clone());
     let builder = register_wire_r21a(builder, backend);

@@ -202,7 +202,7 @@ export MYELIN_SELF_HOST_ISSUES_PROJECT="\${MYELIN_SELF_HOST_ISSUES_PROJECT:-${SE
 export MYELIN_SELF_HOST_ISSUES_TYPE="\${MYELIN_SELF_HOST_ISSUES_TYPE:-${SELF_HOST_ISSUES_TYPE}}"        # explicit v1 type UUID (no type catalogue/FK yet)
 export MYELIN_SELF_HOST_ISSUES_PREFIX="\${MYELIN_SELF_HOST_ISSUES_PREFIX:-${SELF_HOST_ISSUES_PREFIX}}"                                     # canonical founder issue-key prefix
 export MYELIN_EDGE_ADDR="\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}"
-export MYELIN_TOKEN_LOGIN="\${MYELIN_TOKEN_LOGIN:-1}"  # surface the operator-token web login in /v1/auth/config
+export MYELIN_WEB_PUBLIC_URL="\${MYELIN_WEB_PUBLIC_URL:-http://127.0.0.1:3000}"  # web app origin; invitation and CLI-approval links point here
 export MYELIN_GVISOR_ROOTFS="\${MYELIN_GVISOR_ROOTFS:-${rootfs}}"  # immutable hosted-CI base rootfs
 export MYELIN_GVISOR_RUST_ROOTFS="\${MYELIN_GVISOR_RUST_ROOTFS:-${rust_rootfs}}"  # immutable Rust build rootfs
 export MYELIN_GVISOR_GIT_ROOTFS="\${MYELIN_GVISOR_GIT_ROOTFS:-${git_rootfs}}"  # the sandboxed git-wire rootfs (stage-git-rootfs.sh)
@@ -575,9 +575,10 @@ export MYELIN_SELF_HOST_ISSUES_PROJECT="${MYELIN_SELF_HOST_ISSUES_PROJECT}"
 export MYELIN_SELF_HOST_ISSUES_TYPE="${MYELIN_SELF_HOST_ISSUES_TYPE}"
 export MYELIN_SELF_HOST_ISSUES_PREFIX="${MYELIN_SELF_HOST_ISSUES_PREFIX}"
 cd frontend/apps/web && pnpm install && pnpm dev
-# The operator-token login surface is gated by MYELIN_TOKEN_LOGIN=1 on the edge (see \`self-host.sh env\`);
-# the web login form that consumes it landed in R4.0 (paste the \`edge bootstrap\` token on /login). The
-# CLI (\`myelin login --token <token> --scheme agent\`) and a git remote (see docs/self-host.md) also work.
+# People sign in on /login with email and password. The first person in an organization joins
+# through a link from \`edge invite --tenant <tenant> --email <email>\` (needs MYELIN_WEB_PUBLIC_URL);
+# members then invite teammates from the web. The CLI (\`myelin login --token <token> --scheme agent\`)
+# with an \`edge bootstrap\` token and a git remote (see docs/self-host.md) also work.
 # (Re-run with EXEC=1 ./scripts/self-host.sh web to actually start it.)
 EOF
     ;;

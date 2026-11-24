@@ -120,7 +120,7 @@ fn build_with(
         Method::Get,
         "/v1/whoami",
         "edge.whoami",
-        Arc::new(WhoamiHandler),
+        Arc::new(WhoamiHandler::default()),
     );
     builder = register_git_durable(builder, backend);
     (Arc::new(builder.build()), cell)

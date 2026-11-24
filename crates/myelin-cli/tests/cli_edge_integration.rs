@@ -73,7 +73,7 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority, TempDir) {
         Method::Get,
         "/v1/whoami",
         "edge.whoami",
-        Arc::new(WhoamiHandler),
+        Arc::new(WhoamiHandler::default()),
     );
     builder = register_git_durable(builder, git);
     (Arc::new(builder.build()), cell, root)

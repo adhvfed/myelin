@@ -51,6 +51,8 @@ blake3 = "1"
 hex = "0.4"
 siphasher = "1.0.3"
 sha2 = "0.10"
+hmac = "0.12"
+argon2 = { version = "0.5.3", features = ["std"] }
 syn = { version = "2", default-features = false, features = ["derive", "parsing", "proc-macro", "printing", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
@@ -93,6 +95,13 @@ publish = false
 
 [profile.dev]
 debug = 0
+
+# Password hashing is deliberately expensive; unoptimised it takes seconds per login on a dev stack.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.test]
 debug = 0

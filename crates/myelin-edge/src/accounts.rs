@@ -1,0 +1,801 @@
+//! Email-and-password accounts. A person gets an account only by accepting an invitation link;
+//! after that they sign in with their email and password and receive an ordinary human session.
+
+mod credentials;
+pub(crate) mod http;
+mod store;
+
+use myelin_events::clock::{system_clock_reading, ClockError};
+use myelin_events::{IdMinter, UlidMinter};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_identity_service::{PrincipalProfile, PrincipalStore};
+use myelin_storage::TenantScope;
+use myelin_tenancy::{Region, TenantId};
+use sqlx::PgPool;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
+use tokio::runtime::Handle;
+
+pub use credentials::EmailDigester;
+use credentials::{DummyHash, Email, InvitationCode, Password, WeakPassword};
+pub use store::account_migrations;
+pub(crate) use store::InvitationKind;
+use store::{
+    AcceptOutcome, AccountRow, AccountStore, Invitation, IssueOutcome, IssueRule, NewInvitation,
+    Reservation,
+};
+
+pub const JOIN_INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+pub const RESET_INVITATION_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_INVITATION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+const MAX_DISPLAY_NAME_CHARS: usize = 128;
+
+/// Fixed-window limits, counted in the database so every Edge instance shares them.
+struct Limit {
+    name: &'static str,
+    hits: u32,
+    window_secs: i64,
+}
+
+/// Failed sign-ins per email, whoever is asking, so spreading guesses over many sources does not
+/// help. A success clears the count. The Edge cannot see client addresses, so someone who knows an
+/// email can still lock that person out for one window; that is accepted here.
+const LOGIN_FAILURES_PER_EMAIL: Limit = Limit {
+    name: "login.email",
+    hits: 10,
+    window_secs: 15 * 60,
+};
+const INVITES_PER_MEMBER: Limit = Limit {
+    name: "invitation.create",
+    hits: 50,
+    window_secs: 60 * 60,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountError {
+    InvalidEmail,
+    InvalidDisplayName,
+    /// A reset link changes only the password; it does not take a name.
+    UnexpectedDisplayName,
+    LoginFailed,
+    /// Unknown, expired, used, or superseded invitation; deliberately one answer.
+    InvitationNotFound,
+    WeakPassword,
+    AccountExists,
+    NoSuchAccount,
+    RateLimited {
+        retry_after_secs: u64,
+    },
+    Busy,
+    LinksUnavailable,
+    Unavailable(String),
+}
+
+impl core::fmt::Display for AccountError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidEmail => formatter.write_str("the email address is not valid"),
+            Self::InvalidDisplayName => formatter.write_str(
+                "the display name must be 1 to 128 characters without control characters",
+            ),
+            Self::UnexpectedDisplayName => {
+                formatter.write_str("a password reset takes only a password")
+            }
+            Self::LoginFailed => formatter.write_str("login failed"),
+            Self::InvitationNotFound => formatter.write_str("invitation not found"),
+            Self::WeakPassword => {
+                formatter.write_str("the password must be between 10 and 1024 characters long")
+            }
+            Self::AccountExists => {
+                formatter.write_str("an account with this email address already exists")
+            }
+            Self::NoSuchAccount => formatter.write_str("no account has this email address"),
+            Self::RateLimited { retry_after_secs } => {
+                write!(formatter, "too many attempts; retry in {retry_after_secs}s")
+            }
+            Self::Busy => formatter.write_str("sign-in is busy; retry shortly"),
+            Self::LinksUnavailable => formatter.write_str(
+                "invitation links need MYELIN_WEB_PUBLIC_URL set to the web app's https origin",
+            ),
+            Self::Unavailable(detail) => write!(formatter, "accounts are unavailable: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for AccountError {}
+
+impl From<store::StoreError> for AccountError {
+    fn from(error: store::StoreError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+impl From<WeakPassword> for AccountError {
+    fn from(_: WeakPassword) -> Self {
+        Self::WeakPassword
+    }
+}
+
+/// What an invitation link shows before it is accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvitationView {
+    pub kind: &'static str,
+    pub email: String,
+    pub organization: String,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedInvitation {
+    pub url: String,
+    pub email: String,
+    pub expires_at_unix: i64,
+}
+
+/// What the person sends to accept a link. A join needs their name; a reset does not.
+pub struct Acceptance {
+    pub display_name: Option<String>,
+    pub password: String,
+}
+
+/// Where invitation links point. A link carries a bearer secret, so an origin that would send it
+/// over plain http to another machine is refused when the service is built, not when it is used.
+#[derive(Clone)]
+enum LinkOrigin {
+    Unset,
+    Refused(String),
+    Ready(String),
+}
+
+impl LinkOrigin {
+    fn from_config(origin: Option<String>) -> Self {
+        match origin.map(|origin| crate::validated_web_origin(&origin)) {
+            None => Self::Unset,
+            Some(Ok(origin)) => Self::Ready(origin),
+            Some(Err(reason)) => Self::Refused(reason),
+        }
+    }
+}
+
+/// Points a test can stop at, to line a concurrent change up with an exact moment.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Checkpoint {
+    /// Sign-in has verified the password and not yet confirmed it is still current.
+    PasswordVerified,
+    /// A link is about to be issued; nothing about the email has been decided yet.
+    BeforeIssuing,
+    /// A join has made the new person's key and not yet stored the person.
+    JoinKeyMade,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+type CheckpointHook = Arc<dyn Fn(Checkpoint) + Send + Sync>;
+
+/// A link that was live when it was looked up. Consuming it checks again.
+struct LiveLink {
+    code: InvitationCode,
+    invitation: Invitation,
+    email: Email,
+}
+
+#[derive(Clone)]
+pub struct AccountService {
+    store: AccountStore,
+    principals: PrincipalStore,
+    digester: EmailDigester,
+    links: LinkOrigin,
+    region: String,
+    runtime: Handle,
+    hashing: Arc<HashGate>,
+    dummy: Arc<DummyHash>,
+    ids: Arc<UlidMinter>,
+    now: Arc<dyn Fn() -> Result<i64, ClockError> + Send + Sync>,
+    #[cfg(any(test, feature = "test-support"))]
+    checkpoint: Option<CheckpointHook>,
+}
+
+impl AccountService {
+    /// `web_origin` is the web app's origin; links are `{origin}/join/{code}`. Without a usable
+    /// one, sign-in and accepting existing links still work, but no new link can be made.
+    pub fn new(
+        pool: PgPool,
+        principals: PrincipalStore,
+        digester: EmailDigester,
+        region: impl Into<String>,
+        web_origin: Option<String>,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            store: AccountStore::new(pool),
+            principals,
+            digester,
+            links: LinkOrigin::from_config(web_origin),
+            region: region.into(),
+            runtime,
+            hashing: Arc::new(HashGate::sized_for_host()),
+            dummy: Arc::new(DummyHash::generate()),
+            ids: Arc::new(UlidMinter::new()),
+            now: Arc::new(|| system_clock_reading().map(|reading| reading.unix_seconds())),
+            #[cfg(any(test, feature = "test-support"))]
+            checkpoint: None,
+        }
+    }
+
+    /// The clock for rate-limit windows. Link expiry always follows the database clock.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.now = Arc::new(move || Ok(now()));
+        self
+    }
+
+    /// A hash gate that admits `capacity` hashes at once; 0 refuses every hash as busy.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_hash_capacity(mut self, capacity: usize) -> Self {
+        self.hashing = Arc::new(HashGate::with_capacity(capacity));
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_checkpoint(mut self, hook: impl Fn(Checkpoint) + Send + Sync + 'static) -> Self {
+        self.checkpoint = Some(Arc::new(hook));
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn reached(&self, checkpoint: Checkpoint) {
+        if let Some(hook) = &self.checkpoint {
+            hook(checkpoint);
+        }
+    }
+
+    fn now_unix(&self) -> Result<i64, AccountError> {
+        (self.now)().map_err(|error| AccountError::Unavailable(format!("clock: {error}")))
+    }
+
+    fn block<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, AccountError>>,
+    ) -> Result<T, AccountError> {
+        crate::runtime::drive_result_on_runtime(
+            &self.runtime,
+            future,
+            AccountError::Unavailable("accounts require the Edge multi-thread runtime".into()),
+        )
+    }
+
+    fn bucket(limit: &Limit, key: &[u8]) -> [u8; 32] {
+        let mut bucket = blake3::Hasher::new();
+        bucket.update(b"myelin.edge.account.rate.v1\0");
+        bucket.update(limit.name.as_bytes());
+        bucket.update(b"\0");
+        bucket.update(key);
+        *bucket.finalize().as_bytes()
+    }
+
+    /// Takes one slot of `limit` for `bucket`, or fails with how long to wait. The slot is taken
+    /// before the work it pays for, so a burst cannot all pass a check made ahead of the work.
+    async fn reserve(&self, limit: &Limit, bucket: [u8; 32]) -> Result<(), AccountError> {
+        match self
+            .store
+            .reserve_hit(bucket, limit.hits, limit.window_secs, self.now_unix()?)
+            .await?
+        {
+            Reservation::Taken => Ok(()),
+            Reservation::Full { retry_after_secs } => {
+                Err(AccountError::RateLimited { retry_after_secs })
+            }
+        }
+    }
+
+    /// Runs one password hash or verification under the host-wide concurrency cap.
+    fn hashing<T>(&self, work: impl FnOnce() -> T) -> Result<T, AccountError> {
+        let _permit = self.hashing.enter()?;
+        Ok(work())
+    }
+
+    /// Signs a person in. Unknown email, wrong password, and an inactive person all fail the
+    /// same way and cost the same password verification.
+    ///
+    /// Each attempt takes a slot in the email's window before it verifies anything, so a burst
+    /// of guesses at one email gets at most the window's worth of verifications. A slot is only
+    /// given back for an attempt that never verified (the hash gate was busy) or that succeeded.
+    pub fn login(&self, email: &str, password: String) -> Result<Principal, AccountError> {
+        // A malformed email cannot belong to an account and is not counted, but it pays for a
+        // verification like any other attempt so the answer reveals nothing.
+        let digest = Email::parse(email).map(|email| self.digester.digest(&email));
+        let bucket = digest.map(|digest| Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &digest));
+        let account = self.block(async {
+            let Some((digest, bucket)) = digest.zip(bucket) else {
+                return Ok(None);
+            };
+            self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
+            Ok(self.store.account(&digest).await?)
+        })?;
+        let stored_phc = account
+            .as_ref()
+            .map(|account| account.password_phc.as_str());
+        let verified = match self.hashing(|| self.verify(password, stored_phc)) {
+            Ok(verified) => verified,
+            Err(busy) => {
+                self.give_back_login_slot(bucket);
+                return Err(busy);
+            }
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        self.reached(Checkpoint::PasswordVerified);
+        let principal = match account {
+            Some(account) if verified => self.still_signs_in(&account)?,
+            _ => None,
+        };
+        match (principal, bucket) {
+            (Some(principal), Some(bucket)) => {
+                self.block(async { Ok(self.store.clear_hits(bucket).await?) })?;
+                Ok(principal)
+            }
+            // The failure was already counted when its slot was taken.
+            _ => Err(AccountError::LoginFailed),
+        }
+    }
+
+    /// Verifies against the stored hash, or against the dummy when there is none or the
+    /// password is too short to be anyone's.
+    fn verify(&self, password: String, stored_phc: Option<&str>) -> bool {
+        match Password::new(password) {
+            Ok(password) => password.verify(stored_phc, &self.dummy),
+            Err(WeakPassword) => Password::new("x".repeat(credentials::MIN_PASSWORD_CHARS))
+                .expect("the filler meets the policy")
+                .verify(None, &self.dummy),
+        }
+    }
+
+    /// Best effort: if it fails the person is only throttled a little early.
+    fn give_back_login_slot(&self, bucket: Option<[u8; 32]>) {
+        let (Some(bucket), Ok(now)) = (bucket, self.now_unix()) else {
+            return;
+        };
+        let _ = self.block(async { Ok(self.store.release_hit(bucket, now).await?) });
+    }
+
+    /// The person behind a verified password, if the password is still the stored one and the
+    /// person is still active. A reset that lands during verification makes this `None`.
+    fn still_signs_in(&self, account: &AccountRow) -> Result<Option<Principal>, AccountError> {
+        let Some(principal) =
+            self.active_human(&account.tenant, &account.region, &account.principal_id)?
+        else {
+            return Ok(None);
+        };
+        let current = self.block(async { Ok(self.store.still_signs_in(account).await?) })?;
+        Ok(current.then_some(principal))
+    }
+
+    fn active_human(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal_id: &str,
+    ) -> Result<Option<Principal>, AccountError> {
+        let scope = scope_for(tenant, region);
+        let row = self
+            .principals
+            .get_principal(&scope, &PrincipalId(principal_id.to_string()))
+            .map_err(|error| AccountError::Unavailable(error.to_string()))?;
+        Ok(row
+            .filter(|row| {
+                matches!(row.kind, PrincipalKind::Human) && row.status == PrincipalStatus::Active
+            })
+            .map(|row| {
+                Principal::new(
+                    TenantId(tenant.to_string()),
+                    Region(region.to_string()),
+                    row.principal_id,
+                    row.kind,
+                    row.data_role,
+                    row.status,
+                )
+            }))
+    }
+
+    /// What a link shows. A code that is not even well-formed is refused without touching the
+    /// database, and a lookup never writes.
+    pub fn invitation(&self, code: &str) -> Result<InvitationView, AccountError> {
+        self.block(async {
+            let live = self.live_link(code).await?;
+            Ok(InvitationView {
+                kind: live.invitation.kind.as_str(),
+                email: live.email.as_str().to_string(),
+                organization: self
+                    .store
+                    .organization_name(&live.invitation.tenant)
+                    .await?,
+                expires_at_unix: live.invitation.expires_at_unix,
+            })
+        })
+    }
+
+    async fn live_link(&self, code: &str) -> Result<LiveLink, AccountError> {
+        let code = InvitationCode::parse(code).ok_or(AccountError::InvitationNotFound)?;
+        let invitation = self
+            .store
+            .invitation(&code.digest())
+            .await?
+            .ok_or(AccountError::InvitationNotFound)?;
+        let email = code
+            .open_email(&invitation.email)
+            .filter(|email| self.digester.digest(email) == invitation.email_digest)
+            .ok_or_else(|| {
+                AccountError::Unavailable("a stored invitation does not match its link".into())
+            })?;
+        Ok(LiveLink {
+            code,
+            invitation,
+            email,
+        })
+    }
+
+    /// Accepts a link: a join creates the person, a reset replaces their password. Either way the
+    /// person is signed in as the result. The link is found before any password is hashed, so
+    /// only someone holding a live link can make this Edge run Argon2.
+    pub fn accept(&self, code: &str, acceptance: Acceptance) -> Result<Principal, AccountError> {
+        let live = self.block(self.live_link(code))?;
+        match live.invitation.kind {
+            InvitationKind::Join => self.accept_join(live, acceptance),
+            InvitationKind::Reset => self.accept_reset(live, acceptance),
+        }
+    }
+
+    fn accept_join(
+        &self,
+        live: LiveLink,
+        acceptance: Acceptance,
+    ) -> Result<Principal, AccountError> {
+        let display_name = display_name(acceptance.display_name.as_deref())?;
+        let password = Password::new(acceptance.password)?;
+        // The common conflict is answered before a hash or a key is made for it.
+        let digest = live.invitation.email_digest;
+        if self
+            .block(async { Ok(self.store.account(&digest).await?) })?
+            .is_some()
+        {
+            return Err(AccountError::AccountExists);
+        }
+        let password_phc = self.hashing(|| password.hash())?;
+        let scope = scope_for(&live.invitation.tenant, &live.invitation.region);
+        let principal_id =
+            PrincipalId(format!("person-{}", self.ids.mint().0.to_ascii_lowercase()));
+        let row = self
+            .principals
+            .sealed_new_human(
+                &scope,
+                &principal_id,
+                &PrincipalProfile {
+                    email: live.email.as_str().to_string(),
+                    display_name,
+                },
+            )
+            .map_err(|error| AccountError::Unavailable(error.to_string()))?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.reached(Checkpoint::JoinKeyMade);
+        let outcome = self.block(async {
+            Ok(self
+                .store
+                .accept_join(&live.code.digest(), &live.invitation, row, password_phc)
+                .await?)
+        });
+        // A join the database refused rolled back, so nobody holds the new person's key. A
+        // failed call may still have committed, so its key is kept rather than risk erasing a
+        // stored profile.
+        if matches!(outcome, Ok(AcceptOutcome::Gone | AcceptOutcome::EmailTaken)) {
+            self.discard_key(&scope, &principal_id);
+        }
+        self.signed_in_after(&live.invitation, outcome?)
+    }
+
+    fn discard_key(&self, scope: &TenantScope, principal_id: &PrincipalId) {
+        if let Err(error) = self
+            .principals
+            .discard_unstored_subject_key(scope, principal_id)
+        {
+            // The id lets an operator find the key; it is not the person's email.
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "edge.accounts.join_key_left_behind",
+                    "reason": "the key made for a refused join could not be destroyed",
+                    "principal_id": principal_id.0,
+                    "error": error.to_string(),
+                })
+            );
+        }
+    }
+
+    fn accept_reset(
+        &self,
+        live: LiveLink,
+        acceptance: Acceptance,
+    ) -> Result<Principal, AccountError> {
+        if acceptance.display_name.is_some() {
+            return Err(AccountError::UnexpectedDisplayName);
+        }
+        let password = Password::new(acceptance.password)?;
+        let password_phc = self.hashing(|| password.hash())?;
+        let outcome = self.block(async {
+            Ok(self
+                .store
+                .accept_reset(&live.code.digest(), &live.invitation, password_phc)
+                .await?)
+        })?;
+        self.signed_in_after(&live.invitation, outcome)
+    }
+
+    fn signed_in_after(
+        &self,
+        invitation: &Invitation,
+        outcome: AcceptOutcome,
+    ) -> Result<Principal, AccountError> {
+        match outcome {
+            AcceptOutcome::Accepted { principal_id } => self
+                .active_human(&invitation.tenant, &invitation.region, &principal_id)?
+                .ok_or(AccountError::InvitationNotFound),
+            AcceptOutcome::Gone => Err(AccountError::InvitationNotFound),
+            AcceptOutcome::EmailTaken => Err(AccountError::AccountExists),
+        }
+    }
+
+    /// A signed-in member invites a teammate into their own organization. A member can only make
+    /// join links, and a join link can never touch an existing account or a reset link.
+    pub fn invite_member(
+        &self,
+        inviter: &Principal,
+        email: &str,
+    ) -> Result<IssuedInvitation, AccountError> {
+        self.block(async {
+            let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
+            let mut inviter_key = inviter.tenant.0.as_bytes().to_vec();
+            inviter_key.push(0);
+            inviter_key.extend_from_slice(inviter.principal_id.0.as_bytes());
+            let bucket = Self::bucket(&INVITES_PER_MEMBER, &inviter_key);
+            self.reserve(&INVITES_PER_MEMBER, bucket).await?;
+            // Only an account in the inviter's own organization is reported, so a member cannot
+            // probe which addresses have accounts elsewhere in the cell. An address taken in
+            // another organization gets a link that fails when it is accepted.
+            self.issue(
+                IssueRule::MemberJoin,
+                &inviter.tenant.0,
+                &inviter.region.0,
+                email,
+                JOIN_INVITATION_TTL_SECS,
+            )
+            .await
+        })
+    }
+
+    /// The operator's join link, for the first person in an organization or anyone after.
+    pub async fn operator_join_link(
+        &self,
+        tenant: &str,
+        email: &str,
+        ttl_secs: Option<i64>,
+    ) -> Result<IssuedInvitation, AccountError> {
+        let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
+        self.issue(
+            IssueRule::OperatorJoin,
+            tenant,
+            &self.region,
+            email,
+            ttl_secs.unwrap_or(JOIN_INVITATION_TTL_SECS),
+        )
+        .await
+    }
+
+    /// The operator's password reset link for an existing account in `tenant`.
+    pub async fn operator_reset_link(
+        &self,
+        tenant: &str,
+        email: &str,
+        ttl_secs: Option<i64>,
+    ) -> Result<IssuedInvitation, AccountError> {
+        let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
+        self.issue(
+            IssueRule::Reset,
+            tenant,
+            &self.region,
+            email,
+            ttl_secs.unwrap_or(RESET_INVITATION_TTL_SECS),
+        )
+        .await
+    }
+
+    fn link_origin(&self) -> Result<&str, AccountError> {
+        match &self.links {
+            LinkOrigin::Ready(origin) => Ok(origin),
+            LinkOrigin::Unset => Err(AccountError::LinksUnavailable),
+            LinkOrigin::Refused(reason) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "edge.accounts.link_refused",
+                        "reason": reason,
+                    })
+                );
+                Err(AccountError::LinksUnavailable)
+            }
+        }
+    }
+
+    async fn issue(
+        &self,
+        rule: IssueRule,
+        tenant: &str,
+        region: &str,
+        email: Email,
+        ttl_secs: i64,
+    ) -> Result<IssuedInvitation, AccountError> {
+        let origin = self.link_origin()?;
+        if tenant.trim().is_empty() || region.trim().is_empty() {
+            return Err(AccountError::Unavailable(
+                "tenant and region are required".into(),
+            ));
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.reached(Checkpoint::BeforeIssuing);
+        let code = InvitationCode::generate();
+        let link = NewInvitation {
+            tenant: tenant.to_string(),
+            region: region.to_string(),
+            email_digest: self.digester.digest(&email),
+            email: code.seal_email(&email),
+            ttl_secs: ttl_secs.clamp(60, MAX_INVITATION_TTL_SECS),
+        };
+        match self.store.issue(&code.digest(), rule, &link).await? {
+            IssueOutcome::Issued { expires_at_unix } => Ok(IssuedInvitation {
+                url: format!("{origin}/join/{}", code.encoded()),
+                email: email.as_str().to_string(),
+                expires_at_unix,
+            }),
+            IssueOutcome::AccountExists => Err(AccountError::AccountExists),
+            IssueOutcome::NoSuchAccount => Err(AccountError::NoSuchAccount),
+        }
+    }
+
+    /// The signed-in person's own name and email, for `/v1/whoami`.
+    pub fn profile(&self, principal: &Principal) -> Result<Option<PrincipalProfile>, AccountError> {
+        self.principals
+            .get_profile(
+                &scope_for(&principal.tenant.0, &principal.region.0),
+                &principal.principal_id,
+            )
+            .map_err(|error| AccountError::Unavailable(error.to_string()))
+    }
+}
+
+fn display_name(raw: Option<&str>) -> Result<String, AccountError> {
+    let name = raw.map(str::trim).unwrap_or_default();
+    let chars = name.chars().count();
+    if chars == 0 || chars > MAX_DISPLAY_NAME_CHARS || name.chars().any(char::is_control) {
+        return Err(AccountError::InvalidDisplayName);
+    }
+    Ok(name.to_string())
+}
+
+fn scope_for(tenant: &str, region: &str) -> TenantScope {
+    TenantScope::from_verified_token(
+        &Principal::stub(
+            PrincipalId("account-service".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.to_string()),
+        ),
+        Region(region.to_string()),
+    )
+}
+
+/// Bounds how many password hashes run at once. Each Argon2id run holds 19 MiB and a core, so an
+/// unbounded burst would exhaust the host; callers past the bound wait briefly, then get `Busy`.
+struct HashGate {
+    running: Mutex<usize>,
+    freed: Condvar,
+    capacity: usize,
+}
+
+struct HashPermit<'a>(&'a HashGate);
+
+impl HashGate {
+    const WAIT: Duration = Duration::from_secs(2);
+
+    fn sized_for_host() -> Self {
+        let cores = std::thread::available_parallelism().map_or(2, usize::from);
+        Self::with_capacity((cores / 2).clamp(2, 8))
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            running: Mutex::new(0),
+            freed: Condvar::new(),
+            capacity,
+        }
+    }
+
+    fn enter(&self) -> Result<HashPermit<'_>, AccountError> {
+        let running = self
+            .running
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (mut running, timeout) = self
+            .freed
+            .wait_timeout_while(running, Self::WAIT, |running| *running >= self.capacity)
+            .unwrap_or_else(|error| error.into_inner());
+        if timeout.timed_out() && *running >= self.capacity {
+            return Err(AccountError::Busy);
+        }
+        *running += 1;
+        Ok(HashPermit(self))
+    }
+}
+
+impl Drop for HashPermit<'_> {
+    fn drop(&mut self) {
+        let mut running = self
+            .0
+            .running
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *running -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_names_are_trimmed_and_bounded() {
+        assert_eq!(
+            display_name(Some("  Ada Lovelace ")).unwrap(),
+            "Ada Lovelace"
+        );
+        assert_eq!(display_name(None), Err(AccountError::InvalidDisplayName));
+        assert_eq!(
+            display_name(Some("   ")),
+            Err(AccountError::InvalidDisplayName)
+        );
+        assert_eq!(
+            display_name(Some("Ada\nLovelace")),
+            Err(AccountError::InvalidDisplayName)
+        );
+        assert!(display_name(Some(&"é".repeat(128))).is_ok());
+        assert!(display_name(Some(&"é".repeat(129))).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_dummy_hash_is_built_with_the_service_not_on_the_first_unknown_email() {
+        // A lazy pool never connects, so no database is needed to build a service.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("a lazy pool");
+        let service = AccountService::new(
+            pool,
+            PrincipalStore::new(Arc::new(myelin_storage::KmsEngine::new())),
+            EmailDigester::new(zeroize::Zeroizing::new([0; 32])),
+            "eu-west",
+            None,
+            Handle::current(),
+        );
+        assert!(service.dummy.is_a_full_cost_hash());
+    }
+
+    #[test]
+    fn the_hash_gate_admits_its_capacity_and_then_refuses() {
+        let gate = HashGate {
+            running: Mutex::new(0),
+            freed: Condvar::new(),
+            capacity: 1,
+        };
+        let held = gate.enter().expect("the first hash runs");
+        let started = std::time::Instant::now();
+        assert!(matches!(gate.enter(), Err(AccountError::Busy)));
+        assert!(started.elapsed() >= HashGate::WAIT);
+        drop(held);
+        assert!(gate.enter().is_ok(), "a released permit is reusable");
+    }
+}

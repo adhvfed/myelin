@@ -95,7 +95,7 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBacken
         Method::Get,
         "/v1/whoami",
         "edge.whoami",
-        Arc::new(WhoamiHandler),
+        Arc::new(WhoamiHandler::default()),
     );
     builder = register_git_durable(builder, backend.clone());
     (Arc::new(builder.build()), cell, backend)

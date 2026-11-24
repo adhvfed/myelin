@@ -1,3 +1,4 @@
+mod account_operator;
 mod agent_thread_operator;
 mod git_pr_text_rekey_operator;
 mod privacy_restore_operator;
@@ -11,20 +12,21 @@ use myelin_agent_service::workspace::{AgentWorkspaceStore, LocalDevelopmentWorks
 use myelin_agent_service::workspace_execution::AgentWorkspaceExecutor;
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
-    bootstrap_principal_and_mint, execute_secret_command, merge_queue_interval_from_env,
-    recover_placed_git_at_boot, register_agent_mcp, register_agent_threads, register_agents,
-    register_chat, register_ci, register_git_durable, register_git_wire, register_issues,
-    register_knowledge, register_notif, register_privacy, register_projects, register_refs,
-    register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
-    spawn_merge_queue, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,
-    AgentMcpServices, AgentThreadHttpInputs, AgentThreadRecoveryConfig, AuthProvider,
-    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    account_migrations, bootstrap_principal_and_mint, execute_secret_command,
+    merge_queue_interval_from_env, recover_placed_git_at_boot, register_agent_mcp,
+    register_agent_threads, register_agents, register_chat, register_ci, register_git_durable,
+    register_git_wire, register_issues, register_knowledge, register_notif, register_privacy,
+    register_projects, register_refs, register_tools, serve_edge_until_shutdown_with_probe,
+    spawn_issue_authorization_reconciler, spawn_merge_queue, validated_web_origin, AccountService,
+    AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices,
+    AgentThreadHttpInputs, AgentThreadRecoveryConfig, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
     DeviceAuthorizationBroker, DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess,
     DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiApi,
-    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway,
-    GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
-    SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
-    TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
+    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, EmailDigester, Gateway,
+    GitDatabaseProviders, InviteHandler, IssueReconciliationConfig, Method, ReadinessCheck,
+    ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome,
+    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
 };
 use myelin_events::OutboxStore;
 use myelin_identity::{
@@ -75,11 +77,7 @@ struct EdgeReadinessState {
     ready: bool,
 }
 
-fn public_auth_config(
-    sso_configured: bool,
-    dev_login_enabled: bool,
-    token_login_enabled: bool,
-) -> AuthPublicConfig {
+fn public_auth_config(sso_configured: bool, dev_login_enabled: bool) -> AuthPublicConfig {
     AuthPublicConfig {
         sso_configured,
         providers: if sso_configured {
@@ -91,7 +89,6 @@ fn public_auth_config(
             Vec::new()
         },
         dev_login_enabled,
-        token_login_enabled,
     }
 }
 
@@ -139,23 +136,17 @@ fn validated_oidc_issuer(raw: &str) -> Result<String, String> {
     Ok(raw.to_string())
 }
 
-fn device_verification_uri(raw_origin: &str) -> Result<String, String> {
-    let uri: Uri = raw_origin
-        .parse()
-        .map_err(|_| "MYELIN_WEB_PUBLIC_URL is not a valid absolute URI".to_string())?;
-    if !matches!(uri.scheme_str(), Some("http" | "https"))
-        || uri.authority().is_none()
-        || uri
-            .authority()
-            .is_some_and(|authority| authority.as_str().contains('@'))
-        || uri.query().is_some()
-        || !matches!(uri.path(), "" | "/")
-    {
-        return Err(
-            "MYELIN_WEB_PUBLIC_URL must be an absolute, credential-free HTTP(S) origin".into(),
-        );
+/// The web app's origin, from `MYELIN_WEB_PUBLIC_URL`. Browser links (CLI approval, invitations)
+/// are built from it.
+fn web_public_origin() -> Result<Option<String>, String> {
+    match std::env::var("MYELIN_WEB_PUBLIC_URL") {
+        Ok(value) if !value.trim().is_empty() => validated_web_origin(value.trim()).map(Some),
+        _ => Ok(None),
     }
-    Ok(format!("{}/cli/auth", raw_origin.trim_end_matches('/')))
+}
+
+fn device_verification_uri(origin: &str) -> String {
+    format!("{origin}/cli/auth")
 }
 
 fn parse_oidc_jwks_response(
@@ -303,6 +294,7 @@ struct ComposedCore {
     kms: Arc<KmsEngine>,
     cell: Arc<CellTokenAuthority>,
     ci_surface_cursor_key: zeroize::Zeroizing<[u8; 32]>,
+    email_digest_key: zeroize::Zeroizing<[u8; 32]>,
     workspace_ssh_host: WorkspaceSshHostIdentity,
     workspace_ssh_routes: WorkspaceSshRouteKey,
     cell_id: String,
@@ -319,7 +311,6 @@ struct EdgeRuntimeConfig {
     public_base_url: Option<String>,
     listen_addr: Option<String>,
     dev_login_enabled: bool,
-    token_login_enabled: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -394,8 +385,6 @@ impl EdgeRuntimeConfig {
             cfg!(debug_assertions),
             listen_addr.as_deref(),
         )?;
-        let token_login_enabled = serving
-            && optional_runtime_switch("MYELIN_TOKEN_LOGIN", read("MYELIN_TOKEN_LOGIN"), false)?;
         let agent_workspace_root = if serving {
             Some(validated_persistent_directory(
                 "MYELIN_AGENT_WORKSPACE_ROOT",
@@ -432,7 +421,6 @@ impl EdgeRuntimeConfig {
             public_base_url,
             listen_addr,
             dev_login_enabled,
-            token_login_enabled,
         })
     }
 }
@@ -689,6 +677,13 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
+        .migrate(&account_migrations(), &HotTables::none())
+        .await
+    {
+        eprintln!("edge: cannot apply the password account migration: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
         .migrate(
             &myelin_issues::issues_migrations(),
             &myelin_issues::issues_hot_tables(),
@@ -834,6 +829,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
     };
     let ci_surface_cursor_key =
         seal_key.derive_service_key("myelin 2026-07-24 ci run surface cursor v1");
+    let email_digest_key = seal_key.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT);
     let workspace_ssh_host = WorkspaceSshHostIdentity::from_seal_key(&seal_key);
     let workspace_ssh_routes = WorkspaceSshRouteKey::from_seal_key(&seal_key);
     let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id.clone());
@@ -868,10 +864,28 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         kms,
         cell,
         ci_surface_cursor_key,
+        email_digest_key,
         workspace_ssh_host,
         workspace_ssh_routes,
         cell_id,
         handle,
+    }
+}
+
+impl ComposedCore {
+    fn accounts(&self, web_origin: Option<String>) -> AccountService {
+        AccountService::new(
+            self.provider.db_pool().clone(),
+            PrincipalStore::with_pg(
+                self.kms.clone(),
+                DurablePrincipalBacking::new(self.provider.clone()),
+                self.handle.clone(),
+            ),
+            EmailDigester::new(self.email_digest_key.clone()),
+            self.provider.config().region.clone(),
+            web_origin,
+            self.handle.clone(),
+        )
     }
 }
 
@@ -892,6 +906,28 @@ async fn main() {
         Some("revoke") => {
             let runtime = runtime_config_or_exit(false);
             operator_revoke(compose_core(runtime.cell_id).await, &args[1..]).await;
+        }
+        Some(command @ ("invite" | "reset-link")) => {
+            let runtime = runtime_config_or_exit(false);
+            let web_origin = web_public_origin().unwrap_or_else(|error| {
+                eprintln!("edge {command}: {error}");
+                std::process::exit(2);
+            });
+            if web_origin.is_none() {
+                eprintln!(
+                    "edge {command}: MYELIN_WEB_PUBLIC_URL must be set to the web app's origin \
+                     to build the link"
+                );
+                std::process::exit(2);
+            }
+            let core = compose_core(runtime.cell_id).await;
+            let kind = if command == "invite" {
+                account_operator::LinkKind::Join
+            } else {
+                account_operator::LinkKind::Reset
+            };
+            let region = core.provider.config().region.clone();
+            account_operator::run(kind, core.accounts(web_origin), &region, &args[1..]).await;
         }
         Some("secret") => {
             let runtime = runtime_config_or_exit(false);
@@ -921,7 +957,7 @@ async fn main() {
         }
         Some(other) => {
             eprintln!(
-                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | revoke | secret | agent-thread-reconcile | git-pr-text-rekey | privacy-reerase)"
+                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | invite | reset-link | revoke | secret | agent-thread-reconcile | git-pr-text-rekey | privacy-reerase)"
             );
             std::process::exit(2);
         }
@@ -938,7 +974,6 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         public_base_url,
         listen_addr,
         dev_login_enabled,
-        token_login_enabled,
     } = runtime;
     let git_root = git_root.expect("serving config carries a Git root");
     let agent_workspace_root =
@@ -954,11 +989,17 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     let agent_workspace_executor: Arc<dyn AgentWorkspaceExecutor> = local_agent_workspaces;
     let public_base_url = public_base_url.expect("serving config carries a public base URL");
     let listen_addr = listen_addr.expect("serving config carries a listen address");
+    let web_origin = web_public_origin().unwrap_or_else(|error| {
+        eprintln!("edge: invalid web app origin: {error}");
+        std::process::exit(1);
+    });
+    let accounts = core.accounts(web_origin.clone());
     let ComposedCore {
         provider,
         kms,
         cell,
         ci_surface_cursor_key,
+        email_digest_key: _,
         workspace_ssh_host,
         workspace_ssh_routes,
         cell_id,
@@ -1016,6 +1057,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
+    let profile_directory = human_store.clone();
     let project_principals = human_store.clone();
     let git_principals = human_store.clone();
     let mcp_principals = PrincipalStore::with_pg(
@@ -1023,29 +1065,19 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
-    let device_authorization = std::env::var("MYELIN_WEB_PUBLIC_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(|origin| {
-            let verification_uri = device_verification_uri(origin.trim()).unwrap_or_else(|error| {
-                eprintln!("edge: invalid CLI login browser origin: {error}");
-                std::process::exit(1);
-            });
-            DeviceAuthorizationBroker::with_pg(
-                provider.db_pool().clone(),
-                handle.clone(),
-                verification_uri,
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("edge: invalid CLI login verification URI: {error}");
-                std::process::exit(1);
-            })
-        });
-    let auth_config = public_auth_config(
-        oidc_settings.is_some(),
-        dev_login_enabled,
-        token_login_enabled,
-    );
+    let device_authorization = web_origin.as_deref().map(|origin| {
+        let verification_uri = device_verification_uri(origin);
+        DeviceAuthorizationBroker::with_pg(
+            provider.db_pool().clone(),
+            handle.clone(),
+            verification_uri,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("edge: invalid CLI login verification URI: {error}");
+            std::process::exit(1);
+        })
+    });
+    let auth_config = public_auth_config(oidc_settings.is_some(), dev_login_enabled);
     let human_login = Arc::new(match oidc_settings {
         Some(oidc) => {
             let issuer = validated_oidc_issuer(&oidc.issuer).unwrap_or_else(|error| {
@@ -1252,6 +1284,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     )
     .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
     .with_human_session_issuer(cell.clone())
+    .with_accounts(accounts.clone())
     .with_shed(edge_shed);
     let builder = match device_authorization {
         Some(broker) => builder.with_device_authorization(broker),
@@ -1271,13 +1304,19 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             Method::Get,
             "/v1/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler),
+            Arc::new(WhoamiHandler::with_profiles(profile_directory.clone())),
         )
         .route(
             Method::Get,
             "/v1/t/{tenant}/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler),
+            Arc::new(WhoamiHandler::with_profiles(profile_directory.clone())),
+        )
+        .route(
+            Method::Post,
+            "/v1/invitations",
+            "edge.invitations.create",
+            Arc::new(InviteHandler::new(accounts)),
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
@@ -2077,7 +2116,6 @@ mod runtime_config_tests {
         assert_eq!(config.public_base_url, None);
         assert_eq!(config.listen_addr, None);
         assert!(!config.dev_login_enabled);
-        assert!(!config.token_login_enabled);
     }
 
     #[test]
@@ -2104,12 +2142,11 @@ mod runtime_config_tests {
 
     #[test]
     fn configured_oidc_verifier_is_advertised_to_interactive_web_clients() {
-        let config = public_auth_config(true, false, true);
+        let config = public_auth_config(true, false);
         assert!(config.sso_configured);
         assert_eq!(config.providers.len(), 1);
         assert_eq!(config.providers[0].id, "oidc");
         assert!(!config.dev_login_enabled);
-        assert!(config.token_login_enabled);
     }
 
     #[test]

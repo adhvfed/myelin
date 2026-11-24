@@ -829,6 +829,46 @@ impl DurablePrincipalBacking {
             .await
     }
 
+    /// Inserts a brand-new principal inside a caller-owned tenant transaction, so a caller can
+    /// create a person together with the credential that signs them in. Returns `false` when the
+    /// id is already taken; an existing principal is never overwritten through this seam.
+    pub async fn insert_new_principal_in_tx(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        row: &DurablePrincipalRow,
+    ) -> Result<bool, PgError> {
+        let (key_ref, nonce, ciphertext) = match &row.profile {
+            Some(blob) => (
+                Some(blob.key_ref.as_str()),
+                Some(blob.nonce.as_slice()),
+                Some(blob.ciphertext.as_slice()),
+            ),
+            None => (None, None, None),
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO principal \
+               (tenant_id, region, principal_id, kind, data_role, status, \
+                profile_key_ref, profile_nonce, profile_ciphertext) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+             ON CONFLICT (tenant_id, region, principal_id) DO NOTHING",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(&row.principal_id)
+        .bind(&row.kind)
+        .bind(&row.data_role)
+        .bind(&row.status)
+        .bind(key_ref)
+        .bind(nonce)
+        .bind(ciphertext)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?
+        .rows_affected();
+        Ok(inserted == 1)
+    }
+
     pub async fn get_principal(
         &self,
         tenant: &str,
