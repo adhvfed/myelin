@@ -56,6 +56,12 @@ rather than fixed in application documentation. Each service accepts
 `MYELIN_DATABASE_MAX_CONNECTIONS` as a positive per-process Postgres pool budget; the Fed stack
 sets a deliberately smaller budget because its services share one local database.
 
+The stack includes [Mailpit](https://mailpit.axllent.org/), and the edge sends all its mail there:
+invitations, password reset links, and password-change notices. Open the inbox at the
+`Mail inbox:` URL fed prints at startup (the `MAILPIT_WEB_PORT` allocation in `fed ports list`).
+Nothing leaves the machine. Production mail settings are in
+[docs/runbooks/outbound-email.md](docs/runbooks/outbound-email.md).
+
 The test entry points have separate responsibilities:
 
 - `fed test:system` runs the standalone TypeScript black-box suite against the real Edge and

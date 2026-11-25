@@ -16,6 +16,15 @@ async function setEdgeConfig(config: Record<string, unknown>): Promise<void> {
   await context.dispose();
 }
 
+/** The links the double has "emailed" to `to`, oldest first. */
+async function mailTo(to: string): Promise<string[]> {
+  const context = await pwRequest.newContext();
+  const response = await context.get(`${EDGE}/__test/mail`);
+  const { mail } = (await response.json()) as { mail: { to: string; url: string }[] };
+  await context.dispose();
+  return mail.filter((letter) => letter.to === to).map((letter) => letter.url);
+}
+
 async function expectNoAxeViolations(page: Page, where: string) {
   const results = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
@@ -83,11 +92,51 @@ test.describe("signing in", () => {
     await page.waitForURL("**/profile");
   });
 
-  test("forgot password explains that resets come as a link; axe green", async ({ page }) => {
+  test("without mail, forgot password says to ask for a reset link; axe green", async ({ page }) => {
+    await setEdgeConfig({ mailDeliveryEnabled: false });
     await page.goto("/login");
     await page.getByTestId("forgot-password").click();
     await expect(page.getByTestId("password-help")).toContainText(/reset link/i);
+    await expect(page.getByTestId("reset-form")).toHaveCount(0);
     await expectNoAxeViolations(page, "/login?help=password");
+  });
+
+  test("forgot password emails a link without saying whether the account exists; axe green", async ({ page }) => {
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("forgot-password").click();
+    await expect(page.getByRole("heading", { name: "Reset your password" })).toBeVisible();
+    await expectNoAxeViolations(page, "/login?help=password (mail on)");
+    await page.waitForLoadState("networkidle");
+
+    await page.getByTestId("reset-email").fill("nobody@acme.dev");
+    await page.getByTestId("reset-submit").click();
+    await expect(page.getByTestId("reset-sent")).toHaveText(
+      "If an account exists for nobody@acme.dev, a reset link is on its way.",
+    );
+    expect(await mailTo("nobody@acme.dev")).toEqual([]);
+
+    await page.goto("/login?help=password");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("reset-email").fill(ADA.email);
+    await page.getByTestId("reset-submit").click();
+    await expect(page.getByTestId("reset-sent")).toHaveText(
+      `If an account exists for ${ADA.email}, a reset link is on its way.`,
+    );
+    const [link] = await mailTo(ADA.email);
+    await page.goto(new URL(link!).pathname);
+    await expect(page.getByRole("heading", { name: "Choose a new password" })).toBeVisible();
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("join-password").fill("a password from email");
+    await page.getByTestId("join-submit").click();
+    await page.waitForURL("**/git/repos");
+
+    await page.context().clearCookies();
+    await page.goto("/login?help=password");
+    await page.getByTestId("reset-back").click();
+    await page.waitForURL(/\/login$/);
+    await signIn(page, ADA.email, "a password from email");
+    await page.waitForURL("**/git/repos");
   });
 });
 
@@ -143,7 +192,25 @@ test.describe("invitation links", () => {
     await page.waitForURL("**/login");
   });
 
-  test("a member invites a teammate and gets a link to pass on", async ({ page }) => {
+  test("a member invites a teammate by email; the invitee opens the emailed link", async ({ page }) => {
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL("**/git/repos");
+    await page.goto("/profile");
+    await page.waitForLoadState("networkidle");
+
+    await page.getByTestId("invite-email").fill("linus@acme.dev");
+    await page.getByTestId("invite-submit").click();
+    await expect(page.getByTestId("invite-sent")).toContainText("Invitation sent to linus@acme.dev");
+    await expect(page.getByTestId("invite-url")).toHaveCount(0);
+
+    const [link] = await mailTo("linus@acme.dev");
+    await page.context().clearCookies();
+    await page.goto(new URL(link!).pathname);
+    await expect(page.getByTestId("join-email")).toHaveValue("linus@acme.dev");
+  });
+
+  test("without mail, a member invites a teammate and gets a link to pass on", async ({ page }) => {
+    await setEdgeConfig({ mailDeliveryEnabled: false });
     await signIn(page, ADA.email, ADA.password);
     await page.waitForURL("**/git/repos");
     await page.goto("/profile");

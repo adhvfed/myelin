@@ -22,16 +22,24 @@ pub fn validated_web_origin(raw: &str) -> Result<String, String> {
     Ok(origin.to_string())
 }
 
-enum Host {
+pub(crate) enum Host {
     Name(String),
     Ip(IpAddr),
 }
 
 impl Host {
-    fn is_loopback(&self) -> bool {
+    pub(crate) fn is_loopback(&self) -> bool {
         match self {
             Self::Name(name) => name == "localhost",
             Self::Ip(ip) => ip.is_loopback(),
+        }
+    }
+
+    /// The host as a resolver or TLS name check takes it: an IPv6 literal without brackets.
+    pub(crate) fn unbracketed(&self) -> String {
+        match self {
+            Self::Name(name) => name.clone(),
+            Self::Ip(ip) => ip.to_string(),
         }
     }
 }
@@ -74,7 +82,7 @@ fn parse_origin(raw: &str) -> Option<Origin> {
     Some(Origin { scheme, host, port })
 }
 
-fn split_host_port(authority: &str) -> Option<(Host, Option<u16>)> {
+pub(crate) fn split_host_port(authority: &str) -> Option<(Host, Option<u16>)> {
     // Brackets are for IPv6 literals only, so `[localhost]` and `[127.0.0.1]` are refused.
     if let Some(bracketed) = authority.strip_prefix('[') {
         let (literal, after) = bracketed.split_once(']')?;

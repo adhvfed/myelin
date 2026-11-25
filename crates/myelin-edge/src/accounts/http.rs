@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Acceptance, AccountError, AccountService};
+use super::{Acceptance, AccountError, AccountService, MemberInvitation};
 use crate::catalogue::{Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::{no_store, route_segments};
@@ -21,7 +21,7 @@ pub(crate) fn is_account_path(path: &str) -> bool {
     let segments: Vec<&str> = route_segments(path).collect();
     matches!(
         segments.as_slice(),
-        ["v1", "auth", "password", "login"] | ["v1", "invitations"]
+        ["v1", "auth", "password", "login" | "forgot"] | ["v1", "invitations"]
     ) || matches!(segments.as_slice(), ["v1", "auth", "invitations", _, ..])
 }
 
@@ -44,6 +44,12 @@ struct AcceptRequest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InviteRequest {
+    email: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForgotRequest {
     email: String,
 }
 
@@ -137,6 +143,26 @@ pub(crate) fn login(
     }
 }
 
+/// `POST /v1/auth/password/forgot`: one answer for every email, whether or not it has an
+/// account, has asked too often, or is malformed.
+pub(crate) fn forgot(accounts: Option<&AccountService>, request: &EdgeRequest) -> EdgeResponse {
+    let accounts = match configured(accounts) {
+        Ok(accounts) if accounts.mail_enabled() => accounts,
+        Ok(_) => {
+            return error(&EdgeError::Unavailable(
+                "password reset by email is not configured".into(),
+            ))
+        }
+        Err(response) => return response,
+    };
+    let body: ForgotRequest = match parse(&request.body, "password reset") {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    accounts.forgot_password(&body.email);
+    no_store(EdgeResponse::json(202, &json!({ "status": "accepted" })))
+}
+
 /// `GET /v1/auth/invitations/{code}`
 pub(crate) fn invitation(accounts: Option<&AccountService>, code: &str) -> EdgeResponse {
     let outcome =
@@ -204,9 +230,21 @@ impl Handler for InviteHandler {
         };
         Ok(
             match self.accounts.invite_member(ctx.principal, &body.email) {
-                Ok(issued) => no_store(EdgeResponse::json(
+                Ok(MemberInvitation::Emailed {
+                    email,
+                    expires_at_unix,
+                }) => no_store(EdgeResponse::json(
                     201,
                     &json!({
+                        "delivery": "email",
+                        "email": email,
+                        "expires_at": expires_at_unix,
+                    }),
+                )),
+                Ok(MemberInvitation::HandedOver(issued)) => no_store(EdgeResponse::json(
+                    201,
+                    &json!({
+                        "delivery": "link",
                         "url": issued.url,
                         "email": issued.email,
                         "expires_at": issued.expires_at_unix,

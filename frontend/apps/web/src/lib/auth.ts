@@ -28,11 +28,17 @@ import {
   AccountError,
   edgeAcceptInvitation,
   edgeCreateInvitation,
+  edgeForgotPassword,
   edgeGetInvitation,
   edgePasswordLogin,
   validInvitationCode,
 } from "../server/account-gateway";
-import type { AccountFailure, EdgeInvitation, EdgeSessionGrant } from "../server/account-gateway";
+import type {
+  AccountFailure,
+  EdgeCreatedInvitation,
+  EdgeInvitation,
+  EdgeSessionGrant,
+} from "../server/account-gateway";
 import { authFailureDestination, DEFAULT_AUTH_RETURN_TO, safeAuthReturnTo } from "./auth-return";
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
 import {
@@ -257,10 +263,11 @@ export const acceptInvitation = action(async (formData: FormData) => {
 }, "accept-invitation");
 
 export type InvitationResult =
-  | { ok: true; url: string; email: string; expiresAt: number }
+  | ({ ok: true } & EdgeCreatedInvitation)
   | { ok: false; reason: AccountFailure };
 
-/** Create an invitation link for a teammate. The link is shown once, to be passed on by hand. */
+/** Invite a teammate. With mail on the edge emails the link; otherwise it is shown once, to be
+ * passed on by hand. */
 export const createInvitation = action(async (formData: FormData): Promise<InvitationResult> => {
   "use server";
   const email = String(formData.get("email") ?? "").trim();
@@ -274,6 +281,29 @@ export const createInvitation = action(async (formData: FormData): Promise<Invit
     return { ok: false, reason: accountFailure(error) };
   }
 }, "create-invitation");
+
+export type PasswordResetRequest =
+  | { ok: true; email: string }
+  | { ok: false; reason: AccountFailure };
+
+/** Ask for a reset link by email. The answer is the same whether or not the address has an
+ * account, so the page can only say that a link is on its way if one exists. */
+export const requestPasswordReset = action(
+  async (formData: FormData): Promise<PasswordResetRequest> => {
+    "use server";
+    const email = String(formData.get("email") ?? "").trim();
+    if (!email || email.length > 320 || !email.includes("@")) {
+      return { ok: false, reason: "invalid_email" };
+    }
+    try {
+      await edgeForgotPassword(email);
+      return { ok: true, email };
+    } catch (error) {
+      return { ok: false, reason: accountFailure(error) };
+    }
+  },
+  "request-password-reset",
+);
 
 /**
  * Begin a one-time OIDC Authorization Code + S256 PKCE transaction. The mode is re-read from both

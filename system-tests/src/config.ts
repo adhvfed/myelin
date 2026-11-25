@@ -29,6 +29,7 @@ export interface SystemTestConfig {
   reviewerPrincipal: string;
   privacyPrincipal: string;
   natsUrl: string;
+  mailpitUrl: string;
   runId: string;
   issues: {
     projectId: string;
@@ -49,6 +50,7 @@ export const systemTestConfig: SystemTestConfig = Object.freeze({
   reviewerPrincipal: required("MYELIN_SYSTEM_TEST_REVIEWER_PRINCIPAL"),
   privacyPrincipal: required("MYELIN_SYSTEM_TEST_PRIVACY_PRINCIPAL"),
   natsUrl: url("NATS_URL"),
+  mailpitUrl: url("MYELIN_SYSTEM_TEST_MAILPIT_URL"),
   runId: process.env.MYELIN_SYSTEM_TEST_RUN_ID?.trim() || randomUUID(),
   issues: Object.freeze({
     projectId: required("MYELIN_SYSTEM_TEST_ISSUES_PROJECT"),

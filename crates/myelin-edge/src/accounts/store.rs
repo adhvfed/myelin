@@ -14,6 +14,7 @@ use myelin_storage::{
 use sqlx::{PgPool, Row};
 
 use super::credentials::{CodeDigest, EmailDigest, SealedEmail};
+use crate::mail::{Letter, MailOutbox};
 
 const ACCOUNT_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS auth_password_account (
@@ -61,8 +62,12 @@ REVOKE ALL ON TABLE auth_rate_limit FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE auth_rate_limit TO myelin_app;
 "#;
 
+/// The account tables, then the mail outbox that carries their links.
 pub fn account_migrations() -> Migrations {
-    Migrations::of([Migration::plain("edge_0003_password_accounts", ACCOUNT_DDL)])
+    Migrations::of([
+        Migration::plain("edge_0003_password_accounts", ACCOUNT_DDL),
+        crate::mail::outbox_migration(),
+    ])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +121,39 @@ pub(crate) struct NewInvitation {
     pub email_digest: EmailDigest,
     pub email: SealedEmail,
     pub ttl_secs: i64,
+}
+
+/// The letter a new link is emailed in.
+pub(crate) enum LinkLetter {
+    Invitation { organization: String },
+    PasswordReset,
+}
+
+/// A link's letter, written once the link's expiry is known and queued with the link.
+pub(crate) struct LinkMail {
+    pub outbox: MailOutbox,
+    pub letter: LinkLetter,
+    pub to: String,
+    pub url: String,
+}
+
+impl LinkMail {
+    fn letter(&self, expires_at_unix: i64) -> Letter {
+        let (to, link) = (self.to.clone(), self.url.clone());
+        match &self.letter {
+            LinkLetter::Invitation { organization } => Letter::Invitation {
+                to,
+                organization: organization.clone(),
+                link,
+                expires_at_unix,
+            },
+            LinkLetter::PasswordReset => Letter::PasswordReset {
+                to,
+                link,
+                expires_at_unix,
+            },
+        }
+    }
 }
 
 /// Who may get a link, decided under the same lock that stores it.
@@ -339,12 +377,14 @@ impl AccountStore {
 
     /// Decides whether the link may be issued and stores it, under one per-email lock so two
     /// issuances cannot interleave. The new link supersedes older unused links of its own kind
-    /// for the same email in the same organization; a join link never touches a reset link.
+    /// for the same email in the same organization, and withdraws any mail still carrying them;
+    /// a join link never touches a reset link. `mail` is queued in the same transaction.
     pub(crate) async fn issue(
         &self,
         code: &CodeDigest,
         rule: IssueRule,
         link: &NewInvitation,
+        mail: Option<&LinkMail>,
     ) -> Result<IssueOutcome, StoreError> {
         let mut transaction = self.pool.begin().await.map_err(StoreError::database)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -381,17 +421,21 @@ impl AccountStore {
         .execute(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
-        sqlx::query(
+        let superseded: Vec<Vec<u8>> = sqlx::query_scalar(
             "DELETE FROM auth_invitation \
-              WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND kind = $4",
+              WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND kind = $4 \
+             RETURNING code_digest",
         )
         .bind(&link.tenant)
         .bind(&link.region)
         .bind(link.email_digest.as_slice())
         .bind(rule.kind().as_str())
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
+        crate::mail::withdraw(&mut transaction, &superseded)
+            .await
+            .map_err(StoreError::database)?;
         let expires_at_unix: i64 = sqlx::query_scalar(&format!(
             "INSERT INTO auth_invitation \
                (code_digest, kind, tenant_id, region, email_digest, email_nonce, \
@@ -411,6 +455,12 @@ impl AccountStore {
         .fetch_one(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
+        if let Some(mail) = mail {
+            mail.outbox
+                .enqueue(&mut transaction, &mail.letter(expires_at_unix), Some(code))
+                .await
+                .map_err(StoreError::database)?;
+        }
         transaction.commit().await.map_err(StoreError::database)?;
         Ok(IssueOutcome::Issued { expires_at_unix })
     }
@@ -522,11 +572,13 @@ impl AccountStore {
     }
 
     /// Consumes a reset invitation and replaces the password of the active account it names.
+    /// `notice`, the letter telling the owner, is queued only if the password changes.
     pub(crate) async fn accept_reset(
         &self,
         code: &CodeDigest,
         invitation: &Invitation,
         password_phc: String,
+        notice: Option<(MailOutbox, Letter)>,
     ) -> Result<AcceptOutcome, StoreError> {
         let Some(principal_id) = invitation.principal_id.clone() else {
             return Ok(AcceptOutcome::Gone);
@@ -587,6 +639,9 @@ impl AccountStore {
                         .rows_affected();
                         if changed != 1 {
                             return Err(Abort::Gone);
+                        }
+                        if let Some((outbox, letter)) = notice {
+                            outbox.enqueue(conn, &letter, None).await?;
                         }
                         Ok(principal_id)
                     })

@@ -64,6 +64,7 @@ describe("toAuthConfig — carries password_login_enabled (R4.0)", () => {
       providers: [],
       dev_login_enabled: false,
       password_login_enabled: false,
+      mail_delivery_enabled: false,
     });
   });
 
@@ -86,6 +87,16 @@ describe("toAuthConfig — carries password_login_enabled (R4.0)", () => {
       providers: [{ id: "oidc", label: "Work SSO" }],
       dev_login_enabled: false,
       password_login_enabled: false,
+      mail_delivery_enabled: false,
     });
+  });
+
+  it("reports mail delivery only alongside password sign-in", () => {
+    expect(toAuthConfig({ password_login_enabled: true, mail_delivery_enabled: true }, {}, true))
+      .toMatchObject({ mail_delivery_enabled: true });
+    expect(toAuthConfig({ password_login_enabled: false, mail_delivery_enabled: true }, {}, true))
+      .toMatchObject({ mail_delivery_enabled: false });
+    expect(toAuthConfig({ password_login_enabled: true, mail_delivery_enabled: "yes" }, {}, true))
+      .toMatchObject({ mail_delivery_enabled: false });
   });
 });

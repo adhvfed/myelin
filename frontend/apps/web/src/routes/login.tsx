@@ -1,11 +1,18 @@
 // Public sign-in. A person signs in with their email and password; single sign-on appears beside it
-// where the deployment has configured one. The edge config decides which methods render.
+// where the deployment has configured one. The edge config decides which methods render, and
+// whether a forgotten password is reset by email or by asking an administrator.
 import { Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { createAsync, useSearchParams, useSubmission } from "@solidjs/router";
 import { AuthShell } from "../components/auth/AuthShell";
 import { SIGN_IN_CUT } from "../components/auth/Sheath";
-import { getAuthConfig, loginDev, loginWithPassword, startSso } from "../lib/auth";
+import {
+  getAuthConfig,
+  loginDev,
+  loginWithPassword,
+  requestPasswordReset,
+  startSso,
+} from "../lib/auth";
 import { safeAuthReturnTo } from "../lib/auth-return";
 
 /** What went wrong, in the visitor's terms. Unknown codes get the generic line. */
@@ -20,27 +27,56 @@ function errorCopy(code: string): string {
   }
 }
 
+function resetErrorCopy(code: string): string {
+  switch (code) {
+    case "invalid_email":
+      return "That doesn't look like an email address.";
+    case "rate_limited":
+      return "Too many requests. Wait a minute, then try again.";
+    default:
+      return "The request couldn't be sent. Try again in a moment.";
+  }
+}
+
 export default function Login() {
   const config = createAsync(() => getAuthConfig());
   const [params] = useSearchParams();
   const passwordPending = useSubmission(loginWithPassword);
   const ssoPending = useSubmission(startSso);
   const devPending = useSubmission(loginDev);
+  const resetPending = useSubmission(requestPasswordReset);
 
   const error = () => (typeof params.error === "string" ? params.error : "");
   const credentialsRejected = () => error() === "credentials";
   const returnTo = () => safeAuthReturnTo(params.return_to);
-  const busy = () => passwordPending.pending || ssoPending.pending || devPending.pending;
+  const busy = () =>
+    passwordPending.pending || ssoPending.pending || devPending.pending || resetPending.pending;
   const resetHelpHref = () => {
     const query = new URLSearchParams({ help: "password" });
     if (typeof params.return_to === "string") query.set("return_to", returnTo());
     return `/login?${query}`;
   };
+  const signInHref = () =>
+    typeof params.return_to === "string"
+      ? `/login?${new URLSearchParams({ return_to: returnTo() })}`
+      : "/login";
+  const resettingByEmail = () =>
+    params.help === "password" && config()?.mail_delivery_enabled === true;
 
   return (
     <AuthShell cut={SIGN_IN_CUT} busy={busy()}>
-      <Title>Sign in · Myelin</Title>
+      <Suspense fallback={<p class="auth-note">Loading sign-in…</p>}>
+        <Show when={resettingByEmail()} fallback={signIn()}>
+          <PasswordReset signInHref={signInHref()} />
+        </Show>
+      </Suspense>
+    </AuthShell>
+  );
+
+  function signIn() {
+    return (
       <section aria-labelledby="login-heading" class="auth-form">
+        <Title>Sign in · Myelin</Title>
         <h1 id="login-heading" class="auth-heading">
           Sign in
         </h1>
@@ -163,6 +199,77 @@ export default function Login() {
           </Show>
         </Suspense>
       </section>
-    </AuthShell>
+    );
+  }
+}
+
+/** Ask for a reset link by email. The page never learns whether the address has an account. */
+function PasswordReset(props: { signInHref: string }) {
+  const requesting = useSubmission(requestPasswordReset);
+  const sent = () => (requesting.result?.ok ? requesting.result.email : undefined);
+  const failure = () =>
+    requesting.result && !requesting.result.ok ? requesting.result.reason : undefined;
+
+  return (
+    <section aria-labelledby="reset-heading" class="auth-form" data-testid="password-reset">
+      <Title>Reset password · Myelin</Title>
+      <h1 id="reset-heading" class="auth-heading">
+        Reset your password
+      </h1>
+      <p class="auth-sub">We'll email you a link to choose a new one.</p>
+
+      <Show when={failure()} keyed>
+        {(reason) => (
+          <p role="alert" id="reset-error-msg" class="auth-alert" data-testid="reset-error">
+            {resetErrorCopy(reason)}
+          </p>
+        )}
+      </Show>
+      <Show
+        when={sent()}
+        keyed
+        fallback={
+          <form
+            action={requestPasswordReset}
+            method="post"
+            class="auth-fields"
+            data-testid="reset-form"
+          >
+            <label class="auth-field">
+              <span class="auth-label">Email</span>
+              <input
+                name="email"
+                type="email"
+                required
+                autocomplete="username"
+                autocapitalize="off"
+                spellcheck={false}
+                class="auth-input"
+                data-testid="reset-email"
+                aria-invalid={failure() === "invalid_email" ? "true" : undefined}
+                aria-describedby={failure() ? "reset-error-msg" : undefined}
+              />
+            </label>
+            <button
+              type="submit"
+              class="auth-btn auth-btn--primary"
+              data-testid="reset-submit"
+              aria-busy={requesting.pending ? "true" : undefined}
+            >
+              {requesting.pending ? "Sending…" : "Send reset link"}
+            </button>
+          </form>
+        }
+      >
+        {(email) => (
+          <p role="status" class="auth-note" data-testid="reset-sent">
+            If an account exists for <strong>{email}</strong>, a reset link is on its way.
+          </p>
+        )}
+      </Show>
+      <a class="auth-btn" href={props.signInHref} data-testid="reset-back">
+        Back to sign in
+      </a>
+    </section>
   );
 }

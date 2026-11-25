@@ -13,6 +13,8 @@ parameters:
   EDGE_PORT: { type: port, default: 8080 }
   WORKSPACE_SSH_PORT: { type: port, default: 2224 }
   WEB_PORT: { type: port, default: 3000 }
+  MAILPIT_SMTP_PORT: { type: port, default: 1025 }
+  MAILPIT_WEB_PORT: { type: port, default: 8025 }
 
 services:
   postgres:
@@ -107,13 +109,24 @@ services:
       timeout: 30s
     startup_message: "NATS: localhost:{{NATS_PORT}}"
 
+  # Catches every email the edge sends in development; nothing leaves this machine.
+  mailpit:
+    image: axllent/mailpit:v1.34.0@sha256:23a2ef85bc50853ab3093645d1d64679afd8887e89da5e48a88940c172591a4e
+    ports:
+      - "{{MAILPIT_SMTP_PORT}}:1025"
+      - "{{MAILPIT_WEB_PORT}}:8025"
+    healthcheck:
+      command: /mailpit readyz
+      timeout: 30s
+    startup_message: "Mail inbox: http://127.0.0.1:{{MAILPIT_WEB_PORT}}"
+
   data-layer:
     depends_on: [postgres-ready, object-store-ready, valkey, nats]
     migrate: ":"
     startup_message: "Myelin data services are ready"
 
   edge:
-    depends_on: [data-layer]
+    depends_on: [data-layer, mailpit]
     process: >-
       sh -c 'git_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/git";
       agent_workspace_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/agent-workspaces";
@@ -150,6 +163,8 @@ services:
       MYELIN_ISSUES_RECONCILE_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
       MYELIN_AGENT_THREAD_RECOVERY_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
       MYELIN_GIT_MERGE_QUEUE_INTERVAL_MS: "1000"
+      MYELIN_SMTP_URL: "smtp://127.0.0.1:{{MAILPIT_SMTP_PORT}}"
+      MYELIN_MAIL_FROM: "no-reply@myelin.localhost"
     healthcheck:
       http_get: "http://127.0.0.1:{{EDGE_PORT}}/readyz"
       timeout: 120s
@@ -513,6 +528,7 @@ scripts:
       MYELIN_SYSTEM_TEST_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
       MYELIN_SYSTEM_TEST_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
       MYELIN_SYSTEM_TEST_ISSUES_PREFIX: MYL
+      MYELIN_SYSTEM_TEST_MAILPIT_URL: "http://127.0.0.1:{{MAILPIT_WEB_PORT}}"
     script: >-
       sh -c 'set -eu;
       agent_workspace_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/agent-workspaces";
@@ -569,6 +585,7 @@ scripts:
       MYELIN_BROWSER_PRINCIPAL: developer
       MYELIN_BROWSER_REVIEWER_PRINCIPAL: reviewer
       MYELIN_BROWSER_PROJECT_ID: 20aee030-c7fa-4757-8243-700faf528690
+      MYELIN_BROWSER_MAILPIT_URL: "http://127.0.0.1:{{MAILPIT_WEB_PORT}}"
     script: >-
       sh -c 'set -eu;
       browser_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap

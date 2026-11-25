@@ -1,7 +1,8 @@
 import { expect, test, type Page } from "@playwright/test";
 
 // A person's account, start to finish, against the real stack: the operator's first invitation
-// link, a chosen password, an ordinary sign-in, and an invitation for a teammate.
+// link, a chosen password, an ordinary sign-in, an emailed invitation for a teammate, and a
+// forgotten password reset from an emailed link. Mail is read from the stack's Mailpit inbox.
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -11,7 +12,28 @@ function requiredEnvironment(name: string): string {
 
 const inviteUrl = requiredEnvironment("MYELIN_BROWSER_INVITE_URL");
 const inviteEmail = requiredEnvironment("MYELIN_BROWSER_INVITE_EMAIL");
+const mailpit = requiredEnvironment("MYELIN_BROWSER_MAILPIT_URL");
 const password = "a real-stack test password";
+
+/** Waits for the `count`th message to `to` in Mailpit and returns the Myelin link it carries. */
+async function emailedLink(to: string, count = 1): Promise<string> {
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    const query = new URLSearchParams({ query: `to:"${to}"` });
+    const found = await (await fetch(`${mailpit}/api/v1/search?${query}`)).json() as {
+      messages: { ID: string }[];
+    };
+    if (found.messages.length >= count) {
+      // Search lists the newest first.
+      const id = found.messages[found.messages.length - count]!.ID;
+      const message = await (await fetch(`${mailpit}/api/v1/message/${id}`)).json() as { Text: string };
+      const link = /https?:\/\/\S+\/join\/[A-Za-z0-9_-]{43}/.exec(message.Text)?.[0];
+      if (link) return link;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`no message ${count} to ${to} arrived in Mailpit`);
+}
 
 async function signIn(page: Page, email: string, secret: string) {
   await page.goto("/login");
@@ -21,7 +43,7 @@ async function signIn(page: Page, email: string, secret: string) {
   await page.getByTestId("password-login").click();
 }
 
-test("an invited person creates an account, signs in with it, and invites a teammate", async ({
+test("an invited person creates an account, invites a teammate by email, and resets a forgotten password", async ({
   page,
   browser,
 }) => {
@@ -42,7 +64,8 @@ test("an invited person creates an account, signs in with it, and invites a team
   const teammate = inviteEmail.replace("account-", "teammate-");
   await page.getByTestId("invite-email").fill(teammate);
   await page.getByTestId("invite-submit").click();
-  const teammateLink = await page.getByTestId("invite-url").inputValue();
+  await expect(page.getByTestId("invite-sent")).toContainText(`Invitation sent to ${teammate}`);
+  const teammateLink = await emailedLink(teammate);
   await page.getByTestId("invite-email").fill(inviteEmail);
   await page.getByTestId("invite-submit").click();
   await expect(page.getByTestId("invite-error")).toContainText(/already has an account/i);
@@ -69,4 +92,30 @@ test("an invited person creates an account, signs in with it, and invites a team
   await teammatePage.getByTestId("join-submit").click();
   await teammatePage.waitForURL("**/git/repos");
   await other.close();
+
+  // Ada forgets her password and resets it from the emailed link.
+  const forgetful = await browser.newContext();
+  const resetPage = await forgetful.newPage();
+  await resetPage.goto("/login");
+  await resetPage.waitForLoadState("networkidle");
+  await resetPage.getByTestId("forgot-password").click();
+  await resetPage.waitForLoadState("networkidle");
+  await resetPage.getByTestId("reset-email").fill(inviteEmail);
+  await resetPage.getByTestId("reset-submit").click();
+  await expect(resetPage.getByTestId("reset-sent")).toHaveText(
+    `If an account exists for ${inviteEmail}, a reset link is on its way.`,
+  );
+  await resetPage.goto(new URL(await emailedLink(inviteEmail)).pathname);
+  await resetPage.waitForLoadState("networkidle");
+  await expect(resetPage.getByRole("heading", { name: "Choose a new password" })).toBeVisible();
+  await resetPage.getByTestId("join-password").fill("a password from the inbox");
+  await resetPage.getByTestId("join-submit").click();
+  await resetPage.waitForURL("**/git/repos");
+  await forgetful.close();
+
+  await page.context().clearCookies();
+  await signIn(page, inviteEmail, password);
+  await page.waitForURL(/error=credentials/);
+  await signIn(page, inviteEmail, "a password from the inbox");
+  await page.waitForURL("**/git/repos");
 });

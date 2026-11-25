@@ -208,6 +208,11 @@ export MYELIN_GVISOR_RUST_ROOTFS="\${MYELIN_GVISOR_RUST_ROOTFS:-${rust_rootfs}}"
 export MYELIN_GVISOR_GIT_ROOTFS="\${MYELIN_GVISOR_GIT_ROOTFS:-${git_rootfs}}"  # the sandboxed git-wire rootfs (stage-git-rootfs.sh)
 export MYELIN_RUNSC_BIN="\${MYELIN_RUNSC_BIN:-${runsc_bin}}"  # absolute gVisor runtime path; edge startup validates it
 export MYELIN_PUBLIC_BASE_URL="\${MYELIN_PUBLIC_BASE_URL:-http://\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}}"  # advertised clone-URL base (F3)
+# Outbound mail is off until MYELIN_SMTP_URL is set; see docs/runbooks/outbound-email.md. For
+# Scaleway Transactional Email (after verifying the sending domain's SPF and DKIM records):
+#   export MYELIN_SMTP_URL='smtp://smtp.tem.scw.cloud:587?tls=required'
+#   export MYELIN_SMTP_USERNAME='<Scaleway project ID>' MYELIN_SMTP_PASSWORD='<API key secret>'
+#   export MYELIN_MAIL_FROM='Myelin <no-reply@your-verified-domain>'
 EOF
 }
 

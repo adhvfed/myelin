@@ -79,10 +79,13 @@ const state = {
   // the harness's dev-login seam is reachable; a test flips it off to assert the seam disappears.
   devLoginEnabled: true,
   // Accounts and invitation links (see resetAccounts). `loginRateLimited` makes sign-in answer 429.
+  // With `mailDeliveryEnabled`, links are "emailed" into `sentMail` (read at GET /__test/mail).
   accounts: new Map(),
   invitations: new Map(),
   signedInDisplayName: null,
   loginRateLimited: false,
+  mailDeliveryEnabled: true,
+  sentMail: [],
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
@@ -441,8 +444,19 @@ function resetAccounts() {
   ]);
   state.signedInDisplayName = null;
   state.loginRateLimited = false;
+  state.mailDeliveryEnabled = true;
+  state.sentMail = [];
 }
 resetAccounts();
+
+const WEB_ORIGIN = `http://localhost:${process.env.PORT ?? 3000}`;
+
+/** Stores a fresh link and returns its URL. */
+function newInvitation(kind, email) {
+  const code = `e2e-${kind}-link-${String(state.invitations.size).padStart(20, "0")}`;
+  state.invitations.set(code, { kind, email });
+  return `${WEB_ORIGIN}/join/${code}`;
+}
 
 function sessionGrant() {
   return {
@@ -482,6 +496,16 @@ async function handleAccountRoute(req, res, method, path) {
     if (!account || account.password !== body.password) return send(res, 401, { error: { message: "login failed" } }), true;
     state.signedInDisplayName = account.displayName;
     return send(res, 200, sessionGrant()), true;
+  }
+  if (method === "POST" && path === "/v1/auth/password/forgot") {
+    if (!state.mailDeliveryEnabled) return send(res, 503, { error: { message: "not configured" } }), true;
+    const body = await readJson(req);
+    if (!exactKeys(body, ["email"])) return send(res, 400, { error: { message: "bad request" } }), true;
+    const email = body.email.trim().toLowerCase();
+    if (state.accounts.has(email)) {
+      state.sentMail.push({ to: email, kind: "reset", url: newInvitation("reset", email) });
+    }
+    return send(res, 202, { status: "accepted" }), true;
   }
   const match = /^\/v1\/auth\/invitations\/([A-Za-z0-9_-]+)(\/accept)?$/.exec(path);
   if (!match) return false;
@@ -534,6 +558,7 @@ const server = createServer((req, res) => {
       providers: [],
       dev_login_enabled: state.devLoginEnabled,
       password_login_enabled: true,
+      mail_delivery_enabled: state.mailDeliveryEnabled,
     });
   }
 
@@ -543,6 +568,9 @@ const server = createServer((req, res) => {
     });
     return;
   }
+
+  // The mail the double has "sent", oldest first (dev double ONLY).
+  if (method === "GET" && path === "/__test/mail") return send(res, 200, { mail: state.sentMail });
 
   // Test-control seam (dev double ONLY — never a real edge route). Flips the fixture's first-run
   // posture so a single harness can exercise empty-tenant + dev-seam-off.
@@ -572,6 +600,7 @@ const server = createServer((req, res) => {
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (body.resetAccounts === true) resetAccounts();
         if (typeof body.loginRateLimited === "boolean") state.loginRateLimited = body.loginRateLimited;
+        if (typeof body.mailDeliveryEnabled === "boolean") state.mailDeliveryEnabled = body.mailDeliveryEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
         if (typeof body.whoamiUnavailable === "boolean") {
           state.whoamiUnavailable = body.whoamiUnavailable;
@@ -1620,13 +1649,13 @@ const server = createServer((req, res) => {
       }
       const email = body.email.trim().toLowerCase();
       if (state.accounts.has(email)) return send(res, 409, { error: { message: "exists" } });
-      const code = `e2e-member-invitation-${String(state.invitations.size).padStart(10, "0")}`;
-      state.invitations.set(code, { kind: "join", email });
-      send(res, 201, {
-        url: `http://localhost:${process.env.PORT ?? 3000}/join/${code}`,
-        email,
-        expires_at: Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60,
-      });
+      const url = newInvitation("join", email);
+      const expires_at = Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60;
+      if (state.mailDeliveryEnabled) {
+        state.sentMail.push({ to: email, kind: "join", url });
+        return send(res, 201, { delivery: "email", email, expires_at });
+      }
+      send(res, 201, { delivery: "link", url, email, expires_at });
     });
     return;
   }

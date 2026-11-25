@@ -38,11 +38,10 @@ export interface EdgeInvitation {
   expiresAt: number;
 }
 
-export interface EdgeCreatedInvitation {
-  url: string;
-  email: string;
-  expiresAt: number;
-}
+/** A teammate's invitation: emailed to them, or (with mail off) a link to pass on by hand. */
+export type EdgeCreatedInvitation =
+  | { delivery: "email"; email: string; expiresAt: number }
+  | { delivery: "link"; url: string; email: string; expiresAt: number };
 
 /** Invitation codes travel in a URL path; anything outside this alphabet is not one of ours. */
 export function validInvitationCode(value: unknown): value is string {
@@ -157,7 +156,16 @@ export async function edgeAcceptInvitation(
   throw new AccountError("unavailable");
 }
 
-/** Create an invitation link for a teammate, as the signed-in member. */
+/** Ask for a reset link by email. The edge answers alike for every address, so this only fails
+ * when the request could not be made. */
+export async function edgeForgotPassword(email: string): Promise<void> {
+  const { status } = await publicRequest("POST", "/v1/auth/password/forgot", { email });
+  if (status === 202) return;
+  if (status === 429) throw new AccountError("rate_limited");
+  throw new AccountError("unavailable");
+}
+
+/** Invite a teammate, as the signed-in member. */
 export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedInvitation> {
   let json: unknown;
   try {
@@ -173,11 +181,19 @@ export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedIn
   }
   const created = record(json);
   if (
-    !created || typeof created.url !== "string" || !/^https?:\/\//.test(created.url) ||
-    created.url.length > 2_048 || typeof created.email !== "string" ||
+    !created || typeof created.email !== "string" || created.email.length > 320 ||
     !futureSeconds(created.expires_at)
   ) {
     throw new AccountError("unavailable");
   }
-  return { url: created.url, email: created.email, expiresAt: created.expires_at };
+  if (created.delivery === "email") {
+    return { delivery: "email", email: created.email, expiresAt: created.expires_at };
+  }
+  if (
+    created.delivery !== "link" || typeof created.url !== "string" ||
+    !/^https?:\/\//.test(created.url) || created.url.length > 2_048
+  ) {
+    throw new AccountError("unavailable");
+  }
+  return { delivery: "link", url: created.url, email: created.email, expiresAt: created.expires_at };
 }

@@ -512,6 +512,7 @@ enum PublicEndpoint {
     AuthConfig,
     Login,
     PasswordLogin,
+    ForgotPassword,
     Invitation(String),
     AcceptInvitation(String),
     BeginDeviceAuthorization,
@@ -679,6 +680,9 @@ impl Gateway {
             (Method::Post, "/v1/auth/password/login") => {
                 return Ok(PreparedKind::Public(PublicEndpoint::PasswordLogin))
             }
+            (Method::Post, "/v1/auth/password/forgot") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::ForgotPassword))
+            }
             (Method::Post, "/v1/auth/device/authorization") => {
                 return Ok(PreparedKind::Public(
                     PublicEndpoint::BeginDeviceAuthorization,
@@ -781,6 +785,9 @@ impl Gateway {
                     req,
                     &|principal| self.mint_password_session(principal),
                 )),
+                PublicEndpoint::ForgotPassword => {
+                    Ok(crate::accounts::http::forgot(self.accounts.as_ref(), req))
+                }
                 PublicEndpoint::Invitation(code) => Ok(crate::accounts::http::invitation(
                     self.accounts.as_ref(),
                     code,
@@ -959,6 +966,10 @@ impl Gateway {
                 "dev_login_enabled": self.auth_config.dev_login_enabled,
                 "cli_login_enabled": self.device_authorization.is_some(),
                 "password_login_enabled": self.accounts.is_some(),
+                "mail_delivery_enabled": self
+                    .accounts
+                    .as_ref()
+                    .is_some_and(AccountService::mail_enabled),
             }),
         )
     }

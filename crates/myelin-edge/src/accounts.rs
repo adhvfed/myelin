@@ -15,14 +15,17 @@ use sqlx::PgPool;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tokio::sync::Semaphore;
+
+use crate::mail::{Letter, MailOutbox};
 
 pub use credentials::EmailDigester;
 use credentials::{DummyHash, Email, InvitationCode, Password, WeakPassword};
 pub use store::account_migrations;
 pub(crate) use store::InvitationKind;
 use store::{
-    AcceptOutcome, AccountRow, AccountStore, Invitation, IssueOutcome, IssueRule, NewInvitation,
-    Reservation,
+    AcceptOutcome, AccountRow, AccountStore, Invitation, IssueOutcome, IssueRule, LinkLetter,
+    LinkMail, NewInvitation, Reservation,
 };
 
 pub const JOIN_INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -50,6 +53,15 @@ const INVITES_PER_MEMBER: Limit = Limit {
     hits: 50,
     window_secs: 60 * 60,
 };
+/// Emailed reset links per address, so the form cannot be used to flood someone's inbox.
+/// Requests past it are dropped without a word.
+const RESET_REQUESTS_PER_EMAIL: Limit = Limit {
+    name: "password.reset_request",
+    hits: 3,
+    window_secs: 60 * 60,
+};
+/// Reset requests being worked on at once. Past it a request is dropped, as when throttled.
+const RESET_REQUESTS_IN_FLIGHT: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountError {
@@ -132,6 +144,14 @@ pub struct IssuedInvitation {
     pub expires_at_unix: i64,
 }
 
+/// A member's invitation: emailed to the invitee when mail is on, otherwise handed to the
+/// inviter to pass on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberInvitation {
+    Emailed { email: String, expires_at_unix: i64 },
+    HandedOver(IssuedInvitation),
+}
+
 /// What the person sends to accept a link. A join needs their name; a reset does not.
 pub struct Acceptance {
     pub display_name: Option<String>,
@@ -185,6 +205,8 @@ pub struct AccountService {
     principals: PrincipalStore,
     digester: EmailDigester,
     links: LinkOrigin,
+    mail: Option<MailOutbox>,
+    reset_requests: Arc<Semaphore>,
     region: String,
     runtime: Handle,
     hashing: Arc<HashGate>,
@@ -211,6 +233,8 @@ impl AccountService {
             principals,
             digester,
             links: LinkOrigin::from_config(web_origin),
+            mail: None,
+            reset_requests: Arc::new(Semaphore::new(RESET_REQUESTS_IN_FLIGHT)),
             region: region.into(),
             runtime,
             hashing: Arc::new(HashGate::sized_for_host()),
@@ -220,6 +244,17 @@ impl AccountService {
             #[cfg(any(test, feature = "test-support"))]
             checkpoint: None,
         }
+    }
+
+    /// Mail on: members' invitations and reset links are emailed, and a changed password is
+    /// reported to its owner.
+    pub fn with_mail(mut self, outbox: MailOutbox) -> Self {
+        self.mail = Some(outbox);
+        self
+    }
+
+    pub fn mail_enabled(&self) -> bool {
+        self.mail.is_some()
     }
 
     /// The clock for rate-limit windows. Link expiry always follows the database clock.
@@ -519,10 +554,17 @@ impl AccountService {
         }
         let password = Password::new(acceptance.password)?;
         let password_phc = self.hashing(|| password.hash())?;
+        let notice = self.mail.as_ref().map(|outbox| {
+            let letter = Letter::PasswordChanged {
+                to: live.email.as_str().to_string(),
+                sign_in: self.sign_in_help(),
+            };
+            (outbox.clone(), letter)
+        });
         let outcome = self.block(async {
             Ok(self
                 .store
-                .accept_reset(&live.code.digest(), &live.invitation, password_phc)
+                .accept_reset(&live.code.digest(), &live.invitation, password_phc, notice)
                 .await?)
         })?;
         self.signed_in_after(&live.invitation, outcome)
@@ -548,7 +590,7 @@ impl AccountService {
         &self,
         inviter: &Principal,
         email: &str,
-    ) -> Result<IssuedInvitation, AccountError> {
+    ) -> Result<MemberInvitation, AccountError> {
         self.block(async {
             let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
             let mut inviter_key = inviter.tenant.0.as_bytes().to_vec();
@@ -559,15 +601,107 @@ impl AccountService {
             // Only an account in the inviter's own organization is reported, so a member cannot
             // probe which addresses have accounts elsewhere in the cell. An address taken in
             // another organization gets a link that fails when it is accepted.
-            self.issue(
-                IssueRule::MemberJoin,
-                &inviter.tenant.0,
-                &inviter.region.0,
-                email,
-                JOIN_INVITATION_TTL_SECS,
-            )
-            .await
+            let tenant = &inviter.tenant.0;
+            let Some(outbox) = &self.mail else {
+                return self
+                    .issue(
+                        IssueRule::MemberJoin,
+                        tenant,
+                        &inviter.region.0,
+                        email,
+                        JOIN_INVITATION_TTL_SECS,
+                        None,
+                    )
+                    .await
+                    .map(MemberInvitation::HandedOver);
+            };
+            // Mailed, the link goes only to the invitee, so opening it proves they hold the
+            // address.
+            let organization = self.store.organization_name(tenant).await?;
+            let issued = self
+                .issue(
+                    IssueRule::MemberJoin,
+                    tenant,
+                    &inviter.region.0,
+                    email,
+                    JOIN_INVITATION_TTL_SECS,
+                    Some((outbox, LinkLetter::Invitation { organization })),
+                )
+                .await?;
+            Ok(MemberInvitation::Emailed {
+                email: issued.email,
+                expires_at_unix: issued.expires_at_unix,
+            })
         })
+    }
+
+    /// `POST /v1/auth/password/forgot`. The caller always gets the same answer at once; the work
+    /// happens afterwards, so neither the answer nor its timing says whether the email has an
+    /// account.
+    pub fn forgot_password(&self, email: &str) {
+        let Ok(permit) = self.reset_requests.clone().try_acquire_owned() else {
+            return;
+        };
+        let service = self.clone();
+        let email = email.to_string();
+        self.runtime.spawn_blocking(move || {
+            let _permit = permit;
+            if let Err(error) = service.request_password_reset(&email) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "edge.accounts.reset_request_failed",
+                        "error": error.to_string(),
+                    })
+                );
+            }
+        });
+    }
+
+    /// Emails a reset link when the address belongs to an active person and its hourly allowance
+    /// is not used up; otherwise does nothing. Says nothing about which happened.
+    pub fn request_password_reset(&self, email: &str) -> Result<(), AccountError> {
+        let (Some(outbox), Some(email)) = (&self.mail, Email::parse(email)) else {
+            return Ok(());
+        };
+        let digest = self.digester.digest(&email);
+        let account = self.block(async {
+            let bucket = Self::bucket(&RESET_REQUESTS_PER_EMAIL, &digest);
+            match self.reserve(&RESET_REQUESTS_PER_EMAIL, bucket).await {
+                Ok(()) => Ok(self.store.account(&digest).await?),
+                Err(AccountError::RateLimited { .. }) => Ok(None),
+                Err(error) => Err(error),
+            }
+        })?;
+        let Some(account) = account else {
+            return Ok(());
+        };
+        if self
+            .active_human(&account.tenant, &account.region, &account.principal_id)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let issued = self.block(self.issue(
+            IssueRule::Reset,
+            &account.tenant,
+            &account.region,
+            email,
+            RESET_INVITATION_TTL_SECS,
+            Some((outbox, LinkLetter::PasswordReset)),
+        ));
+        match issued {
+            Ok(_) | Err(AccountError::NoSuchAccount) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Where a person who did not change their own password goes next.
+    fn sign_in_help(&self) -> Option<String> {
+        match &self.links {
+            LinkOrigin::Ready(origin) => Some(format!("{origin}/login?help=password")),
+            LinkOrigin::Unset | LinkOrigin::Refused(_) => None,
+        }
     }
 
     /// The operator's join link, for the first person in an organization or anyone after.
@@ -584,6 +718,7 @@ impl AccountService {
             &self.region,
             email,
             ttl_secs.unwrap_or(JOIN_INVITATION_TTL_SECS),
+            None,
         )
         .await
     }
@@ -602,6 +737,7 @@ impl AccountService {
             &self.region,
             email,
             ttl_secs.unwrap_or(RESET_INVITATION_TTL_SECS),
+            None,
         )
         .await
     }
@@ -623,6 +759,8 @@ impl AccountService {
         }
     }
 
+    /// Stores a new link. With `mail`, the letter it writes for the link is queued in the same
+    /// transaction, so the link exists only if its mail does.
     async fn issue(
         &self,
         rule: IssueRule,
@@ -630,6 +768,7 @@ impl AccountService {
         region: &str,
         email: Email,
         ttl_secs: i64,
+        mail: Option<(&MailOutbox, LinkLetter)>,
     ) -> Result<IssuedInvitation, AccountError> {
         let origin = self.link_origin()?;
         if tenant.trim().is_empty() || region.trim().is_empty() {
@@ -647,9 +786,20 @@ impl AccountService {
             email: code.seal_email(&email),
             ttl_secs: ttl_secs.clamp(60, MAX_INVITATION_TTL_SECS),
         };
-        match self.store.issue(&code.digest(), rule, &link).await? {
+        let url = format!("{origin}/join/{}", code.encoded());
+        let mail = mail.map(|(outbox, letter)| LinkMail {
+            outbox: outbox.clone(),
+            letter,
+            to: email.as_str().to_string(),
+            url: url.clone(),
+        });
+        match self
+            .store
+            .issue(&code.digest(), rule, &link, mail.as_ref())
+            .await?
+        {
             IssueOutcome::Issued { expires_at_unix } => Ok(IssuedInvitation {
-                url: format!("{origin}/join/{}", code.encoded()),
+                url,
                 email: email.as_str().to_string(),
                 expires_at_unix,
             }),

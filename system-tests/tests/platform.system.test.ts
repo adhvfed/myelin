@@ -32,6 +32,7 @@ describe("running edge platform", () => {
       dev_login_enabled: true,
       cli_login_enabled: true,
       password_login_enabled: true,
+      mail_delivery_enabled: true,
     });
     expect(response.headers.get("cache-control")).toContain("no-store");
   });

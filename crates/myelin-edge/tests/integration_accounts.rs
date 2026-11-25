@@ -4,7 +4,7 @@
 //! link supersedes an older one, expiry is enforced, and removing a person removes their sign-in.
 
 use myelin_config::{Mode, MyelinConfig};
-use myelin_edge::accounts::{Acceptance, Checkpoint};
+use myelin_edge::accounts::{Acceptance, Checkpoint, MemberInvitation};
 use myelin_edge::{account_migrations, AccountError, AccountService, EmailDigester};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::PrincipalStore;
@@ -27,6 +27,14 @@ fn unique(prefix: &str) -> String {
             .unwrap()
             .as_nanos()
     )
+}
+
+/// With mail off, a member's invitation link comes back to the inviter.
+fn handed_over(invitation: MemberInvitation) -> String {
+    match invitation {
+        MemberInvitation::HandedOver(issued) => issued.url,
+        MemberInvitation::Emailed { .. } => panic!("mail is off, so the link is handed over"),
+    }
 }
 
 fn code_of(url: &str) -> String {
@@ -395,8 +403,8 @@ async fn two_people_racing_for_one_link_produce_exactly_one_account() {
                     .with_tenant(&other_tenant),
                 &email,
             )
-            .expect("another organization may still send a link")
-            .url,
+            .map(handed_over)
+            .expect("another organization may still send a link"),
     );
     assert_eq!(
         cell.accounts
@@ -734,11 +742,10 @@ async fn links_are_made_only_for_an_https_or_loopback_origin() {
     );
 
     let loopback = cell.service(Some("http://127.0.0.1:3000"));
-    assert!(loopback
-        .invite_member(&member, &invitee)
-        .unwrap()
-        .url
-        .starts_with("http://127.0.0.1:3000/join/"));
+    assert!(
+        handed_over(loopback.invite_member(&member, &invitee).unwrap())
+            .starts_with("http://127.0.0.1:3000/join/")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

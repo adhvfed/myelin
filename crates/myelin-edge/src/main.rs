@@ -11,6 +11,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_agent_service::workspace::{AgentWorkspaceStore, LocalDevelopmentWorkspaceProvisioner};
 use myelin_agent_service::workspace_execution::AgentWorkspaceExecutor;
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
+use myelin_edge::mail::DeliverySchedule;
 use myelin_edge::{
     account_migrations, bootstrap_principal_and_mint, execute_secret_command,
     merge_queue_interval_from_env, recover_placed_git_at_boot, register_agent_mcp,
@@ -24,9 +25,10 @@ use myelin_edge::{
     DeviceAuthorizationBroker, DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess,
     DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiApi,
     DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, EmailDigester, Gateway,
-    GitDatabaseProviders, InviteHandler, IssueReconciliationConfig, Method, ReadinessCheck,
-    ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome,
-    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
+    GitDatabaseProviders, InviteHandler, IssueReconciliationConfig, MailOutbox, MailSettings,
+    MailWorker, Method, ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError,
+    SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    WorkspaceSshEndpoint,
 };
 use myelin_events::OutboxStore;
 use myelin_identity::{
@@ -295,6 +297,7 @@ struct ComposedCore {
     cell: Arc<CellTokenAuthority>,
     ci_surface_cursor_key: zeroize::Zeroizing<[u8; 32]>,
     email_digest_key: zeroize::Zeroizing<[u8; 32]>,
+    mail_outbox_key: zeroize::Zeroizing<[u8; 32]>,
     workspace_ssh_host: WorkspaceSshHostIdentity,
     workspace_ssh_routes: WorkspaceSshRouteKey,
     cell_id: String,
@@ -830,6 +833,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
     let ci_surface_cursor_key =
         seal_key.derive_service_key("myelin 2026-07-24 ci run surface cursor v1");
     let email_digest_key = seal_key.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT);
+    let mail_outbox_key = seal_key.derive_service_key(MailOutbox::SEAL_KEY_CONTEXT);
     let workspace_ssh_host = WorkspaceSshHostIdentity::from_seal_key(&seal_key);
     let workspace_ssh_routes = WorkspaceSshRouteKey::from_seal_key(&seal_key);
     let kms_backing = DurableKmsBacking::new(provider.db_pool().clone(), cell_id.clone());
@@ -865,6 +869,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         cell,
         ci_surface_cursor_key,
         email_digest_key,
+        mail_outbox_key,
         workspace_ssh_host,
         workspace_ssh_routes,
         cell_id,
@@ -993,13 +998,50 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         eprintln!("edge: invalid web app origin: {error}");
         std::process::exit(1);
     });
-    let accounts = core.accounts(web_origin.clone());
+    let mail_settings = MailSettings::from_env().unwrap_or_else(|error| {
+        eprintln!("edge: refused to start: {error}");
+        std::process::exit(1);
+    });
+    let mut accounts = core.accounts(web_origin.clone());
+    let mail_worker = match mail_settings {
+        Some(_) if web_origin.is_none() => {
+            eprintln!(
+                "edge: refused to start: mail carries links to the web app, so MYELIN_SMTP_URL \
+                 needs MYELIN_WEB_PUBLIC_URL"
+            );
+            std::process::exit(1);
+        }
+        Some(settings) => {
+            let outbox = MailOutbox::new(core.cell_id.clone(), core.mail_outbox_key.clone());
+            accounts = accounts.with_mail(outbox.clone());
+            let worker = MailWorker::new(
+                core.provider.db_pool().clone(),
+                outbox,
+                &settings,
+                DeliverySchedule::default(),
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("edge: mail delivery refused to start: {error}");
+                std::process::exit(1);
+            });
+            eprintln!("edge: mail delivery on ({settings:?})");
+            Some(worker.spawn())
+        }
+        None => {
+            eprintln!(
+                "edge: mail delivery off - MYELIN_SMTP_URL is not set; invitation links go to \
+                 the inviter"
+            );
+            None
+        }
+    };
     let ComposedCore {
         provider,
         kms,
         cell,
         ci_surface_cursor_key,
         email_digest_key: _,
+        mail_outbox_key: _,
         workspace_ssh_host,
         workspace_ssh_routes,
         cell_id,
@@ -1570,6 +1612,12 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
     if let Err(e) = agent_thread_recovery.shutdown().await {
         eprintln!("edge: agent thread recovery did not drain cleanly: {e}");
         std::process::exit(1);
+    }
+    if let Some(mail_worker) = mail_worker {
+        if let Err(e) = mail_worker.shutdown().await {
+            eprintln!("edge: {e}");
+            std::process::exit(1);
+        }
     }
     if let Err(e) = server_result {
         eprintln!("edge: {e}");

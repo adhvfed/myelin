@@ -4,6 +4,7 @@ import { describe, expect, test } from "vitest";
 
 import { systemClient } from "../src/context.js";
 import { integer, record, string, type JsonRecord } from "../src/json.js";
+import { linkIn, mailSoFar, mailTo } from "../src/mailpit.js";
 import { failedOperatorLink, operatorLink } from "../src/operator.js";
 import { systemTestConfig } from "../src/config.js";
 import type { SystemResponse } from "../src/client.js";
@@ -47,7 +48,7 @@ async function whoami(token: string): Promise<JsonRecord> {
 describe("a person's account", () => {
   test("is created from an invitation, signs in with a password, invites a teammate, and is reset by the operator", async () => {
     const config = await systemClient.json("/v1/auth/config", anonymous);
-    expect(config.body).toMatchObject({ password_login_enabled: true });
+    expect(config.body).toMatchObject({ password_login_enabled: true, mail_delivery_enabled: true });
     expect(config.body).not.toHaveProperty("token_login_enabled");
 
     // The operator invites the organization's first person.
@@ -143,9 +144,14 @@ describe("a person's account", () => {
       body: { email: graceEmail },
       expectedStatus: 201,
     });
-    expect(invited.body).toMatchObject({ email: graceEmail });
+    expect(invited.body).toMatchObject({ delivery: "email", email: graceEmail });
+    expect(invited.body).not.toHaveProperty("url");
     integer(invited.body.expires_at, "teammate invitation expiry");
-    const graceCode = codeOf(string(invited.body.url, "teammate invitation link"));
+    // The link goes only to Grace's inbox, so opening it shows she holds the address.
+    const [invitationMail] = await mailTo(graceEmail);
+    expect(invitationMail!.subject).toBe(`Join ${string(invitation.body.organization, "organization")} on Myelin`);
+    expect(invitationMail!.html).not.toMatch(/<img/i);
+    const graceCode = codeOf(linkIn(invitationMail!));
 
     const graceInvitation = await systemClient.json(`/v1/auth/invitations/${graceCode}`, anonymous);
     expect(graceInvitation.body).toMatchObject({
@@ -218,6 +224,64 @@ describe("a person's account", () => {
     expect(record(unknown.body.error, "unknown invitation error")).toMatchObject({
       code: "not_found",
     });
+  });
+
+  test("forgets a password, resets it from the emailed link, and is told it changed", async () => {
+    const email = uniqueEmail("lamarr");
+    const code = codeOf(await operatorLink("invite", email));
+    await systemClient.json(`/v1/auth/invitations/${code}/accept`, {
+      method: "POST",
+      ...anonymous,
+      body: { display_name: "Hedy Lamarr", password: "frequency hopping" },
+    });
+
+    // Every address gets the same answer, whether or not it has an account.
+    const forgot = (address: string) =>
+      systemClient.json("/v1/auth/password/forgot", {
+        method: "POST",
+        ...anonymous,
+        body: { email: address },
+        expectedStatus: 202,
+      });
+    const nobody = uniqueEmail("nobody");
+    const unknown = await forgot(nobody);
+    const known = await forgot(` ${email.toUpperCase()} `);
+    expect(known.body).toEqual(unknown.body);
+    expect(known.body).toEqual({ status: "accepted" });
+    expectNoStore(known);
+
+    const [resetMail] = await mailTo(email);
+    expect(resetMail!.subject).toBe("Reset your Myelin password");
+    const resetLink = linkIn(resetMail!);
+    expect(resetMail!.text).toMatch(/expires on \d{1,2} \w+ \d{4} at \d{2}:\d{2} UTC/);
+    const resetCode = codeOf(resetLink);
+    const reset = await systemClient.json(`/v1/auth/invitations/${resetCode}`, anonymous);
+    expect(reset.body).toMatchObject({ kind: "reset", email });
+    const session = expectSession(
+      await systemClient.json(`/v1/auth/invitations/${resetCode}/accept`, {
+        method: "POST",
+        ...anonymous,
+        body: { password: "spread spectrum" },
+      }),
+    );
+    expect(await whoami(session)).toMatchObject({ email, display_name: "Hedy Lamarr" });
+    await signIn(email, "frequency hopping", 401);
+    expectSession(await signIn(email, "spread spectrum"));
+
+    const [, notice] = await mailTo(email, 2);
+    expect(notice!.subject).toBe("Your Myelin password was changed");
+    expect(notice!.text).toContain(email);
+    expect(await mailSoFar(nobody)).toEqual([]);
+
+    // Three reset mails an hour reach one address; further requests are dropped unseen.
+    for (const expected of [3, 4]) {
+      await forgot(email);
+      await mailTo(email, expected);
+    }
+    const dropped = await forgot(email);
+    expect(dropped.body).toEqual(unknown.body);
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+    expect(await mailSoFar(email)).toHaveLength(4);
   });
 
   test("links are never echoed back and oversized sign-in bodies are refused", async () => {

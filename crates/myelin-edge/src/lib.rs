@@ -34,6 +34,7 @@ pub mod issue_effect;
 pub mod issues_http;
 pub mod knowledge_effect;
 pub mod knowledge_http;
+pub mod mail;
 pub mod mcp_read;
 pub mod notif_http;
 pub mod privacy_http;
@@ -130,6 +131,7 @@ pub use knowledge_http::{
     register_knowledge, DurableKnowledgeMutationApi, DurableKnowledgeReadApi,
     KnowledgeCreateOutcome, KnowledgeCreateRequest, KnowledgeLinkOutcome, KnowledgeLinkRequest,
 };
+pub use mail::{MailOutbox, MailSettings, MailWorker};
 pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use privacy_http::register_privacy;

@@ -1,9 +1,9 @@
 import { Icon, useToast, type IconName } from "@myelin/design-system";
 import { Title } from "@solidjs/meta";
-import { useAction, useSubmission } from "@solidjs/router";
+import { createAsync, useAction, useSubmission } from "@solidjs/router";
 import { createSignal, For, onMount, Show, type JSX } from "solid-js";
 import { useAppViewer } from "~/components/AppShell";
-import { createInvitation, logout } from "~/lib/auth";
+import { createInvitation, getAuthConfig, logout } from "~/lib/auth";
 import { applyTheme, restoreTheme, THEMES, type Theme } from "~/lib/theme";
 
 const THEME_COPY: Record<Theme, { label: string; copy: string }> = {
@@ -47,9 +47,14 @@ const INVITE_ERRORS: Record<string, string> = {
   rate_limited: "Too many invitations just now. Wait a minute, then try again.",
 };
 
-/** Make an invitation link for a teammate. There is no mail server, so the link is copied by hand. */
+const untilDate = (unix: number) =>
+  new Date(unix * 1_000).toLocaleDateString(undefined, { day: "numeric", month: "long" });
+
+/** Invite a teammate. With mail on Myelin emails them the link; otherwise it is copied by hand. */
 function InviteCard() {
   const inviting = useSubmission(createInvitation);
+  const config = createAsync(() => getAuthConfig());
+  const emailed = () => config()?.mail_delivery_enabled === true;
   const toast = useToast();
   const copy = async (url: string) => {
     try {
@@ -60,7 +65,13 @@ function InviteCard() {
     }
   };
   return (
-    <ProfileCard icon="team" title="Invite a teammate" copy="Create a link that lets one person join your organization. Send it to them yourself; Myelin doesn't email it.">
+    <ProfileCard
+      icon="team"
+      title="Invite a teammate"
+      copy={emailed()
+        ? "Myelin emails one person a link to join your organization."
+        : "Create a link that lets one person join your organization. Send it to them yourself; Myelin doesn't email it."}
+    >
       <form action={createInvitation} method="post" class="profile-invite-form">
         <div>
           <label>
@@ -68,7 +79,7 @@ function InviteCard() {
             <input name="email" type="email" required autocomplete="off" data-testid="invite-email" />
           </label>
           <button type="submit" data-testid="invite-submit" aria-busy={inviting.pending ? "true" : undefined}>
-            {inviting.pending ? "Creating…" : "Create link"}
+            {inviting.pending ? (emailed() ? "Sending…" : "Creating…") : emailed() ? "Send invitation" : "Create link"}
           </button>
         </div>
       </form>
@@ -85,11 +96,21 @@ function InviteCard() {
           >
             {(created) => (
               <div role="status" class="profile-invite-result" data-testid="invite-result">
-                <p>Link for <strong>{created.email}</strong>. It works once, until {new Date(created.expiresAt * 1_000).toLocaleDateString(undefined, { day: "numeric", month: "long" })}.</p>
-                <div>
-                  <input readonly aria-label="Invitation link" value={created.url} data-testid="invite-url" onFocus={(event) => event.currentTarget.select()} />
-                  <button type="button" onClick={() => void copy(created.url)}>Copy</button>
-                </div>
+                <Show
+                  when={created.delivery === "link" ? created : undefined}
+                  keyed
+                  fallback={<p data-testid="invite-sent">Invitation sent to <strong>{created.email}</strong>. The link in it works once, until {untilDate(created.expiresAt)}.</p>}
+                >
+                  {(link) => (
+                    <>
+                      <p>Link for <strong>{link.email}</strong>. It works once, until {untilDate(link.expiresAt)}.</p>
+                      <div>
+                        <input readonly aria-label="Invitation link" value={link.url} data-testid="invite-url" onFocus={(event) => event.currentTarget.select()} />
+                        <button type="button" onClick={() => void copy(link.url)}>Copy</button>
+                      </div>
+                    </>
+                  )}
+                </Show>
               </div>
             )}
           </Show>

@@ -15,6 +15,8 @@ export interface AuthConfig {
   dev_login_enabled: boolean;
   /** Whether the edge accepts email + password sign-in. False when config is unavailable. */
   password_login_enabled: boolean;
+  /** Whether the edge emails invitation and reset links; otherwise people pass links on by hand. */
+  mail_delivery_enabled: boolean;
 }
 
 /** The edge's raw `/v1/auth/config` response. */
@@ -23,12 +25,14 @@ export interface EdgeAuthConfig {
   providers?: AuthProvider[];
   dev_login_enabled?: boolean;
   password_login_enabled?: boolean;
+  mail_delivery_enabled?: boolean;
 }
 
 /**
  * Map the edge's raw config to the login page's render source.
  * Development login requires the edge flag, frontend environment, and a non-production build.
- * Password sign-in depends only on the edge flag. Missing values default to false.
+ * Password sign-in depends only on the edge flag, and mail delivery only matters with it. Missing
+ * values default to false.
  */
 export function toAuthConfig(
   edge: unknown,
@@ -45,6 +49,7 @@ export function toAuthConfig(
     providers: ssoConfigured ? validProviders(raw.providers) : [],
     dev_login_enabled: devSeamAllowed(raw.dev_login_enabled === true, env, isProdBuild),
     password_login_enabled: raw.password_login_enabled === true,
+    mail_delivery_enabled: raw.password_login_enabled === true && raw.mail_delivery_enabled === true,
   };
 }
 
