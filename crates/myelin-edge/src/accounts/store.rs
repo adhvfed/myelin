@@ -282,9 +282,16 @@ fn settle(result: Result<String, Abort>) -> Result<AcceptOutcome, StoreError> {
     }
 }
 
+/// One hit taken in one window of a counter. Giving it back touches only that window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Slot {
+    pub bucket: [u8; 32],
+    window_ends_at_unix: i64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reservation {
-    Taken,
+    Taken(Slot),
     Full { retry_after_secs: u64 },
 }
 
@@ -352,7 +359,7 @@ impl AccountStore {
                                           THEN EXCLUDED.window_ends_at_unix \
                                           ELSE auth_rate_limit.window_ends_at_unix END \
              WHERE auth_rate_limit.window_ends_at_unix <= $3 OR auth_rate_limit.hits < $4 \
-             RETURNING hits",
+             RETURNING window_ends_at_unix",
         )
         .bind(bucket.as_slice())
         .bind(now_unix.saturating_add(window_secs))
@@ -361,8 +368,11 @@ impl AccountStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(StoreError::database)?;
-        if taken.is_some() {
-            return Ok(Reservation::Taken);
+        if let Some(window_ends_at_unix) = taken {
+            return Ok(Reservation::Taken(Slot {
+                bucket,
+                window_ends_at_unix,
+            }));
         }
         let window_ends_at_unix: Option<i64> = sqlx::query_scalar(
             "SELECT window_ends_at_unix FROM auth_rate_limit \
@@ -380,21 +390,18 @@ impl AccountStore {
         })
     }
 
-    /// Gives back one slot taken by `reserve_hit` in a window that is still open. The row is
+    /// Gives back a slot taken by `reserve_hit`, if its window is still the counter's: a window
+    /// that has since been replaced holds other people's hits, so it is left alone. The row is
     /// locked while it is read, so concurrent gives-back each remove exactly one hit; a single
     /// conditional statement would judge them all against the same stale count.
-    pub(crate) async fn release_hit(
-        &self,
-        bucket: [u8; 32],
-        now_unix: i64,
-    ) -> Result<(), StoreError> {
+    pub(crate) async fn release_hit(&self, slot: Slot) -> Result<(), StoreError> {
         let mut transaction = self.pool.begin().await.map_err(StoreError::database)?;
         let hits: Option<i64> = sqlx::query_scalar(
             "SELECT hits FROM auth_rate_limit \
-              WHERE bucket = $1 AND window_ends_at_unix > $2 FOR UPDATE",
+              WHERE bucket = $1 AND window_ends_at_unix = $2 FOR UPDATE",
         )
-        .bind(bucket.as_slice())
-        .bind(now_unix)
+        .bind(slot.bucket.as_slice())
+        .bind(slot.window_ends_at_unix)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
@@ -405,7 +412,7 @@ impl AccountStore {
             Some(_) => "UPDATE auth_rate_limit SET hits = hits - 1 WHERE bucket = $1",
         };
         sqlx::query(statement)
-            .bind(bucket.as_slice())
+            .bind(slot.bucket.as_slice())
             .execute(&mut *transaction)
             .await
             .map_err(StoreError::database)?;
@@ -456,16 +463,6 @@ impl AccountStore {
                 None => return Ok(IssueOutcome::NoSuchAccount),
             },
         };
-        // @tenant-cross-scope: bounded cleanup of expired, unreadable invitations. Rows another
-        // transaction holds are skipped, so this never waits on, or deadlocks with, anyone.
-        sqlx::query(&format!(
-            "DELETE FROM auth_invitation WHERE code_digest IN \
-               (SELECT code_digest FROM auth_invitation WHERE expires_at_unix <= {DB_NOW} \
-                LIMIT 256 FOR UPDATE SKIP LOCKED)"
-        ))
-        .execute(&mut *transaction)
-        .await
-        .map_err(StoreError::database)?;
         if let Some(replaced) = rule.supersedes() {
             let superseded: Vec<Vec<u8>> = sqlx::query_scalar(&format!(
                 "DELETE FROM auth_invitation \
@@ -508,6 +505,17 @@ impl AccountStore {
                 .await
                 .map_err(StoreError::database)?;
         }
+        // @tenant-cross-scope: bounded cleanup of expired, unreadable invitations. It skips rows
+        // others hold, so it never waits; it comes last, so the locks it takes are never held
+        // while this transaction waits for anything else, as a supersede above might.
+        sqlx::query(&format!(
+            "DELETE FROM auth_invitation WHERE code_digest IN \
+               (SELECT code_digest FROM auth_invitation WHERE expires_at_unix <= {DB_NOW} \
+                LIMIT 256 FOR UPDATE SKIP LOCKED)"
+        ))
+        .execute(&mut *transaction)
+        .await
+        .map_err(StoreError::database)?;
         transaction.commit().await.map_err(StoreError::database)?;
         Ok(IssueOutcome::Issued { expires_at_unix })
     }
@@ -709,7 +717,10 @@ impl AccountStore {
                         if let Some(hook) = &checkpoint {
                             hook(super::Checkpoint::ResetPasswordReplaced);
                         }
-                        // The new password ends every other reset link the person holds.
+                        // The new password ends every other reset link the person holds, expired
+                        // or not. An expired one may be held by another issue's cleanup; that
+                        // cleanup is the last thing its transaction does, so this waits at most
+                        // for that commit and cannot close a cycle.
                         let mut ended: Vec<Vec<u8>> = sqlx::query_scalar(
                             "DELETE FROM auth_invitation \
                               WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \

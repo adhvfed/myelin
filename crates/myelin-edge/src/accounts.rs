@@ -26,7 +26,7 @@ pub use store::account_migrations;
 pub(crate) use store::InvitationKind;
 use store::{
     AcceptOutcome, AccountRow, AccountStore, Invitation, IssueOutcome, IssueRule, LinkLetter,
-    LinkMail, NewInvitation, Reservation,
+    LinkMail, NewInvitation, Reservation, Slot,
 };
 
 pub const JOIN_INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -337,13 +337,13 @@ impl AccountService {
 
     /// Takes one slot of `limit` for `bucket`, or fails with how long to wait. The slot is taken
     /// before the work it pays for, so a burst cannot all pass a check made ahead of the work.
-    async fn reserve(&self, limit: &Limit, bucket: [u8; 32]) -> Result<(), AccountError> {
+    async fn reserve(&self, limit: &Limit, bucket: [u8; 32]) -> Result<Slot, AccountError> {
         match self
             .store
             .reserve_hit(bucket, limit.hits, limit.window_secs, self.now_unix()?)
             .await?
         {
-            Reservation::Taken => Ok(()),
+            Reservation::Taken(slot) => Ok(slot),
             Reservation::Full { retry_after_secs } => {
                 Err(AccountError::RateLimited { retry_after_secs })
             }
@@ -366,13 +366,13 @@ impl AccountService {
         // A malformed email cannot belong to an account and is not counted, but it pays for a
         // verification like any other attempt so the answer reveals nothing.
         let digest = Email::parse(email).map(|email| self.digester.digest(&email));
-        let bucket = digest.map(|digest| Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &digest));
-        let account = self.block(async {
-            let Some((digest, bucket)) = digest.zip(bucket) else {
-                return Ok(None);
+        let (account, slot) = self.block(async {
+            let Some(digest) = digest else {
+                return Ok((None, None));
             };
-            self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
-            Ok(self.store.account(&digest).await?)
+            let bucket = Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &digest);
+            let slot = self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
+            Ok((self.store.account(&digest).await?, Some(slot)))
         })?;
         let stored_phc = account
             .as_ref()
@@ -380,7 +380,12 @@ impl AccountService {
         let verified = match self.hashing(|| self.verify(password, stored_phc)) {
             Ok(verified) => verified,
             Err(busy) => {
-                self.give_back_login_slot(bucket);
+                if let Some(slot) = slot {
+                    let _ = self.block(async {
+                        self.give_back(&[slot]).await;
+                        Ok(())
+                    });
+                }
                 return Err(busy);
             }
         };
@@ -390,9 +395,9 @@ impl AccountService {
             Some(account) if verified => self.still_signs_in(&account)?,
             _ => None,
         };
-        match (principal, bucket) {
-            (Some(principal), Some(bucket)) => {
-                self.block(async { Ok(self.store.clear_hits(bucket).await?) })?;
+        match (principal, slot) {
+            (Some(principal), Some(slot)) => {
+                self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
                 Ok(principal)
             }
             // The failure was already counted when its slot was taken.
@@ -409,14 +414,6 @@ impl AccountService {
                 .expect("the filler meets the policy")
                 .verify(None, &self.dummy),
         }
-    }
-
-    /// Best effort: if it fails the person is only throttled a little early.
-    fn give_back_login_slot(&self, bucket: Option<[u8; 32]>) {
-        let (Some(bucket), Ok(now)) = (bucket, self.now_unix()) else {
-            return;
-        };
-        let _ = self.block(async { Ok(self.store.release_hit(bucket, now).await?) });
     }
 
     /// The person behind a verified password, if the password is still the stored one and the
@@ -629,23 +626,24 @@ impl AccountService {
                 invitee_key.push(0);
                 invitee_key.extend_from_slice(&self.digester.digest(&email));
                 let bucket = Self::bucket(&INVITES_PER_RECIPIENT, &invitee_key);
-                self.reserve(&INVITES_PER_RECIPIENT, bucket).await.map_err(
-                    |error| match error {
+                let slot = self
+                    .reserve(&INVITES_PER_RECIPIENT, bucket)
+                    .await
+                    .map_err(|error| match error {
                         AccountError::RateLimited { retry_after_secs } => {
                             AccountError::RecipientRateLimited { retry_after_secs }
                         }
                         other => other,
-                    },
-                )?;
-                taken.push(bucket);
+                    })?;
+                taken.push(slot);
             }
             let mut inviter_key = inviter.tenant.0.as_bytes().to_vec();
             inviter_key.push(0);
             inviter_key.extend_from_slice(inviter.principal_id.0.as_bytes());
             let bucket = Self::bucket(&INVITES_PER_MEMBER, &inviter_key);
             let outcome = match self.reserve(&INVITES_PER_MEMBER, bucket).await {
-                Ok(()) => {
-                    taken.push(bucket);
+                Ok(slot) => {
+                    taken.push(slot);
                     self.member_link(inviter, email).await
                 }
                 Err(refused) => Err(refused),
@@ -699,12 +697,9 @@ impl AccountService {
     }
 
     /// Best effort: a slot that cannot be given back only throttles a little early.
-    async fn give_back(&self, buckets: &[[u8; 32]]) {
-        let Ok(now) = self.now_unix() else {
-            return;
-        };
-        for bucket in buckets {
-            let _ = self.store.release_hit(*bucket, now).await;
+    async fn give_back(&self, slots: &[Slot]) {
+        for slot in slots {
+            let _ = self.store.release_hit(*slot).await;
         }
     }
 
@@ -755,7 +750,7 @@ impl AccountService {
         let account = self.block(async {
             let bucket = Self::bucket(&RESET_REQUESTS_PER_EMAIL, &digest);
             match self.reserve(&RESET_REQUESTS_PER_EMAIL, bucket).await {
-                Ok(()) => Ok(self.store.account(&digest).await?),
+                Ok(_) => Ok(self.store.account(&digest).await?),
                 Err(AccountError::RateLimited { .. }) => Ok(None),
                 Err(error) => Err(error),
             }

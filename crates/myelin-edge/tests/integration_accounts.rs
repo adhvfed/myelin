@@ -1092,6 +1092,51 @@ async fn a_sign_in_turned_away_because_hashing_is_busy_keeps_its_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slot_given_back_after_its_window_ended_leaves_the_next_window_alone() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-window");
+    let email = format!("{}@example.com", unique("noether"));
+    cell.join_person(&tenant, &email, "Emmy").await;
+
+    // The saturated attempt takes its slot, then waits two seconds for the hash gate. Meanwhile
+    // its window ends and a wrong guess opens the next one.
+    let saturated = cell
+        .service(Some("https://myelin.example"))
+        .with_hash_capacity(0);
+    let stale = tokio::task::spawn_blocking({
+        let email = email.clone();
+        move || saturated.login(&email, "wrong password!".into())
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    cell.clock.fetch_add(15 * 60, Ordering::Relaxed);
+    assert_eq!(
+        cell.accounts
+            .login(&email, "wrong password!".into())
+            .unwrap_err(),
+        AccountError::LoginFailed
+    );
+    assert_eq!(stale.await.unwrap().unwrap_err(), AccountError::Busy);
+
+    for attempt in 2..=10 {
+        assert_eq!(
+            cell.accounts
+                .login(&email, "wrong password!".into())
+                .unwrap_err(),
+            AccountError::LoginFailed,
+            "attempt {attempt}"
+        );
+    }
+    assert!(
+        matches!(
+            cell.accounts.login(&email, "wrong password!".into()),
+            Err(AccountError::RateLimited { .. })
+        ),
+        "the late give-back did not take back the new window's first hit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_link_replaces_only_the_same_kind_for_the_same_email_in_the_same_organization() {
     let _turn = ONE_AT_A_TIME.lock().await;
     let cell = cell().await;
