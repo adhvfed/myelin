@@ -78,6 +78,32 @@ export async function issueSession(rec: SessionRecord): Promise<string> {
   return id;
 }
 
+/** The session id this request's cookie names, if it is well formed. */
+export function currentSessionId(): string | null {
+  const id = getCookie(SESSION_COOKIE);
+  return id && validSessionId(id) ? id : null;
+}
+
+/** Clear a session the edge refused. Its record goes either way, but the cookie only when it was
+ * still that session's: a request that began before a password change rotated the session must
+ * not sign the browser out of the fresh one, which the browser already holds instead. */
+export async function clearRefusedSession(id: string | null): Promise<void> {
+  if (!id) return;
+  let stillCurrent = true;
+  try {
+    stillCurrent = await store.delete(id);
+  } finally {
+    if (stillCurrent) {
+      deleteCookie(SESSION_COOKIE, {
+        httpOnly: true,
+        sameSite: "lax",
+        path: "/",
+        secure: cookie.secure,
+      });
+    }
+  }
+}
+
 /** Clear the current session (logout / dead session): drop the record AND the cookie. Idempotent. */
 export async function clearCurrentSession(): Promise<void> {
   const id = getCookie(SESSION_COOKIE);

@@ -51,6 +51,9 @@ export default function Login() {
   const signedOut = () => {
     if (params.signed_out === "everywhere") return "You were signed out of all devices.";
     if (params.signed_out === "session") return "You were signed out.";
+    if (params.signed_out === "password_changed") {
+      return "Your password was changed. Sign in again.";
+    }
     return "";
   };
   const returnTo = () => safeAuthReturnTo(params.return_to);

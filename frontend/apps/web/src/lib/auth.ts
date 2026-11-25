@@ -90,10 +90,8 @@ export const requireViewer = query(async (): Promise<Viewer | null> => {
   try {
     who = await edgeWhoami();
   } catch (error) {
-    if (isUnauthorized(error)) {
-      await clearCurrentSession();
-      throw redirect(loginAfter(error));
-    }
+    // The gateway has already cleared the session the edge refused.
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return null;
   }
 
@@ -341,10 +339,14 @@ export const startSso = action(async (formData: FormData) => {
 export const logout = action(async () => {
   "use server";
   const rec = await getSessionRecord();
-  if (rec && (await edgeSignOut(rec.token, rec.scheme, false)) === "failed") {
+  const outcome = rec ? await edgeSignOut(rec.token, rec.scheme, false) : null;
+  if (outcome?.kind === "failed") {
     // The web session is cleared anyway: this browser is signed out either way, and the edge
     // session, which nothing holds any more, ends when it expires.
-    console.warn("Sign-out could not reach the edge; the web session was cleared regardless.");
+    console.warn(
+      `Sign-out could not end the edge session (${outcome.status ?? "no answer"}); ` +
+        "the web session was cleared regardless.",
+    );
   }
   await clearCurrentSession();
   throw redirect("/login");
@@ -358,12 +360,20 @@ export const logoutEverywhere = action(async (): Promise<{ ok: false }> => {
   const outcome = await edgeSignOut(rec.token, rec.scheme, true);
   // Unlike a plain sign-out, a failure here would leave the other devices signed in, so this
   // browser keeps its session to say so and let the person try again.
-  if (outcome === "failed") return { ok: false };
+  if (outcome.kind === "failed") {
+    console.warn(`Signing out everywhere failed at the edge (${outcome.status ?? "no answer"}).`);
+    return { ok: false };
+  }
   await clearCurrentSession();
-  throw redirect(outcome === "signed_out" ? "/login?signed_out=everywhere" : SIGNED_OUT_DESTINATION);
+  throw redirect(
+    outcome.kind === "signed_out" ? "/login?signed_out=everywhere" : SIGNED_OUT_DESTINATION,
+  );
 }, "logout-everywhere");
 
 export type PasswordChangeResult = { ok: true } | { ok: false; reason: AccountFailure };
+
+/** Where a browser goes when its password changed but its fresh session could not be installed. */
+const PASSWORD_CHANGED_DESTINATION = "/login?signed_out=password_changed";
 
 /** Change the password while signed in. The edge ends every session the person held and answers
  * with a fresh one, which replaces this browser's. */
@@ -376,17 +386,24 @@ export const changePassword = action(
     if (!current || current.length > 4_096) return { ok: false, reason: "wrong_password" };
     if (next.length > 4_096) return { ok: false, reason: "weak_password" };
     if (next !== confirm) return { ok: false, reason: "password_mismatch" };
+    let grant: EdgeSessionGrant;
     try {
-      await signInWithGrant(await edgeChangePassword(current, next));
-      return { ok: true };
+      grant = await edgeChangePassword(current, next);
     } catch (error) {
       const reason = accountFailure(error);
-      if (reason === "signed_out") {
-        await clearCurrentSession();
-        throw redirect(SIGNED_OUT_DESTINATION);
-      }
+      // The gateway has already cleared the session the edge refused.
+      if (reason === "signed_out") throw redirect(SIGNED_OUT_DESTINATION);
       return { ok: false, reason };
     }
+    try {
+      await signInWithGrant(grant);
+    } catch {
+      // The password has changed and the session this browser held has ended, so keeping it would
+      // only fail later. Start clean and say what happened.
+      await clearCurrentSession().catch(() => undefined);
+      throw redirect(PASSWORD_CHANGED_DESTINATION);
+    }
+    return { ok: true };
   },
   "change-password",
 );

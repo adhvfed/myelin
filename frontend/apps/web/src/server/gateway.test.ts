@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 
 const session = vi.hoisted(() => ({
-  clearCurrentSession: vi.fn(),
+  clearRefusedSession: vi.fn(),
+  currentSessionId: vi.fn(),
   getSessionRecord: vi.fn(),
+  hasSessionCookie: vi.fn(),
   updateSessionToken: vi.fn(),
 }));
 
@@ -48,7 +50,9 @@ beforeEach(() => {
     scheme: "pat",
   });
   session.updateSessionToken.mockResolvedValue(true);
-  session.clearCurrentSession.mockResolvedValue(undefined);
+  session.clearRefusedSession.mockResolvedValue(undefined);
+  session.currentSessionId.mockReturnValue("sess_refused");
+  session.hasSessionCookie.mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -235,7 +239,7 @@ describe("gateway refresh revocation races", () => {
     await expect(edgeGetEventStream("/v1/ci/live")).rejects.toMatchObject({
       name: "Unauthorized",
     });
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 
   it("preserves a mutation idempotency key across an authentication retry", async () => {
@@ -286,7 +290,7 @@ describe("gateway refresh revocation races", () => {
     await expect(edgeGet("/v1/issues")).rejects.toMatchObject({ name: "Unauthorized" });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 
   it("does not retry a JSON request when the session vanished during refresh", async () => {
@@ -304,7 +308,7 @@ describe("gateway refresh revocation races", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 
   it("does not retry a raw request when the session vanished during refresh", async () => {
@@ -322,7 +326,7 @@ describe("gateway refresh revocation races", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 
   it("clears the session when a refreshed raw request is still unauthorized", async () => {
@@ -340,7 +344,7 @@ describe("gateway refresh revocation races", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(3);
     expect(session.updateSessionToken).toHaveBeenCalledWith("fresh-token");
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 
   it("does not persist a malformed token from a successful refresh response", async () => {
@@ -354,7 +358,7 @@ describe("gateway refresh revocation races", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(session.updateSessionToken).not.toHaveBeenCalled();
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 
   it("treats a control-bearing refresh token as authentication failure", async () => {
@@ -369,7 +373,7 @@ describe("gateway refresh revocation races", () => {
     await expect(edgeGet("/v1/issues")).rejects.toMatchObject({ name: "Unauthorized" });
 
     expect(session.updateSessionToken).not.toHaveBeenCalled();
-    expect(session.clearCurrentSession).toHaveBeenCalledTimes(1);
+    expect(session.clearRefusedSession).toHaveBeenCalledWith("sess_refused");
   });
 });
 

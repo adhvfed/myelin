@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { requestMethodPolicy, sameOriginVerdict } from "./csrf";
+import { refusesServerFunctionRead, requestMethodPolicy, sameOriginVerdict } from "./csrf";
 
 const HOST = "app.myelin.dev";
 const ORIGIN = `https://${HOST}`;
@@ -88,5 +88,38 @@ describe("requestMethodPolicy", () => {
 
   it("rejects TRACE regardless of origin", () => {
     expect(requestMethodPolicy("TRACE")).toBe("reject");
+  });
+});
+
+describe("refusesServerFunctionRead", () => {
+  const read = (overrides: Partial<Parameters<typeof refusesServerFunctionRead>[0]>) =>
+    refusesServerFunctionRead({
+      method: "GET",
+      pathname: "/_server/",
+      instance: "server-fn:3",
+      fetchSite: "same-origin",
+      ...overrides,
+    });
+
+  it("lets the app's own query reads through", () => {
+    expect(read({})).toBe(false);
+    expect(read({ fetchSite: null })).toBe(false);
+  });
+
+  it("refuses a read without SolidStart's header, as a cross-site link would make", () => {
+    for (const pathname of ["/_server", "/_server/", "/_server//"]) {
+      expect(read({ pathname, instance: null, fetchSite: "cross-site" })).toBe(true);
+      expect(read({ pathname, method: "head", instance: null, fetchSite: null })).toBe(true);
+    }
+  });
+
+  it("refuses a read the browser says came from another site", () => {
+    expect(read({ fetchSite: "cross-site" })).toBe(true);
+    expect(read({ fetchSite: "same-site" })).toBe(true);
+  });
+
+  it("leaves POSTs (origin-checked) and other paths alone", () => {
+    expect(read({ method: "POST", instance: null })).toBe(false);
+    expect(read({ pathname: "/profile", instance: null })).toBe(false);
   });
 });

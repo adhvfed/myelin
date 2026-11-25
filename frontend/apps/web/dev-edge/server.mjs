@@ -91,6 +91,14 @@ const state = {
   // `signOutUnavailable` makes both sign-out routes answer 503.
   signOuts: [],
   signOutUnavailable: false,
+  // The session token the double accepts. A password change replaces it, as the real edge ends
+  // every older session, so a web app that kept the old token is caught.
+  accessToken: DEV_ACCESS_TOKEN,
+  passwordChanges: 0,
+  // `changePasswordConflict` answers a change as if another change got there first;
+  // `whoamiFailsAfterPasswordChange` makes installing the fresh session fail after a change.
+  changePasswordConflict: false,
+  whoamiFailsAfterPasswordChange: false,
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
@@ -454,6 +462,10 @@ function resetAccounts() {
   state.invitesPerRecipient = new Map();
   state.signOuts = [];
   state.signOutUnavailable = false;
+  state.accessToken = DEV_ACCESS_TOKEN;
+  state.passwordChanges = 0;
+  state.changePasswordConflict = false;
+  state.whoamiFailsAfterPasswordChange = false;
 }
 resetAccounts();
 
@@ -468,7 +480,7 @@ function newInvitation(kind, email) {
 
 function sessionGrant() {
   return {
-    access_token: DEV_ACCESS_TOKEN,
+    access_token: state.accessToken,
     token_type: "Bearer",
     scheme: "session",
     expires_at: Math.floor(Date.now() / 1_000) + 60 * 60,
@@ -506,7 +518,7 @@ async function handleAccountRoute(req, res, method, path) {
     return send(res, 200, sessionGrant()), true;
   }
   if (method === "POST" && path === "/v1/auth/password/change") {
-    if (state.forceUnauthorized || bearer(req) !== DEV_ACCESS_TOKEN) {
+    if (state.forceUnauthorized || bearer(req) !== state.accessToken) {
       return send(res, 401, unauthorizedEnvelope()), true;
     }
     const body = await readJson(req);
@@ -521,7 +533,15 @@ async function handleAccountRoute(req, res, method, path) {
     if ([...body.new_password].length < MIN_PASSWORD_LENGTH) {
       return send(res, 422, { error: { code: "weak_password", message: "too short" } }), true;
     }
+    if (state.changePasswordConflict) {
+      return send(res, 409, {
+        error: { code: "password_changed_elsewhere", message: "your password was just changed elsewhere" },
+      }), true;
+    }
     account.password = body.new_password;
+    state.passwordChanges += 1;
+    state.accessToken = `dev.access.rotated-${state.passwordChanges}`;
+    if (state.whoamiFailsAfterPasswordChange) state.whoamiUnavailable = true;
     state.sentMail.push({ to: E2E_ACCOUNT.email, kind: "password_changed", url: `${WEB_ORIGIN}/login?help=password` });
     return send(res, 200, sessionGrant()), true;
   }
@@ -600,7 +620,7 @@ const server = createServer((req, res) => {
   // Sign-out: one session, or every session the person holds. The double has one shared token, so
   // it records what was asked rather than refusing that token afterwards.
   if (method === "POST" && (path === "/v1/auth/logout" || path === "/v1/auth/logout/everywhere")) {
-    if (state.forceUnauthorized || bearer(req) !== DEV_ACCESS_TOKEN) {
+    if (state.forceUnauthorized || bearer(req) !== state.accessToken) {
       return send(res, 401, unauthorizedEnvelope());
     }
     if (state.signOutUnavailable) {
@@ -646,6 +666,12 @@ const server = createServer((req, res) => {
         if (typeof body.mailDeliveryEnabled === "boolean") state.mailDeliveryEnabled = body.mailDeliveryEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
         if (typeof body.signOutUnavailable === "boolean") state.signOutUnavailable = body.signOutUnavailable;
+        if (typeof body.changePasswordConflict === "boolean") {
+          state.changePasswordConflict = body.changePasswordConflict;
+        }
+        if (typeof body.whoamiFailsAfterPasswordChange === "boolean") {
+          state.whoamiFailsAfterPasswordChange = body.whoamiFailsAfterPasswordChange;
+        }
         if (typeof body.whoamiUnavailable === "boolean") {
           state.whoamiUnavailable = body.whoamiUnavailable;
         }
@@ -914,7 +940,7 @@ const server = createServer((req, res) => {
   }
 
   // Every data route returns the same 401 for a missing or invalid bearer token.
-  const authed = !state.forceUnauthorized && bearer(req) === DEV_ACCESS_TOKEN;
+  const authed = !state.forceUnauthorized && bearer(req) === state.accessToken;
 
   if (method === "GET" && path === "/v1/chat/conversations") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());

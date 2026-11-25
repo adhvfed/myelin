@@ -4,7 +4,8 @@
 
 import { runGateway, GatewayError, Unauthorized } from "./gateway-core";
 import {
-  clearCurrentSession,
+  clearRefusedSession,
+  currentSessionId,
   getSessionRecord,
   hasSessionCookie,
   updateSessionToken,
@@ -294,6 +295,7 @@ async function edgeRequest<T>(
   body?: unknown,
   options?: GatewayMutationOptions,
 ): Promise<T> {
+  const sessionId = currentSessionId();
   const initialSession = await getSessionRecord();
   const scheme = initialSession?.scheme ?? "pat";
   const signal = gatewayRequestSignal(options);
@@ -342,7 +344,7 @@ async function edgeRequest<T>(
       // retry unless the fresh credential was persisted onto that still-live session.
       return (await updateSessionToken(fresh)) ? fresh : null;
     },
-    clearSession: () => clearCurrentSession(),
+    clearSession: () => clearRefusedSession(sessionId),
   });
 }
 
@@ -368,6 +370,7 @@ export async function edgeGetEventStream(
   path: string,
   options: EventStreamRequestOptions = {},
 ): Promise<Response> {
+  const sessionId = currentSessionId();
   const initialSession = await getSessionRecord();
   const token = initialSession?.token;
   if (!token) throw missingSession();
@@ -430,14 +433,14 @@ export async function edgeGetEventStream(
     }
   }
   if (!fresh) {
-    await clearCurrentSession();
+    await clearRefusedSession(sessionId);
     throw new Unauthorized("session refresh failed", { refused: true });
   }
 
   response = await doFetch(fresh);
   if (response.status === 401) {
     await response.body?.cancel().catch(() => undefined);
-    await clearCurrentSession();
+    await clearRefusedSession(sessionId);
     throw new Unauthorized("still unauthorized after one refresh", { refused: true });
   }
   return response;
@@ -447,6 +450,7 @@ export async function edgeGetRaw(
   path: string,
   options?: GatewayRequestOptions,
 ): Promise<RawEdgeResponse> {
+  const sessionId = currentSessionId();
   const initialSession = await getSessionRecord();
   const scheme = initialSession?.scheme ?? "pat";
   const signal = gatewayRequestSignal(options);
@@ -481,13 +485,13 @@ export async function edgeGetRaw(
       }
     }
     if (!fresh) {
-      await clearCurrentSession();
+      await clearRefusedSession(sessionId);
       throw new Unauthorized("still unauthorized after one refresh", { refused: true });
     }
     res = await doFetch(fresh);
     if (res.status === 401) {
       await res.body?.cancel().catch(() => undefined);
-      await clearCurrentSession();
+      await clearRefusedSession(sessionId);
       throw new Unauthorized("still unauthorized after one refresh", { refused: true });
     }
   }

@@ -45,7 +45,12 @@ test.beforeEach(async () => {
   await setEdgeConfig({ resetAccounts: true, devLoginEnabled: true });
 });
 test.afterEach(async () => {
-  await setEdgeConfig({ resetAccounts: true, devLoginEnabled: true, forceUnauthorized: false });
+  await setEdgeConfig({
+    resetAccounts: true,
+    devLoginEnabled: true,
+    forceUnauthorized: false,
+    whoamiUnavailable: false,
+  });
 });
 
 test.describe("signing in", () => {
@@ -297,6 +302,109 @@ test.describe("password and sessions", () => {
     await page.waitForURL(/error=credentials/);
     await signIn(page, ADA.email, "a newer passphrase");
     await page.waitForURL("**/git/repos");
+  });
+
+  test("a change another device beat says so and keeps the person signed in", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ changePasswordConflict: true });
+    await changePassword(page, ADA.password, "a newer passphrase");
+    await expect(page.getByTestId("password-error")).toHaveText(
+      "Your password was just changed somewhere else, so it wasn't changed here.",
+    );
+    await page.reload();
+    await expect(page.getByRole("heading", { level: 1, name: ADA.name })).toBeVisible();
+  });
+
+  test("a change refused because the session ended sends the person to sign in", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ forceUnauthorized: true });
+    await changePassword(page, ADA.password, "a newer passphrase");
+    await page.waitForURL(/\/login\?signed_out=session$/);
+    await expect(page.getByTestId("signed-out")).toHaveText("You were signed out.");
+  });
+
+  test("when the new session cannot be set up, the person is asked to sign in again", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ whoamiFailsAfterPasswordChange: true });
+    await changePassword(page, ADA.password, "a newer passphrase");
+    await page.waitForURL(/\/login\?signed_out=password_changed$/);
+    await expect(page.getByTestId("signed-out")).toHaveText(
+      "Your password was changed. Sign in again.",
+    );
+    await setEdgeConfig({ whoamiUnavailable: false });
+    await signIn(page, ADA.email, "a newer passphrase");
+    await page.waitForURL("**/git/repos");
+  });
+
+  test("a cross-site link cannot run sign-out everywhere", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await page.getByTestId("signout-everywhere").click();
+    const action = await page.getByTestId("signout-everywhere-confirm").getAttribute("action");
+    expect(action).toMatch(/\/_server\?id=/);
+    // A top-level GET carries the cookie, as a link from another site would. `/_server/` is the
+    // form SolidStart's handler serves reads at.
+    const response = await page.request.get(action!.replace("/_server?", "/_server/?"));
+    expect(response.status()).toBe(403);
+    expect(await signOuts()).toEqual([]);
+    await page.reload();
+    await expect(page.getByRole("heading", { level: 1, name: ADA.name })).toBeVisible();
+  });
+
+  test("the sign-out confirmation takes focus, gives it back, and starts clean", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ signOutUnavailable: true });
+    await page.getByTestId("signout-everywhere").click();
+    await expect(page.getByTestId("signout-everywhere-submit")).toBeFocused();
+    await page.getByTestId("signout-everywhere-submit").click();
+    await expect(page.getByTestId("signout-everywhere-error")).toBeVisible();
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByTestId("signout-everywhere")).toBeFocused();
+    await page.getByTestId("signout-everywhere").click();
+    await expect(page.getByTestId("signout-everywhere-error")).toHaveCount(0);
+  });
+
+  test("without JavaScript no password ever reaches the flash cookie", async ({ browser }) => {
+    const context = await browser.newContext({ javaScriptEnabled: false });
+    const page = await context.newPage();
+    const flash = async () =>
+      (await context.cookies()).filter((cookie) => cookie.name === "flash").map((c) => c.value);
+
+    // Sign-in answers with a redirect, which SolidStart never flashes. (Accepting an invitation
+    // does too, and its page needs JavaScript to show the form at all.)
+    await page.goto("/login");
+    await page.getByTestId("email-input").fill(ADA.email);
+    await page.getByTestId("password-input").fill("not the password");
+    await page.getByTestId("password-login").click();
+    await page.waitForURL(/error=credentials/);
+    expect(await flash()).toEqual([]);
+
+    // The password form cannot be posted until the page is interactive.
+    await page.goto("/login");
+    await page.getByTestId("email-input").fill(ADA.email);
+    await page.getByTestId("password-input").fill(ADA.password);
+    await page.getByTestId("password-login").click();
+    await page.waitForURL("**/git/repos");
+    await page.goto("/profile");
+    await expect(page.getByRole("heading", { name: "Session security" })).toBeVisible();
+    await expect(page.locator('[data-testid="password-submit"]:not([disabled])')).toHaveCount(0);
+    await context.close();
+  });
+
+  test("password errors point at the field they are about", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await changePassword(page, ADA.password, "a newer passphrase", "a different one!");
+    await expect(page.getByTestId("confirm-password")).toHaveAttribute(
+      "aria-describedby",
+      "password-change-error",
+    );
+    await expect(page.getByTestId("current-password")).not.toHaveAttribute(
+      "aria-describedby",
+      /password-change-error/,
+    );
+    await expect(page.getByTestId("new-password")).toHaveAttribute(
+      "aria-describedby",
+      "new-password-hint",
+    );
   });
 
   test("signing out ends the session at the edge", async ({ page }) => {

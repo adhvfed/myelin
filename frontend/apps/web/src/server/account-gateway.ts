@@ -25,6 +25,7 @@ export type AccountFailure =
   | "invalid_name"
   | "wrong_password" // the current password given to change it is not right
   | "password_mismatch" // the new password and its confirmation differ
+  | "password_changed_elsewhere" // a reset or another change got there first
   | "no_password" // the person signs in another way and has no password here
   | "signed_out" // the edge refused the session that asked
   | "unavailable";
@@ -230,6 +231,9 @@ export async function edgeChangePassword(
         throw new AccountError("wrong_password");
       }
       if (error.status === 422) throw new AccountError("weak_password");
+      if (error.status === 409 && error.code === "password_changed_elsewhere") {
+        throw new AccountError("password_changed_elsewhere");
+      }
       if (error.status === 409) throw new AccountError("no_password");
       if (error.status === 429) throw new AccountError("rate_limited");
       throw new AccountError("unavailable");
@@ -239,8 +243,14 @@ export async function edgeChangePassword(
   return sessionGrant(json);
 }
 
-/** How a sign-out request ended at the edge. */
-export type SignOutOutcome = "signed_out" | "already_signed_out" | "failed";
+/** How a sign-out request ended at the edge. A failure carries the edge's status, if it answered. */
+export type SignOutOutcome =
+  | { kind: "signed_out" }
+  | { kind: "already_signed_out" }
+  | { kind: "failed"; status?: number };
+
+/** Sign-out is on the way out of the app; it waits for the edge only briefly. */
+const SIGN_OUT_TIMEOUT_MS = 3_000;
 
 /** End `token`'s session at the edge, or (with `everywhere`) every session its person holds. It
  * goes straight to the edge, never through the refresh-and-retry lifecycle. */
@@ -261,14 +271,14 @@ export async function edgeSignOut(
         },
         body: "{}",
         redirect: "error",
-        signal: gatewayRequestSignal(),
+        signal: gatewayRequestSignal({ timeoutMs: SIGN_OUT_TIMEOUT_MS }),
       },
     );
     await response.body?.cancel().catch(() => undefined);
-    if (response.ok) return "signed_out";
-    if (response.status === 401) return "already_signed_out";
-    return "failed";
+    if (response.ok) return { kind: "signed_out" };
+    if (response.status === 401) return { kind: "already_signed_out" };
+    return { kind: "failed", status: response.status };
   } catch {
-    return "failed";
+    return { kind: "failed" };
   }
 }

@@ -51,3 +51,27 @@ export function sameOriginVerdict(sig: OriginSignals): OriginVerdict {
   }
   return "reject";
 }
+
+/** What a request to the server-function endpoint shows about where it came from. */
+export interface ServerFunctionRead {
+  method: string;
+  pathname: string;
+  /** The `X-Server-Instance` header SolidStart's own client sends on every call. */
+  instance: string | null;
+  /** The browser's `Sec-Fetch-Site`, when it sends one. */
+  fetchSite: string | null;
+}
+
+/**
+ * SolidStart runs any server function, actions included, for `GET /_server?id=…&name=…`, and the
+ * origin check above covers only unsafe methods. The app's own reads (router queries) are GETs
+ * too, but always fetched with SolidStart's custom headers, which a cross-site link or form cannot
+ * add. So a read there must carry `X-Server-Instance` and, when the browser says, be same-origin.
+ */
+export function refusesServerFunctionRead(read: ServerFunctionRead): boolean {
+  const method = read.method.toUpperCase();
+  if ((method !== "GET" && method !== "HEAD") || read.pathname.replace(/\/+$/, "") !== "/_server") {
+    return false;
+  }
+  return !read.instance || (read.fetchSite !== null && read.fetchSite !== "same-origin");
+}

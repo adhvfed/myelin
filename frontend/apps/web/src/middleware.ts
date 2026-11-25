@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import { createMiddleware } from "@solidjs/start/middleware";
 
-import { requestMethodPolicy, sameOriginVerdict } from "~/lib/csrf";
+import { refusesServerFunctionRead, requestMethodPolicy, sameOriginVerdict } from "~/lib/csrf";
 import { securityHeaders } from "~/lib/security-headers";
 import { transportVerdict } from "~/lib/transport-security";
 import { boundMutationRequest } from "~/server/bounded-request";
@@ -25,6 +25,20 @@ export default createMiddleware({
     event.locals.cspNonce = nonce;
     applySecurityHeaders(event.response.headers, nonce);
 
+    if (
+      refusesServerFunctionRead({
+        method: event.request.method,
+        pathname: new URL(event.request.url).pathname,
+        instance: event.request.headers.get("x-server-instance"),
+        fetchSite: event.request.headers.get("sec-fetch-site"),
+      })
+    ) {
+      event.response.headers.set("Content-Type", "text/plain; charset=utf-8");
+      return new Response("forbidden", {
+        status: 403,
+        headers: event.response.headers,
+      });
+    }
     const methodPolicy = requestMethodPolicy(event.request.method);
     if (methodPolicy === "reject") {
       event.response.headers.set("Content-Type", "text/plain; charset=utf-8");

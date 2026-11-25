@@ -43,7 +43,7 @@ export default function Profile() {
         <ProfileCard icon="gate" title="Data residency" copy="Myelin keeps execution and durable product data inside the assigned region."><dl><div><dt>Active region</dt><dd><strong>{viewer.region}</strong></dd></div><div><dt>Residency</dt><dd>EU sovereign boundary</dd></div></dl></ProfileCard>
         <ProfileCard icon="settings" title="Appearance" copy="Choose a mode for this browser. The setting persists without changing your organization profile."><div class="profile-theme-options" role="radiogroup" aria-label="Appearance"><For each={THEMES}>{(option) => <button type="button" role="radio" aria-checked={theme() === option} disabled={!interactive()} onClick={() => chooseTheme(option)}><span class={`profile-theme-swatch ${option}`} aria-hidden="true" /><strong>{THEME_COPY[option].label}</strong><small>{THEME_COPY[option].copy}</small></button>}</For></div></ProfileCard>
         <InviteCard />
-        <PasswordCard />
+        <PasswordCard interactive={interactive()} />
         <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><div class="profile-signout-actions"><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button><SignOutEverywhere disabled={!interactive()} /></div></ProfileCard>
       </div>
     </div>
@@ -152,6 +152,15 @@ const PASSWORD_ERRORS: Record<string, string> = {
   password_mismatch: "The two new passwords don't match.",
   rate_limited: "Too many attempts. Wait a few minutes, then try again.",
   no_password: "You sign in with single sign-on, so there's no Myelin password to change.",
+  password_changed_elsewhere:
+    "Your password was just changed somewhere else, so it wasn't changed here.",
+};
+
+/** The field each failure is about; the rest are about the form as a whole. */
+const PASSWORD_ERROR_FIELD: Record<string, "current" | "new" | "confirm"> = {
+  wrong_password: "current",
+  weak_password: "new",
+  password_mismatch: "confirm",
 };
 
 function passwordError(result: PasswordChangeResult): string {
@@ -159,8 +168,10 @@ function passwordError(result: PasswordChangeResult): string {
   return PASSWORD_ERRORS[result.reason] ?? "The password couldn't be changed. Try again in a moment.";
 }
 
-/** Change the password. Every other session ends; this browser stays signed in. */
-function PasswordCard() {
+/** Change the password. Every other session ends; this browser stays signed in. The form works
+ * only once the page is interactive: submitted without JavaScript, SolidStart would echo the
+ * passwords back in a cookie. */
+function PasswordCard(props: { interactive: boolean }) {
   const changing = useSubmission(changePassword);
   const config = createAsync(() => getAuthConfig());
   const toast = useToast();
@@ -169,6 +180,18 @@ function PasswordCard() {
   const failure = () => {
     const result = changing.result;
     return result && !result.ok ? result.reason : undefined;
+  };
+  /** A failure about one field describes that field; a failure about the form describes all. */
+  const describedBy = (field: "current" | "new" | "confirm", hint?: string) => {
+    const reason = failure();
+    const about = reason ? (PASSWORD_ERROR_FIELD[reason] ?? field) : undefined;
+    return [hint, about === field ? "password-change-error" : undefined]
+      .filter(Boolean)
+      .join(" ") || undefined;
+  };
+  const invalid = (field: "current" | "new" | "confirm") => {
+    const reason = failure();
+    return reason && PASSWORD_ERROR_FIELD[reason] === field ? "true" : undefined;
   };
   createEffect(() => {
     if (changing.result?.ok && !changing.pending) {
@@ -192,8 +215,8 @@ function PasswordCard() {
               type="password"
               required
               autocomplete="current-password"
-              aria-invalid={failure() === "wrong_password" ? "true" : undefined}
-              aria-describedby={failure() ? "password-change-error" : undefined}
+              aria-invalid={invalid("current")}
+              aria-describedby={describedBy("current")}
               data-testid="current-password"
             />
           </label>
@@ -205,8 +228,8 @@ function PasswordCard() {
               required
               minlength={MIN_PASSWORD_LENGTH}
               autocomplete="new-password"
-              aria-describedby="new-password-hint"
-              aria-invalid={failure() === "weak_password" ? "true" : undefined}
+              aria-describedby={describedBy("new", "new-password-hint")}
+              aria-invalid={invalid("new")}
               data-testid="new-password"
               onInput={(event) => setLength([...event.currentTarget.value].length)}
             />
@@ -224,7 +247,8 @@ function PasswordCard() {
               type="password"
               required
               autocomplete="new-password"
-              aria-invalid={failure() === "password_mismatch" ? "true" : undefined}
+              aria-invalid={invalid("confirm")}
+              aria-describedby={describedBy("confirm")}
               data-testid="confirm-password"
             />
           </label>
@@ -235,7 +259,12 @@ function PasswordCard() {
               </p>
             )}
           </Show>
-          <button type="submit" data-testid="password-submit" aria-busy={changing.pending ? "true" : undefined}>
+          <button
+            type="submit"
+            disabled={!props.interactive || changing.pending}
+            data-testid="password-submit"
+            aria-busy={changing.pending ? "true" : undefined}
+          >
             {changing.pending ? "Changing…" : "Change password"}
           </button>
         </form>
@@ -248,22 +277,40 @@ function PasswordCard() {
 function SignOutEverywhere(props: { disabled: boolean }) {
   const [confirming, setConfirming] = createSignal(false);
   const ending = useSubmission(logoutEverywhere);
+  let opener: HTMLButtonElement | undefined;
+  let confirm: HTMLButtonElement | undefined;
+  const open = () => {
+    ending.clear();
+    setConfirming(true);
+    confirm?.focus();
+  };
+  const cancel = () => {
+    setConfirming(false);
+    opener?.focus();
+  };
   return (
     <Show
       when={confirming()}
       fallback={
-        <button type="button" class="profile-signout" disabled={props.disabled} onClick={() => setConfirming(true)} data-testid="signout-everywhere">
+        <button ref={opener} type="button" class="profile-signout" disabled={props.disabled} onClick={open} data-testid="signout-everywhere">
           <Icon name="close" /> Sign out of all devices
         </button>
       }
     >
-      <form action={logoutEverywhere} method="post" class="profile-signout-confirm" data-testid="signout-everywhere-confirm">
-        <p>Sign out on every device, including this one?</p>
+      <form action={logoutEverywhere} method="post" class="profile-signout-confirm" data-testid="signout-everywhere-confirm" aria-labelledby="signout-everywhere-question">
+        <p id="signout-everywhere-question">Sign out on every device, including this one?</p>
         <div>
-          <button type="submit" class="profile-signout" aria-busy={ending.pending ? "true" : undefined} data-testid="signout-everywhere-submit">
+          <button
+            ref={confirm}
+            type="submit"
+            class="profile-signout"
+            disabled={ending.pending}
+            aria-busy={ending.pending ? "true" : undefined}
+            data-testid="signout-everywhere-submit"
+          >
             {ending.pending ? "Signing out…" : "Sign out everywhere"}
           </button>
-          <button type="button" onClick={() => setConfirming(false)}>Cancel</button>
+          <button type="button" onClick={cancel}>Cancel</button>
         </div>
         <Show when={ending.result && !ending.result.ok}>
           <p role="alert" class="profile-invite-error" data-testid="signout-everywhere-error">
