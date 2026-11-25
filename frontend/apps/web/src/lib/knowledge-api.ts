@@ -6,6 +6,7 @@ import {
   type KnowledgeCreateDraft, type KnowledgeCreateReceipt, type KnowledgePage,
   type KnowledgePageList, type KnowledgeSaveDraft, type KnowledgeSaveReceipt,
 } from "./knowledge-response";
+import { loginAfter } from "./auth-return";
 
 export * from "./knowledge-response";
 export type KnowledgeErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
@@ -16,7 +17,7 @@ export class KnowledgeRouteError extends Error {
 
 async function authed<T>(run: () => Promise<T>): Promise<T> {
   try { return await run(); } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) throw new KnowledgeRouteError("bad-input");
       if (error.status === 404) throw new KnowledgeRouteError("not-found");

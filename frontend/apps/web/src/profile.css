@@ -34,4 +34,18 @@
 .profile-invite-result, .profile-invite-error { margin: var(--space-3) 0 0; }
 .profile-invite-result p { margin: 0 0 var(--space-2); color: var(--text-muted); }
 .profile-invite-error { color: var(--danger); }
+.profile-password-form { display: grid; gap: var(--space-3); margin: 0; }
+.profile-password-form label { display: grid; gap: var(--space-2); color: var(--text-subtle); }
+.profile-password-form input { min-width: 0; min-height: var(--row-h); padding-inline: var(--space-2); border: var(--hairline) solid var(--border-strong); border-radius: var(--radius-1); background: var(--surface); color: var(--text-primary); font: inherit; }
+.profile-password-form input[aria-invalid="true"] { border-color: var(--danger); }
+.profile-password-hint { display: flex; justify-content: space-between; gap: var(--space-3); margin: calc(-1 * var(--space-2)) 0 0; color: var(--text-subtle); font-size: var(--fs-caption); }
+.profile-password-hint [data-met] { color: var(--accent); }
+.profile-password-form button { justify-self: start; min-height: var(--row-h); padding-inline: var(--space-3); border: var(--hairline) solid var(--border-strong); border-radius: var(--radius-1); background: transparent; color: var(--text-primary); cursor: pointer; }
+.profile-password-form button:hover { background: var(--surface-hover); }
+.profile-password-form .profile-invite-error { margin: 0; }
+.profile-signout-actions { display: flex; flex-wrap: wrap; align-items: start; gap: var(--space-2); }
+.profile-signout-confirm { flex-basis: 100%; display: grid; gap: var(--space-2); margin: 0; padding-block-start: var(--space-2); }
+.profile-signout-confirm p { margin: 0; color: var(--text-muted); }
+.profile-signout-confirm > div { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.profile-signout-confirm button[type="button"] { min-height: var(--control-h); padding-inline: var(--space-3); border: var(--hairline) solid var(--border-strong); border-radius: var(--radius-1); background: transparent; color: var(--text-primary); cursor: pointer; }
 @media (max-width: 760px) { .profile-screen { padding: 0; }.profile-hero { margin: 0 0 var(--space-3); padding: var(--space-4); }.profile-grid { grid-template-columns: 1fr; }.profile-theme-options { grid-template-columns: 1fr; } }

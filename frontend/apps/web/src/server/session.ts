@@ -44,6 +44,13 @@ export async function getSessionRecord(): Promise<SessionRecord | null> {
   return await store.get(id);
 }
 
+/** Whether the browser presented a session cookie. With no record behind it, the session it
+ * named has ended: signed out at the edge, cleared by a concurrent request, or expired. */
+export function hasSessionCookie(): boolean {
+  const id = getCookie(SESSION_COOKIE);
+  return Boolean(id && validSessionId(id));
+}
+
 /** Persist a (possibly rotated) token onto the current session, if one exists. Server-only. */
 export async function updateSessionToken(token: string): Promise<boolean> {
   const id = getCookie(SESSION_COOKIE);

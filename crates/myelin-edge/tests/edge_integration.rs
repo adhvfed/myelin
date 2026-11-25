@@ -309,6 +309,7 @@ fn mint_for_subject(
         region: REGION.into(),
         subject_key: subject.into(),
         jti: jti.into(),
+        issued_at_unix: Some(exp_unix - 3600),
         exp_unix,
         authority,
         dpop_jkt: None,

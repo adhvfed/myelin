@@ -24,6 +24,7 @@ import {
   type ProjectListInput,
   type ProjectPage,
 } from "./project-contract";
+import { loginAfter } from "./auth-return";
 
 export type ProjectErrorKind = "bad-input" | "conflict" | "not-found" | "unavailable" | "error";
 export type ProjectListResult =
@@ -60,7 +61,7 @@ export const getProjects = query(async (value: ProjectListInput = {}): Promise<P
     const page = parseProjectPage(await edgeGet(`/v1/projects${queryString ? `?${queryString}` : ""}`));
     return page ? { ok: true, page } : { ok: false, error: "error" };
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return { ok: false, error: errorKind(error) };
   }
 }, "projects-list");
@@ -80,7 +81,7 @@ export const getProjectCollaborators = query(async (
     ));
     return page ? { ok: true, page } : { ok: false, error: "error" };
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return { ok: false, error: errorKind(error) };
   }
 }, "project-collaborators-list");
@@ -100,7 +101,7 @@ export const getProjectAccess = query(async (
     ));
     return page ? { ok: true, page } : { ok: false, error: "error" };
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return { ok: false, error: errorKind(error) };
   }
 }, "project-access-list");
@@ -120,7 +121,7 @@ export const setProjectAccess = action(async (
     ));
     return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return result({ ok: false, error: errorKind(error) });
   }
 }, "project-access-set");
@@ -138,7 +139,7 @@ export const createProject = action(async (value: NewProjectInput) => {
     ));
     return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return result({ ok: false, error: errorKind(error) });
   }
 }, "projects-create");

@@ -126,6 +126,7 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
         region: REGION.into(),
         subject_key: "subj-1".into(),
         jti: "jti-scope".into(),
+        issued_at_unix: Some(exp - 3600),
         exp_unix: exp,
         authority: vec!["edge.operator".into()],
         dpop_jkt: None,

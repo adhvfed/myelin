@@ -1267,6 +1267,7 @@ mod tests {
             dpop_bound: false,
             purpose,
             audience: crate::machine_auth::CredentialAudience::Edge,
+            issued_at_unix: None,
             exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
         }
     }

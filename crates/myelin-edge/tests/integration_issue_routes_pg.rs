@@ -120,6 +120,7 @@ fn mint(cell: &CellTokenAuthority, principal: &Principal, subject_key: &str, jti
         region: principal.region.as_str().into(),
         subject_key: subject_key.into(),
         jti: jti.into(),
+        issued_at_unix: Some(now()),
         exp_unix: now() + 3_600,
         authority: vec!["edge.operator".into()],
         dpop_jkt: None,

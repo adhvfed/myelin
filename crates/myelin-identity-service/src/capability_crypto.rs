@@ -144,6 +144,9 @@ impl CellTokenAuthority {
         claims.insert("sub".into(), spec.subject_key.clone().into());
         claims.insert("jti".into(), spec.jti.clone().into());
         claims.insert("exp".into(), spec.exp_unix.into());
+        if let Some(issued_at_unix) = spec.issued_at_unix {
+            claims.insert("iat".into(), issued_at_unix.into());
+        }
         claims.insert("purpose".into(), spec.purpose.claim().into());
         claims.insert("aud".into(), spec.audience.claim().into());
         if let Some(run_id) = spec.purpose.run_id() {
@@ -190,6 +193,9 @@ pub struct CapabilityMintSpec {
     pub region: String,
     pub subject_key: String,
     pub jti: String,
+    /// Signed as `iat`. Every human session carries one; a run token is re-signed identically on
+    /// replay, so it has none.
+    pub issued_at_unix: Option<i64>,
     pub exp_unix: i64,
     pub authority: Vec<String>,
     pub dpop_jkt: Option<String>,
@@ -591,6 +597,14 @@ impl PasetoCapabilityVerifier {
             .get("exp")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| refuse("verified token missing integer `exp`"))?;
+        let issued_at_unix = claims
+            .get("iat")
+            .map(|value| {
+                value
+                    .as_i64()
+                    .ok_or_else(|| refuse("signed `iat` must be an integer"))
+            })
+            .transpose()?;
         let purpose_claim = str_claim(&claims, "purpose").map_err(|_| {
             refuse(
                 "capability token has no signed credential purpose; ambiguous legacy credentials are \
@@ -736,6 +750,7 @@ impl PasetoCapabilityVerifier {
             dpop_bound,
             purpose,
             audience,
+            issued_at_unix,
             exp_unix: exp,
         })
     }
@@ -885,6 +900,7 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
             region: request.scope().region().0.clone(),
             subject_key: request.subject().0.clone(),
             jti: request.jti().to_string(),
+            issued_at_unix: None,
             exp_unix: exp,
             authority: request.grants().to_vec(),
             dpop_jkt: None,

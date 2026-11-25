@@ -24,6 +24,7 @@ import {
   AutomationRouteError,
   type AutomationErrorKind,
 } from "./automation-error";
+import { loginAfter } from "./auth-return";
 
 export { AutomationRouteError, type AutomationErrorKind } from "./automation-error";
 
@@ -71,7 +72,7 @@ async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) throw new AutomationRouteError("bad-input");
       if (error.status === 403 || error.status === 404) throw new AutomationRouteError("not-found");
@@ -184,7 +185,7 @@ export const createAutomation = action(async (input: unknown) => {
     }, { idempotencyKey: value.clientNonce }));
     return receipt ? respond({ ok: true, receipt }) : respond({ ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) return respond({ ok: false, error: "bad-input" });
       if (error.status === 403 || error.status === 404) {
@@ -217,7 +218,7 @@ export const changeAutomationLifecycle = action(async (input: {
       ? respond({ ok: true, receipt })
       : respond({ ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) return respond({ ok: false, error: "bad-input" });
       if (error.status === 403 || error.status === 404) {
@@ -251,7 +252,7 @@ export const decideAutomationFiring = action(async (input: {
       ? respond({ ok: true, receipt })
       : respond({ ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) return respond({ ok: false, error: "bad-input" });
       if (error.status === 403 || error.status === 404) {
@@ -283,7 +284,7 @@ export const eraseAutomationResult = action(async (input: {
       ? respond({ ok: true, receipt })
       : respond({ ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError && (error.status === 403 || error.status === 404)) {
       return respond({ ok: false, error: "not-found" });
     }

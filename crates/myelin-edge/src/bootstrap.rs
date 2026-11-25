@@ -132,6 +132,7 @@ pub fn bootstrap_principal_and_mint(
         region: params.region.to_string(),
         subject_key: subject_key.clone(),
         jti: jti.clone(),
+        issued_at_unix: Some(now_unix),
         exp_unix: expiry_unix,
         authority: BOOTSTRAP_AUTHORITY.iter().map(|g| g.to_string()).collect(),
         dpop_jkt: None,

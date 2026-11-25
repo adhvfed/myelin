@@ -414,6 +414,7 @@ mod tests {
                 region: REGION.into(),
                 subject_key: "operator-subject".into(),
                 jti: "secret-command-test-jti".into(),
+                issued_at_unix: Some(0),
                 exp_unix: 4_102_444_800,
                 authority: vec!["edge.operator".into()],
                 dpop_jkt: None,

@@ -65,3 +65,12 @@ function hasControlCharacter(value: string): boolean {
   }
   return false;
 }
+
+/** Where a browser goes once the edge has refused the session it held. */
+export const SIGNED_OUT_DESTINATION = "/login?signed_out=session";
+
+/** Sign-in after an authentication failure. It says "You were signed out." only when the edge
+ * refused a session this browser held, not when there was never one. */
+export function loginAfter(error: { refused?: boolean }): string {
+  return error.refused ? SIGNED_OUT_DESTINATION : "/login";
+}

@@ -175,6 +175,7 @@ impl Harness {
             region: REGION.into(),
             subject_key: subject_key.into(),
             jti,
+            issued_at_unix: Some(now()),
             exp_unix: now() + 3600,
             authority: vec![if ci_job {
                 "ci.checks.report".into()

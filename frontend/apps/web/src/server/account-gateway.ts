@@ -4,7 +4,7 @@
 
 import { edgeOrigin } from "./edge-origin";
 import { readLimitedText } from "./bounded-response";
-import { edgePost, GatewayError, gatewayRequestSignal } from "./gateway";
+import { edgePost, GatewayError, gatewayRequestSignal, isUnauthorized } from "./gateway";
 import { validSessionToken } from "./session-store";
 
 /** A freshly minted human session capability. */
@@ -23,6 +23,10 @@ export type AccountFailure =
   | "account_exists"
   | "invalid_email"
   | "invalid_name"
+  | "wrong_password" // the current password given to change it is not right
+  | "password_mismatch" // the new password and its confirmation differ
+  | "no_password" // the person signs in another way and has no password here
+  | "signed_out" // the edge refused the session that asked
   | "unavailable";
 
 export class AccountError extends Error {
@@ -205,4 +209,66 @@ export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedIn
     throw new AccountError("unavailable");
   }
   return { delivery: "link", url: created.url, email: created.email, expiresAt: created.expires_at };
+}
+
+/** Change the signed-in person's password. Every session they held ends, so the edge answers with
+ * a fresh one for this browser. */
+export async function edgeChangePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<EdgeSessionGrant> {
+  let json: unknown;
+  try {
+    json = await edgePost<unknown>("/v1/auth/password/change", {
+      current_password: currentPassword,
+      new_password: newPassword,
+    });
+  } catch (error) {
+    if (isUnauthorized(error)) throw new AccountError("signed_out");
+    if (error instanceof GatewayError) {
+      if (error.status === 403 && error.code === "wrong_password") {
+        throw new AccountError("wrong_password");
+      }
+      if (error.status === 422) throw new AccountError("weak_password");
+      if (error.status === 409) throw new AccountError("no_password");
+      if (error.status === 429) throw new AccountError("rate_limited");
+      throw new AccountError("unavailable");
+    }
+    throw error;
+  }
+  return sessionGrant(json);
+}
+
+/** How a sign-out request ended at the edge. */
+export type SignOutOutcome = "signed_out" | "already_signed_out" | "failed";
+
+/** End `token`'s session at the edge, or (with `everywhere`) every session its person holds. It
+ * goes straight to the edge, never through the refresh-and-retry lifecycle. */
+export async function edgeSignOut(
+  token: string,
+  scheme: string,
+  everywhere: boolean,
+): Promise<SignOutOutcome> {
+  try {
+    const response = await fetch(
+      `${edgeOrigin()}/v1/auth/logout${everywhere ? "/everywhere" : ""}`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "x-myelin-token-scheme": scheme,
+          "content-type": "application/json",
+        },
+        body: "{}",
+        redirect: "error",
+        signal: gatewayRequestSignal(),
+      },
+    );
+    await response.body?.cancel().catch(() => undefined);
+    if (response.ok) return "signed_out";
+    if (response.status === 401) return "already_signed_out";
+    return "failed";
+  } catch {
+    return "failed";
+  }
 }

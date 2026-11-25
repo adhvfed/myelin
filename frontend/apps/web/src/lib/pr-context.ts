@@ -9,6 +9,7 @@ import {
   RELATED_REFS_PAGE_LIMIT,
   type RelatedRefsPage,
 } from "./related-ref-response";
+import { loginAfter } from "./auth-return";
 
 export interface LinkedIssueVM {
   id: string;
@@ -37,7 +38,7 @@ async function read<T>(path: string, parse: (value: unknown) => T | null): Promi
     const value = parse(await edgeGet(path));
     return value === null ? { value: null, failed: true } : { value, failed: false };
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     return { value: null, failed: true };
   }
 }

@@ -45,7 +45,7 @@ test.beforeEach(async () => {
   await setEdgeConfig({ resetAccounts: true, devLoginEnabled: true });
 });
 test.afterEach(async () => {
-  await setEdgeConfig({ resetAccounts: true, devLoginEnabled: true });
+  await setEdgeConfig({ resetAccounts: true, devLoginEnabled: true, forceUnauthorized: false });
 });
 
 test.describe("signing in", () => {
@@ -247,5 +247,111 @@ test.describe("invitation links", () => {
     await page.context().clearCookies();
     await page.goto(new URL(link).pathname);
     await expect(page.getByTestId("join-email")).toHaveValue("linus@acme.dev");
+  });
+});
+
+/** The sign-outs the web app asked the double for, oldest first. */
+async function signOuts(): Promise<string[]> {
+  const context = await pwRequest.newContext();
+  const response = await context.get(`${EDGE}/__test/sessions`);
+  const { signOuts } = (await response.json()) as { signOuts: string[] };
+  await context.dispose();
+  return signOuts;
+}
+
+async function openProfileSignedIn(page: Page, password = ADA.password) {
+  await signIn(page, ADA.email, password);
+  await page.waitForURL("**/git/repos");
+  await page.goto("/profile");
+  await page.waitForLoadState("networkidle");
+}
+
+async function changePassword(page: Page, current: string, next: string, confirm = next) {
+  await page.getByTestId("current-password").fill(current);
+  await page.getByTestId("new-password").fill(next);
+  await page.getByTestId("confirm-password").fill(confirm);
+  await page.getByTestId("password-submit").click();
+}
+
+test.describe("password and sessions", () => {
+  test("a person changes their password and stays signed in; axe green", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await expect(page.getByRole("heading", { name: "Password" })).toBeVisible();
+    await expectNoAxeViolations(page, "/profile (password card)");
+
+    await changePassword(page, "not my password", "a newer passphrase");
+    await expect(page.getByTestId("password-error")).toHaveText("That isn't your current password.");
+    await expect(page.getByTestId("current-password")).toHaveAttribute("aria-invalid", "true");
+
+    await changePassword(page, ADA.password, "a newer passphrase", "a different one!");
+    await expect(page.getByTestId("password-error")).toHaveText("The two new passwords don't match.");
+
+    await changePassword(page, ADA.password, "a newer passphrase");
+    await expect(page.getByText("Password changed. Your other sessions were signed out.")).toBeVisible();
+    await expect(page.getByTestId("password-error")).toHaveCount(0);
+    await page.reload();
+    await expect(page.getByRole("heading", { level: 1, name: ADA.name })).toBeVisible();
+
+    await page.context().clearCookies();
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL(/error=credentials/);
+    await signIn(page, ADA.email, "a newer passphrase");
+    await page.waitForURL("**/git/repos");
+  });
+
+  test("signing out ends the session at the edge", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await page.getByRole("button", { name: "Sign out of Myelin" }).click();
+    await page.waitForURL(/\/login$/);
+    expect(await signOuts()).toEqual(["session"]);
+    await page.goto("/profile");
+    await page.waitForURL(/\/login$/);
+  });
+
+  test("signing out still signs this browser out when the edge cannot be reached", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ signOutUnavailable: true });
+    await page.getByRole("button", { name: "Sign out of Myelin" }).click();
+    await page.waitForURL(/\/login$/);
+    await page.goto("/profile");
+    await page.waitForURL(/\/login$/);
+  });
+
+  test("signing out of all devices asks first, then signs out everywhere; axe green", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await page.getByTestId("signout-everywhere").click();
+    await expect(page.getByTestId("signout-everywhere-confirm")).toContainText(
+      "Sign out on every device, including this one?",
+    );
+    await expectNoAxeViolations(page, "/profile (sign out everywhere)");
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(page.getByTestId("signout-everywhere-confirm")).toHaveCount(0);
+    expect(await signOuts()).toEqual([]);
+
+    await page.getByTestId("signout-everywhere").click();
+    await page.getByTestId("signout-everywhere-submit").click();
+    await page.waitForURL(/\/login\?signed_out=everywhere$/);
+    await expect(page.getByTestId("signed-out")).toHaveText("You were signed out of all devices.");
+    expect(await signOuts()).toEqual(["everywhere"]);
+  });
+
+  test("when the edge cannot sign out everywhere, the person stays signed in and is told", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ signOutUnavailable: true });
+    await page.getByTestId("signout-everywhere").click();
+    await page.getByTestId("signout-everywhere-submit").click();
+    await expect(page.getByTestId("signout-everywhere-error")).toContainText("couldn't be signed out");
+    await page.reload();
+    await expect(page.getByRole("heading", { level: 1, name: ADA.name })).toBeVisible();
+  });
+
+  test("a session the edge refuses sends the person to sign-in, saying so; axe green", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ forceUnauthorized: true });
+    await page.goto("/profile");
+    await page.waitForURL(/\/login\?signed_out=session$/);
+    await expect(page.getByTestId("signed-out")).toHaveText("You were signed out.");
+    await expectNoAxeViolations(page, "/login?signed_out=session");
+    await setEdgeConfig({ forceUnauthorized: false });
   });
 });

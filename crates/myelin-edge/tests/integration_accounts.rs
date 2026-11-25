@@ -141,7 +141,10 @@ impl Cell {
                 .unwrap()
                 .url,
         );
-        self.accounts.accept(&code, join(name, PASSWORD)).unwrap()
+        self.accounts
+            .accept(&code, join(name, PASSWORD))
+            .unwrap()
+            .principal
     }
 }
 
@@ -248,7 +251,8 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
     let joined = cell
         .accounts
         .accept(&code, join("Ada Lovelace", PASSWORD))
-        .expect("a failed attempt does not use up the link");
+        .expect("a failed attempt does not use up the link")
+        .principal;
     assert_eq!(joined.tenant.0, tenant);
     assert_eq!(joined.status, PrincipalStatus::Active);
     let profile = cell.accounts.profile(&joined).unwrap().expect("a profile");
@@ -270,7 +274,8 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
     let signed_in = cell
         .accounts
         .login(&format!("  {}  ", email.to_uppercase()), PASSWORD.into())
-        .expect("sign-in normalizes the email");
+        .expect("sign-in normalizes the email")
+        .principal;
     assert_eq!(signed_in.principal_id, joined.principal_id);
     for (who, password) in [
         (email.as_str(), "wrong password!"),
@@ -320,7 +325,8 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
                 password: "a brand new passphrase".into(),
             },
         )
-        .expect("the reset is accepted");
+        .expect("the reset is accepted")
+        .principal;
     assert_eq!(after_reset.principal_id, joined.principal_id);
     assert_eq!(
         cell.accounts.login(&email, PASSWORD.into()).unwrap_err(),
@@ -400,6 +406,7 @@ async fn two_people_racing_for_one_link_produce_exactly_one_account() {
                     .into_iter()
                     .find_map(Result::ok)
                     .unwrap()
+                    .principal
                     .with_tenant(&other_tenant),
                 &email,
             )
@@ -492,7 +499,11 @@ async fn sign_in_is_throttled_per_email_and_refused_to_inactive_or_removed_peopl
             .unwrap()
             .url,
     );
-    let person = cell.accounts.accept(&code, join("Hedy", PASSWORD)).unwrap();
+    let person = cell
+        .accounts
+        .accept(&code, join("Hedy", PASSWORD))
+        .unwrap()
+        .principal;
     let scope = myelin_storage::TenantScope::from_verified_token(&person, person.region.clone());
 
     cell.principals
@@ -975,7 +986,7 @@ async fn burst_of_logins(
     email: &str,
     password: &str,
     attempts: usize,
-) -> Vec<Result<myelin_identity::Principal, AccountError>> {
+) -> Vec<Result<myelin_edge::SignedIn, AccountError>> {
     let start = Arc::new(Barrier::new(attempts));
     let attempts: Vec<_> = (0..attempts)
         .map(|_| {

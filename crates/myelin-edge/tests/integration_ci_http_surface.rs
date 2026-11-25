@@ -563,6 +563,7 @@ fn mint(cell: &CellTokenAuthority) -> String {
         region: REGION.into(),
         subject_key: "viewer-subject".into(),
         jti: "ci-http-surface-viewer".into(),
+        issued_at_unix: Some(exp_unix - 3600),
         exp_unix,
         authority: vec!["edge.operator".into()],
         dpop_jkt: None,

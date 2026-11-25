@@ -87,6 +87,10 @@ const state = {
   mailDeliveryEnabled: true,
   sentMail: [],
   invitesPerRecipient: new Map(),
+  // Sign-outs the web app asked for ("session" or "everywhere"), read at GET /__test/sessions.
+  // `signOutUnavailable` makes both sign-out routes answer 503.
+  signOuts: [],
+  signOutUnavailable: false,
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
@@ -448,6 +452,8 @@ function resetAccounts() {
   state.mailDeliveryEnabled = true;
   state.sentMail = [];
   state.invitesPerRecipient = new Map();
+  state.signOuts = [];
+  state.signOutUnavailable = false;
 }
 resetAccounts();
 
@@ -497,6 +503,26 @@ async function handleAccountRoute(req, res, method, path) {
     const account = state.accounts.get(body.email.trim().toLowerCase());
     if (!account || account.password !== body.password) return send(res, 401, { error: { message: "login failed" } }), true;
     state.signedInDisplayName = account.displayName;
+    return send(res, 200, sessionGrant()), true;
+  }
+  if (method === "POST" && path === "/v1/auth/password/change") {
+    if (state.forceUnauthorized || bearer(req) !== DEV_ACCESS_TOKEN) {
+      return send(res, 401, unauthorizedEnvelope()), true;
+    }
+    const body = await readJson(req);
+    if (!exactKeys(body, ["current_password", "new_password"])) {
+      return send(res, 400, { error: { message: "bad request" } }), true;
+    }
+    if (state.loginRateLimited) return send(res, 429, { error: { message: "slow down" } }, { "retry-after": "60" }), true;
+    const account = state.accounts.get(E2E_ACCOUNT.email);
+    if (account.password !== body.current_password) {
+      return send(res, 403, { error: { code: "wrong_password", message: "the current password is not right" } }), true;
+    }
+    if ([...body.new_password].length < MIN_PASSWORD_LENGTH) {
+      return send(res, 422, { error: { code: "weak_password", message: "too short" } }), true;
+    }
+    account.password = body.new_password;
+    state.sentMail.push({ to: E2E_ACCOUNT.email, kind: "password_changed", url: `${WEB_ORIGIN}/login?help=password` });
     return send(res, 200, sessionGrant()), true;
   }
   if (method === "POST" && path === "/v1/auth/password/forgot") {
@@ -571,6 +597,21 @@ const server = createServer((req, res) => {
     return;
   }
 
+  // Sign-out: one session, or every session the person holds. The double has one shared token, so
+  // it records what was asked rather than refusing that token afterwards.
+  if (method === "POST" && (path === "/v1/auth/logout" || path === "/v1/auth/logout/everywhere")) {
+    if (state.forceUnauthorized || bearer(req) !== DEV_ACCESS_TOKEN) {
+      return send(res, 401, unauthorizedEnvelope());
+    }
+    if (state.signOutUnavailable) {
+      return send(res, 503, { error: { code: "unavailable", message: "sign-out is temporarily unavailable" } });
+    }
+    const scope = path.endsWith("/everywhere") ? "everywhere" : "session";
+    state.signOuts.push(scope);
+    return send(res, 200, { signed_out: scope });
+  }
+  if (method === "GET" && path === "/__test/sessions") return send(res, 200, { signOuts: state.signOuts });
+
   // The mail the double has "sent", oldest first (dev double ONLY).
   if (method === "GET" && path === "/__test/mail") return send(res, 200, { mail: state.sentMail });
 
@@ -604,6 +645,7 @@ const server = createServer((req, res) => {
         if (typeof body.loginRateLimited === "boolean") state.loginRateLimited = body.loginRateLimited;
         if (typeof body.mailDeliveryEnabled === "boolean") state.mailDeliveryEnabled = body.mailDeliveryEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
+        if (typeof body.signOutUnavailable === "boolean") state.signOutUnavailable = body.signOutUnavailable;
         if (typeof body.whoamiUnavailable === "boolean") {
           state.whoamiUnavailable = body.whoamiUnavailable;
         }

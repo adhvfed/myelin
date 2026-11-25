@@ -51,6 +51,7 @@ fn spec(tenant: &str, grants: &[&str], jkt: Option<String>) -> CapabilityMintSpe
         region: "eu-west".into(),
         subject_key: "subj-1".into(),
         jti: "jti-1".into(),
+        issued_at_unix: Some(NOW),
         exp_unix: NOW + 300,
         authority: grants.iter().map(|s| s.to_string()).collect(),
         dpop_jkt: jkt,

@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{Acceptance, AccountError, AccountService, MemberInvitation};
+use super::{Acceptance, AccountError, AccountService, MemberInvitation, SignedIn};
 use crate::catalogue::{Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::{no_store, route_segments};
@@ -21,11 +21,11 @@ pub(crate) fn is_account_path(path: &str) -> bool {
     let segments: Vec<&str> = route_segments(path).collect();
     matches!(
         segments.as_slice(),
-        ["v1", "auth", "password", "login" | "forgot"] | ["v1", "invitations"]
+        ["v1", "auth", "password", "login" | "forgot" | "change"] | ["v1", "invitations"]
     ) || matches!(segments.as_slice(), ["v1", "auth", "invitations", _, ..])
 }
 
-pub(crate) type SessionMint<'a> = &'a dyn Fn(&Principal) -> Result<(String, i64), EdgeError>;
+pub(crate) type SessionMint<'a> = &'a dyn Fn(&SignedIn) -> Result<(String, i64), EdgeError>;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +39,13 @@ struct LoginRequest {
 struct AcceptRequest {
     display_name: Option<String>,
     password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +87,12 @@ fn account_error(failure: AccountError) -> EdgeResponse {
             401,
             &json!({ "error": { "code": "unauthorized", "message": message } }),
         )),
+        // Not 401: the session that asked is fine, only the password it gave is not.
+        AccountError::WrongPassword => no_store(EdgeResponse::json(
+            403,
+            &json!({ "error": { "code": "wrong_password", "message": message } }),
+        )),
+        AccountError::NoPassword => error(&EdgeError::Conflict(message)),
         AccountError::InvitationNotFound | AccountError::NoSuchAccount => {
             error(&EdgeError::NotFound(message))
         }
@@ -111,8 +124,8 @@ fn account_error(failure: AccountError) -> EdgeResponse {
     }
 }
 
-fn session(principal: &Principal, mint: SessionMint<'_>) -> EdgeResponse {
-    match mint(principal) {
+fn session(signed_in: &SignedIn, mint: SessionMint<'_>) -> EdgeResponse {
+    match mint(signed_in) {
         Ok((access_token, expires_at)) => no_store(EdgeResponse::json(
             200,
             &json!({
@@ -147,7 +160,27 @@ pub(crate) fn login(
             .map_err(account_error)
     });
     match outcome {
-        Ok(principal) => session(&principal, mint),
+        Ok(signed_in) => session(&signed_in, mint),
+        Err(response) => response,
+    }
+}
+
+/// `POST /v1/auth/password/change`: `person` is the verified holder of the session that asked.
+/// The answer is a fresh session, since the change ends every session they held.
+pub(crate) fn change_password(
+    accounts: Option<&AccountService>,
+    request: &EdgeRequest,
+    person: &Principal,
+    mint: SessionMint<'_>,
+) -> EdgeResponse {
+    let outcome = configured(accounts).and_then(|accounts| {
+        let body: ChangePasswordRequest = parse(&request.body, "password change")?;
+        accounts
+            .change_password(person, body.current_password, body.new_password)
+            .map_err(account_error)
+    });
+    match outcome {
+        Ok(signed_in) => session(&signed_in, mint),
         Err(response) => response,
     }
 }
@@ -210,7 +243,7 @@ pub(crate) fn accept(
             .map_err(account_error)
     });
     match outcome {
-        Ok(principal) => session(&principal, mint),
+        Ok(signed_in) => session(&signed_in, mint),
         Err(response) => response,
     }
 }

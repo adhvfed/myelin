@@ -1,4 +1,4 @@
-use crate::accounts::AccountService;
+use crate::accounts::{AccountService, SignedIn};
 use crate::auth_request::{
     parse_auth_request, require_auth_request_budget, DeviceApprovalRequest, DeviceClaimRequest,
     DeviceStartRequest, LoginRequest,
@@ -7,7 +7,7 @@ use crate::authz::{authorize_edge_action, human_session_authority};
 use crate::catalogue::{Handler, HandlerCtx, Method};
 use crate::device_auth::{
     ApprovalOutcome, ClaimOutcome, DeviceApproval, DeviceAuthorizationBroker,
-    DeviceAuthorizationError, DEVICE_AUTHORIZATION_TTL_SECS,
+    DeviceAuthorizationClaim, DeviceAuthorizationError, DEVICE_AUTHORIZATION_TTL_SECS,
 };
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
@@ -15,7 +15,7 @@ use crate::shed_governor::{run_class_header, EdgeShed, RUN_CLASS_HEADER};
 use crate::sse::{SseEvent, SseHub};
 use myelin_events::clock::ClockError;
 use myelin_events::{IdMinter, UlidMinter};
-use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
+use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind, RevokeTarget};
 use myelin_identity_service::{
     machine_scheme, CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority,
     CredentialAudience, CredentialPurpose, DpopBinding, HumanSsoAuthenticator, PrincipalStore,
@@ -51,14 +51,16 @@ impl HumanSessionIssuer {
         principal: &Principal,
         assertion: &VerifiedAssertion,
     ) -> Result<(String, i64), EdgeError> {
-        self.mint_until(principal, assertion.expires_at_unix)
+        let now = self.now_unix()?;
+        self.mint_session(principal, now, assertion.expires_at_unix)
     }
 
-    /// A browser session for `principal`, ending at the source credential's expiry or after the
-    /// standard session lifetime, whichever is sooner.
-    fn mint_until(
+    /// A browser session for `principal` that counts as issued at `issued_at_unix`, ending at the
+    /// source credential's expiry or after the standard session lifetime, whichever is sooner.
+    fn mint_session(
         &self,
         principal: &Principal,
+        issued_at_unix: i64,
         source_expires_at_unix: Option<i64>,
     ) -> Result<(String, i64), EdgeError> {
         let now = self.now_unix()?;
@@ -75,6 +77,7 @@ impl HumanSessionIssuer {
             region: principal.region.0.clone(),
             subject_key: principal.principal_id.0.clone(),
             jti: format!("session-{}", self.jtis.mint().0),
+            issued_at_unix: Some(issued_at_unix),
             exp_unix: expiry,
             authority: human_session_authority(),
             dpop_jkt: None,
@@ -86,12 +89,12 @@ impl HumanSessionIssuer {
 
     fn mint_device_session(
         &self,
-        approval: &DeviceApproval,
-        session_jti: &str,
-        authorization_expires_at_unix: i64,
+        claim: &DeviceAuthorizationClaim,
     ) -> Result<(String, i64), EdgeError> {
+        let (approval, session_jti) = (&claim.approval, claim.session_jti.as_str());
         let now = self.now_unix()?;
-        let authorization_started_at_unix = authorization_expires_at_unix
+        let authorization_started_at_unix = claim
+            .authorization_expires_at_unix
             .checked_sub(DEVICE_AUTHORIZATION_TTL_SECS)
             .ok_or_else(|| EdgeError::Unauthorized("the CLI login request is invalid".into()))?;
         let expiry = approval
@@ -123,6 +126,7 @@ impl HumanSessionIssuer {
             region: approval.principal.region.0.clone(),
             subject_key: approval.principal.principal_id.0.clone(),
             jti: session_jti.to_string(),
+            issued_at_unix: Some(claim.approved_at_unix),
             exp_unix: expiry,
             authority: approval.authority.clone(),
             dpop_jkt: None,
@@ -513,6 +517,9 @@ enum PublicEndpoint {
     Login,
     PasswordLogin,
     ForgotPassword,
+    ChangePassword,
+    Logout,
+    LogoutEverywhere,
     Invitation(String),
     AcceptInvitation(String),
     BeginDeviceAuthorization,
@@ -683,6 +690,15 @@ impl Gateway {
             (Method::Post, "/v1/auth/password/forgot") => {
                 return Ok(PreparedKind::Public(PublicEndpoint::ForgotPassword))
             }
+            (Method::Post, "/v1/auth/password/change") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::ChangePassword))
+            }
+            (Method::Post, "/v1/auth/logout") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::Logout))
+            }
+            (Method::Post, "/v1/auth/logout/everywhere") => {
+                return Ok(PreparedKind::Public(PublicEndpoint::LogoutEverywhere))
+            }
             (Method::Post, "/v1/auth/device/authorization") => {
                 return Ok(PreparedKind::Public(
                     PublicEndpoint::BeginDeviceAuthorization,
@@ -783,8 +799,19 @@ impl Gateway {
                 PublicEndpoint::PasswordLogin => Ok(crate::accounts::http::login(
                     self.accounts.as_ref(),
                     req,
-                    &|principal| self.mint_password_session(principal),
+                    &|signed_in| self.mint_password_session(signed_in),
                 )),
+                PublicEndpoint::ChangePassword => {
+                    let identity = self.person_session(req)?;
+                    Ok(crate::accounts::http::change_password(
+                        self.accounts.as_ref(),
+                        req,
+                        &identity.principal,
+                        &|signed_in| self.mint_password_session(signed_in),
+                    ))
+                }
+                PublicEndpoint::Logout => self.logout(req),
+                PublicEndpoint::LogoutEverywhere => self.logout_everywhere(req),
                 PublicEndpoint::ForgotPassword => {
                     Ok(crate::accounts::http::forgot(self.accounts.as_ref(), req))
                 }
@@ -796,7 +823,7 @@ impl Gateway {
                     self.accounts.as_ref(),
                     req,
                     code,
-                    &|principal| self.mint_password_session(principal),
+                    &|signed_in| self.mint_password_session(signed_in),
                 )),
                 PublicEndpoint::BeginDeviceAuthorization => self.begin_device_authorization(req),
                 PublicEndpoint::ApproveDeviceAuthorization => {
@@ -974,11 +1001,63 @@ impl Gateway {
         )
     }
 
-    fn mint_password_session(&self, principal: &Principal) -> Result<(String, i64), EdgeError> {
+    fn mint_password_session(&self, signed_in: &SignedIn) -> Result<(String, i64), EdgeError> {
         self.human_session_issuer
             .as_ref()
             .ok_or_else(|| EdgeError::Unavailable("human session issuer is unavailable".into()))?
-            .mint_until(principal, None)
+            .mint_session(&signed_in.principal, signed_in.issued_at_unix, None)
+    }
+
+    /// The verified identity behind a person's own session (browser or CLI). Other credentials,
+    /// such as agent or operator tokens, cannot sign a person out or change their password.
+    fn person_session(&self, req: &EdgeRequest) -> Result<RequestIdentity, EdgeError> {
+        let identity = self.authenticate(req, None, false)?;
+        if identity.capability().purpose != CredentialPurpose::HumanSession {
+            return Err(EdgeError::Forbidden(
+                "only a person's own session can do this".into(),
+            ));
+        }
+        Ok(identity)
+    }
+
+    /// `POST /v1/auth/logout`: ends the session that asks, durably, until it would have expired.
+    fn logout(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
+        let identity = self.person_session(req)?;
+        let capability = identity.capability();
+        let now = myelin_events::clock::system_clock_reading()
+            .map_err(|error| EdgeError::Unavailable(format!("clock unavailable: {error}")))?;
+        let expires_at = myelin_events::clock::clock_reading_from_unix(capability.expires_at_unix)
+            .map_err(|_| EdgeError::Unauthorized("the session has an invalid expiry".into()))?;
+        self.authn
+            .revocations()
+            .revoke_until(
+                &identity.scope,
+                &RevokeTarget::Jti(capability.jti.clone()),
+                now.timestamp(),
+                expires_at.timestamp(),
+            )
+            .map_err(|_| EdgeError::Unavailable("sign-out is temporarily unavailable".into()))?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({ "signed_out": "session" }),
+        )))
+    }
+
+    /// `POST /v1/auth/logout/everywhere`: ends every session the person holds, this one included.
+    fn logout_everywhere(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
+        let identity = self.person_session(req)?;
+        let ended = self
+            .authn
+            .principals()
+            .end_sessions(&identity.scope, &identity.principal.principal_id)
+            .map_err(|_| EdgeError::Unavailable("sign-out is temporarily unavailable".into()))?;
+        if ended.is_none() {
+            return Err(EdgeError::Unauthorized("authentication failed".into()));
+        }
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({ "signed_out": "everywhere" }),
+        )))
     }
 
     fn begin_device_authorization(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
@@ -1078,11 +1157,7 @@ impl Gateway {
                 let issuer = self.human_session_issuer.as_ref().ok_or_else(|| {
                     EdgeError::Unavailable("human session issuer is unavailable".into())
                 })?;
-                let (access_token, expires_at) = issuer.mint_device_session(
-                    &claim.approval,
-                    &claim.session_jti,
-                    claim.authorization_expires_at_unix,
-                )?;
+                let (access_token, expires_at) = issuer.mint_device_session(&claim)?;
                 Ok(no_store(EdgeResponse::json(
                     200,
                     &json!({
@@ -1466,6 +1541,7 @@ mod tests {
                 dpop_bound: true,
                 purpose: myelin_identity_service::CredentialPurpose::Pat,
                 audience: myelin_identity_service::CredentialAudience::Edge,
+                issued_at_unix: None,
                 exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
             })
         }
@@ -1618,6 +1694,7 @@ mod tests {
                 dpop_bound: true,
                 purpose: myelin_identity_service::CredentialPurpose::Pat,
                 audience: myelin_identity_service::CredentialAudience::Edge,
+                issued_at_unix: None,
                 exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
             })
         }
@@ -1894,13 +1971,30 @@ mod tests {
             "the web BFF's opaque cookie is meaningful only to the BFF; Edge requires its bounded capability"
         );
 
-        for obsolete_path in ["/v1/auth/refresh", "/v1/auth/logout"] {
-            let response =
-                gateway.handle(EdgeRequest::new("POST", obsolete_path, "", vec![], vec![]));
+        let refresh = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/refresh",
+            "",
+            vec![],
+            vec![],
+        ));
+        assert_eq!(
+            refresh.status(),
+            404,
+            "a session is never refreshed; signing in again makes a new one"
+        );
+        for path in ["/v1/auth/logout", "/v1/auth/logout/everywhere"] {
+            let cookie_only = gateway.handle(EdgeRequest::new(
+                "POST",
+                path,
+                "",
+                vec![("cookie".into(), "myelin_session=obsolete".into())],
+                vec![],
+            ));
             assert_eq!(
-                response.status(),
-                404,
-                "Edge must not advertise a parallel cookie lifecycle at {obsolete_path}"
+                cookie_only.status(),
+                401,
+                "signing out names the session by its capability, never by a cookie: {path}"
             );
         }
     }
@@ -2111,6 +2205,101 @@ mod tests {
     }
 
     #[test]
+    fn signing_out_ends_one_session_and_signing_out_everywhere_ends_them_all() {
+        use myelin_identity::{DataRole, PrincipalId, PrincipalStatus};
+
+        let now = myelin_events::clock::system_clock_reading()
+            .unwrap()
+            .unix_seconds();
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[43_u8; 32], &[44_u8; 32]).unwrap());
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(
+                PrincipalId("p:ada".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            ),
+            Region("eu-west".into()),
+        );
+        store
+            .put_principal(
+                &scope,
+                PrincipalId("p:ada".into()),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        let session = |jti: &str, issued_at_unix: i64| {
+            cell.mint(&CapabilityMintSpec {
+                tenant: "acme".into(),
+                region: "eu-west".into(),
+                subject_key: "p:ada".into(),
+                jti: jti.into(),
+                issued_at_unix: Some(issued_at_unix),
+                exp_unix: now + 3600,
+                authority: human_session_authority(),
+                dpop_jkt: None,
+                purpose: CredentialPurpose::HumanSession,
+                audience: CredentialAudience::Edge,
+            })
+        };
+        let (laptop, phone, tablet) = (
+            session("session-laptop", now - 60),
+            session("session-phone", now - 60),
+            session("session-tablet", now - 60),
+        );
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        ));
+        let gateway = Gateway::builder(authn, human_login(), Arc::new(AllowAll))
+            .default_token_scheme("session")
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler::default()),
+            )
+            .build();
+        let call = |method: &str, path: &str, token: &str| {
+            gateway
+                .handle(EdgeRequest::new(
+                    method,
+                    path,
+                    "",
+                    vec![("authorization".into(), format!("Bearer {token}"))],
+                    vec![],
+                ))
+                .status()
+        };
+
+        assert_eq!(call("POST", "/v1/auth/logout", &laptop), 200);
+        assert_eq!(call("GET", "/v1/whoami", &laptop), 401);
+        assert_eq!(
+            call("GET", "/v1/whoami", &phone),
+            200,
+            "only that session ended"
+        );
+
+        assert_eq!(call("POST", "/v1/auth/logout/everywhere", &phone), 200);
+        assert_eq!(
+            call("GET", "/v1/whoami", &phone),
+            401,
+            "the asking session ends too"
+        );
+        assert_eq!(call("GET", "/v1/whoami", &tablet), 401);
+        let later = session("session-later", now + 2);
+        assert_eq!(
+            call("GET", "/v1/whoami", &later),
+            200,
+            "a new sign-in works"
+        );
+    }
+
+    #[test]
     fn browser_approval_mints_one_fresh_cli_session_without_transferring_its_token() {
         use base64::Engine as _;
         use myelin_identity::{DataRole, PrincipalId, PrincipalStatus};
@@ -2147,6 +2336,7 @@ mod tests {
             region: principal.region.0.clone(),
             subject_key: principal.principal_id.0.clone(),
             jti: "browser-session".into(),
+            issued_at_unix: Some(source_expiry - 3600),
             exp_unix: source_expiry,
             authority: human_session_authority(),
             dpop_jkt: None,
@@ -2804,6 +2994,7 @@ mod git_wire_basic_auth_tests {
             region: REGION.into(),
             subject_key: subject_key.into(),
             jti: jti.into(),
+            issued_at_unix: Some(0),
             exp_unix: 9_999_999_999,
             authority: authority.iter().map(|grant| (*grant).into()).collect(),
             dpop_jkt: None,

@@ -121,6 +121,22 @@ impl RevocationStore {
         self.insert(scope, kind, handle, now, None)
     }
 
+    /// Denies `target` until `expires_at`, after which the credential it names has expired
+    /// anyway and the entry no longer matters.
+    pub fn revoke_until(
+        &self,
+        scope: &TenantScope,
+        target: &RevokeTarget,
+        now: Timestamp,
+        expires_at: Timestamp,
+    ) -> Result<(), myelin_storage::ProviderError> {
+        let (kind, handle) = match target {
+            RevokeTarget::Jti(jti) => (RevokedKind::Jti, jti.clone()),
+            RevokeTarget::Principal(pid) => (RevokedKind::Principal, pid.0.clone()),
+        };
+        self.insert(scope, kind, handle, now, Some(expires_at))
+    }
+
     pub fn disable_principal(
         &self,
         scope: &TenantScope,

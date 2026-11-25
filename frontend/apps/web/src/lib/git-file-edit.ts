@@ -6,6 +6,7 @@ import {
   parseGitFileEditReceipt,
   type GitFileEditResult,
 } from "./git-file-edit-contract";
+import { loginAfter } from "./auth-return";
 
 export * from "./git-file-edit-contract";
 
@@ -30,7 +31,7 @@ export const commitGitFile = action(async (value: unknown) => {
     ));
     return respond(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) return respond({ ok: false, error: "bad-input" });
       if (error.status === 403) return respond({ ok: false, error: "forbidden" });

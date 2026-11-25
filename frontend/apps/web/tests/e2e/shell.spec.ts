@@ -156,7 +156,8 @@ test.describe("MR-019 app shell — real browser", () => {
       await staleContext.addCookies([{ ...first!, expires: -1 }]);
       const stalePage = await staleContext.newPage();
       await stalePage.goto(`${APP}/git/repos`);
-      await stalePage.waitForURL("**/login");
+      await stalePage.waitForURL("**/login?signed_out=session");
+      await expect(stalePage.getByTestId("signed-out")).toHaveText("You were signed out.");
     } finally {
       await staleContext.close();
     }

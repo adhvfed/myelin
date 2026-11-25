@@ -6,6 +6,7 @@ import { runGateway, GatewayError, Unauthorized } from "./gateway-core";
 import {
   clearCurrentSession,
   getSessionRecord,
+  hasSessionCookie,
   updateSessionToken,
 } from "./session";
 import { edgeOrigin } from "./edge-origin";
@@ -297,7 +298,10 @@ async function edgeRequest<T>(
   const scheme = initialSession?.scheme ?? "pat";
   const signal = gatewayRequestSignal(options);
   return runGateway<T>({
-    getToken: () => initialSession?.token ?? null,
+    getToken: () => {
+      if (!initialSession) throw missingSession();
+      return initialSession.token;
+    },
     doFetch: async (token) => {
       const res = await fetch(`${edgeOrigin()}${path}`, {
         method,
@@ -366,7 +370,7 @@ export async function edgeGetEventStream(
 ): Promise<Response> {
   const initialSession = await getSessionRecord();
   const token = initialSession?.token;
-  if (!token) throw new Unauthorized("no session token (not authenticated)");
+  if (!token) throw missingSession();
 
   const doFetch = async (accessToken: string): Promise<Response> => {
     const connect = new AbortController();
@@ -427,14 +431,14 @@ export async function edgeGetEventStream(
   }
   if (!fresh) {
     await clearCurrentSession();
-    throw new Unauthorized("session refresh failed");
+    throw new Unauthorized("session refresh failed", { refused: true });
   }
 
   response = await doFetch(fresh);
   if (response.status === 401) {
     await response.body?.cancel().catch(() => undefined);
     await clearCurrentSession();
-    throw new Unauthorized("still unauthorized after one refresh");
+    throw new Unauthorized("still unauthorized after one refresh", { refused: true });
   }
   return response;
 }
@@ -455,7 +459,7 @@ export async function edgeGetRaw(
     });
 
   const token = initialSession?.token;
-  if (!token) throw new Unauthorized("no session token (not authenticated)");
+  if (!token) throw missingSession();
   let res = await doFetch(token);
   if (res.status === 401) {
     // Retry once after refreshing the session.
@@ -478,13 +482,13 @@ export async function edgeGetRaw(
     }
     if (!fresh) {
       await clearCurrentSession();
-      throw new Unauthorized("still unauthorized after one refresh");
+      throw new Unauthorized("still unauthorized after one refresh", { refused: true });
     }
     res = await doFetch(fresh);
     if (res.status === 401) {
       await res.body?.cancel().catch(() => undefined);
       await clearCurrentSession();
-      throw new Unauthorized("still unauthorized after one refresh");
+      throw new Unauthorized("still unauthorized after one refresh", { refused: true });
     }
   }
   return {
@@ -492,6 +496,11 @@ export async function edgeGetRaw(
     contentType: res.headers.get("content-type") ?? "application/octet-stream",
     body: streamLimitedBytes(res, MAX_EDGE_RAW_RESPONSE_BYTES),
   };
+}
+
+/** No session record for this request. A cookie without one names a session that has ended. */
+function missingSession(): Unauthorized {
+  return new Unauthorized("no session token (not authenticated)", { refused: hasSessionCookie() });
 }
 
 function parseJson(text: string): unknown {

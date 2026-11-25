@@ -306,7 +306,9 @@ test.describe("GT-004 Git web UI — real browser", () => {
     });
     expect(forced.ok()).toBe(true);
     await page.goto("/git/repos/myelin");
-    await page.waitForURL("**/login");
+    // The open page's own background request may meet the refusal first and clear the cookie; the
+    // navigation then finds no session at all.
+    await page.waitForURL(/\/login(\?signed_out=session)?$/);
     expect(consoleErrors.filter((message) => message.includes("Content Security Policy"))).toEqual([]);
   });
 });

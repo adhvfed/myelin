@@ -38,6 +38,11 @@ CREATE POLICY myelin_tenant_isolation ON principal \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+/// Human sessions issued before this unix second are refused. Moved forward, never back, when a
+/// person's sessions are ended; NULL when they never were.
+pub const PRINCIPAL_SESSIONS_NOT_BEFORE_MIGRATION: &str =
+    "ALTER TABLE principal ADD COLUMN IF NOT EXISTS sessions_not_before bigint;";
+
 pub const REVOCATION_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS revocation (
     tenant_id  text NOT NULL,
@@ -297,6 +302,11 @@ pub fn identity_durable_migrations() -> Migrations {
         Migration::plain("0017_revocation_rls", REVOCATION_RLS_POLICY),
         Migration::plain("0018_run_token_teardown", RUN_TOKEN_TEARDOWN_MIGRATION),
         Migration::plain("0019_run_token_teardown_rls", RUN_TOKEN_TEARDOWN_RLS_POLICY),
+        Migration::plain_on(
+            "0181_principal_sessions_not_before",
+            PRINCIPAL_SESSIONS_NOT_BEFORE_MIGRATION,
+            "principal",
+        ),
     ])
 }
 
@@ -704,6 +714,8 @@ pub struct DurablePrincipalRow {
     pub data_role: String,
     pub status: String,
     pub profile: Option<DurableProfileBlob>,
+    /// Read back only. Writes leave it as stored; `end_sessions` is the one thing that moves it.
+    pub sessions_not_before: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -882,7 +894,8 @@ impl DurablePrincipalBacking {
                 Box::pin(async move {
                     let row = sqlx::query(
                         "SELECT principal_id, kind, data_role, status, \
-                                profile_key_ref, profile_nonce, profile_ciphertext \
+                                profile_key_ref, profile_nonce, profile_ciphertext, \
+                                sessions_not_before \
                          FROM principal \
                          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3",
                     )
@@ -909,7 +922,8 @@ impl DurablePrincipalBacking {
                 Box::pin(async move {
                     let rows = sqlx::query(
                         "SELECT principal_id, kind, data_role, status, \
-                                profile_key_ref, profile_nonce, profile_ciphertext \
+                                profile_key_ref, profile_nonce, profile_ciphertext, \
+                                sessions_not_before \
                          FROM principal WHERE tenant_id = $1 AND region = $2 \
                          ORDER BY principal_id",
                     )
@@ -940,7 +954,8 @@ impl DurablePrincipalBacking {
                 Box::pin(async move {
                     let rows = sqlx::query(
                         "SELECT principal_id, kind, data_role, status, \
-                                profile_key_ref, profile_nonce, profile_ciphertext \
+                                profile_key_ref, profile_nonce, profile_ciphertext, \
+                                sessions_not_before \
                            FROM principal \
                           WHERE tenant_id = $1 AND region = $2 \
                             AND ($3::text IS NULL OR principal_id > $3) \
@@ -1018,7 +1033,8 @@ impl DurablePrincipalBacking {
                 Box::pin(async move {
                     let row = sqlx::query(
                         "SELECT p.principal_id, p.kind, p.data_role, p.status, \
-                                p.profile_key_ref, p.profile_nonce, p.profile_ciphertext \
+                                p.profile_key_ref, p.profile_nonce, p.profile_ciphertext, \
+                                p.sessions_not_before \
                          FROM credential_link c \
                          JOIN principal p ON p.tenant_id = c.tenant_id \
                               AND p.region = c.region AND p.principal_id = c.principal_id \
@@ -1031,6 +1047,50 @@ impl DurablePrincipalBacking {
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
                     row.map(|row| row_to_principal(&row)).transpose()
+                })
+            })
+            .await
+    }
+}
+
+impl DurablePrincipalBacking {
+    /// Ends every human session the person holds, inside a caller-owned tenant transaction, and
+    /// returns the new cutoff: the first second whose sessions stay valid. It is the next second
+    /// by the database clock, and always past the old cutoff, so a session issued at the old one
+    /// ends too. `None` when there is no such person.
+    pub async fn end_sessions_in_tx(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        principal_id: &str,
+    ) -> Result<Option<i64>, PgError> {
+        sqlx::query_scalar(
+            "UPDATE principal SET sessions_not_before = GREATEST( \
+               COALESCE(sessions_not_before, 0) + 1, \
+               floor(extract(epoch FROM clock_timestamp()))::bigint + 1) \
+             WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
+             RETURNING sessions_not_before",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(principal_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    pub async fn end_sessions(
+        &self,
+        tenant: &str,
+        principal_id: &str,
+    ) -> Result<Option<i64>, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let pid = principal_id.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    Self::end_sessions_in_tx(conn, &tenant_owned, &region, &pid).await
                 })
             })
             .await
@@ -1054,6 +1114,9 @@ fn row_to_principal(r: &sqlx::postgres::PgRow) -> Result<DurablePrincipalRow, cr
         data_role: r.try_get("data_role").map_err(principal_row_decode)?,
         status: r.try_get("status").map_err(principal_row_decode)?,
         profile,
+        sessions_not_before: r
+            .try_get("sessions_not_before")
+            .map_err(principal_row_decode)?,
     })
 }
 

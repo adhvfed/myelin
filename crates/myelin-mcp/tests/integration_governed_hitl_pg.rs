@@ -462,6 +462,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
                 data_role: serde_json::to_string(&myelin_identity::DataRole::Controller).unwrap(),
                 status: serde_json::to_string(&myelin_identity::PrincipalStatus::Active).unwrap(),
                 profile: None,
+                sessions_not_before: None,
             },
             "credential\0link",
         )

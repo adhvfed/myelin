@@ -20,8 +20,8 @@ pub(crate) enum Letter {
     },
     PasswordChanged {
         to: String,
-        /// Where to sign in or ask for a reset; absent when the web app's origin is not set.
-        sign_in: Option<String>,
+        /// Where to ask for a reset; absent when the web app's origin is not set.
+        reset: Option<String>,
     },
 }
 
@@ -81,19 +81,23 @@ impl Letter {
                     )),
                 ],
             ),
-            Self::PasswordChanged { to, sign_in } => {
-                let mut lines = vec![
-                    Line::Text(format!(
-                        "The password for your Myelin account, {to}, was just changed."
-                    )),
-                    Line::Text(
-                        "If that was you, there's nothing else to do. If it wasn't, reset your \
-                         password now and tell whoever runs your Myelin deployment."
+            Self::PasswordChanged { to, reset } => {
+                let mut lines = vec![Line::Text(format!(
+                    "The password for your Myelin account, {to}, was just changed. All other \
+                     sessions were signed out."
+                ))];
+                match reset {
+                    Some(reset) => {
+                        lines.push(Line::Text(
+                            "If this wasn't you, reset your password:".into(),
+                        ));
+                        lines.push(Line::Link(reset));
+                    }
+                    None => lines.push(Line::Text(
+                        "If this wasn't you, ask whoever runs your Myelin deployment to reset \
+                         your password."
                             .into(),
-                    ),
-                ];
-                if let Some(sign_in) = sign_in {
-                    lines.push(Line::Link(sign_in));
+                    )),
                 }
                 compose("Your Myelin password was changed".into(), &lines)
             }
@@ -210,7 +214,7 @@ mod tests {
             },
             Letter::PasswordChanged {
                 to: "ada@example.com".into(),
-                sign_in: None,
+                reset: None,
             },
         ] {
             let queued = serde_json::to_vec(&letter).unwrap();
@@ -219,13 +223,18 @@ mod tests {
     }
 
     #[test]
-    fn the_change_notice_points_at_sign_in_when_it_can() {
+    fn the_change_notice_says_the_other_sessions_ended_and_where_to_reset() {
         let rendered = Letter::PasswordChanged {
             to: "ada@example.com".into(),
-            sign_in: Some("https://myelin.example/login".into()),
+            reset: Some("https://myelin.example/login?help=password".into()),
         }
         .render();
         assert!(rendered.text.contains("ada@example.com"));
-        assert!(rendered.text.contains("https://myelin.example/login"));
+        assert!(rendered
+            .text
+            .contains("All other sessions were signed out."));
+        assert!(rendered.text.contains(
+            "If this wasn't you, reset your password:\n\nhttps://myelin.example/login?help=password"
+        ));
     }
 }

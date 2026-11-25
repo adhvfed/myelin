@@ -2,7 +2,8 @@ import { expect, test, type Page } from "@playwright/test";
 
 // A person's account, start to finish, against the real stack: the operator's first invitation
 // link, a chosen password, an ordinary sign-in, an emailed invitation for a teammate, and a
-// forgotten password reset from an emailed link. Mail is read from the stack's Mailpit inbox.
+// forgotten password reset from an emailed link, a password change on one of two devices, and
+// signing out of all of them. Mail is read from the stack's Mailpit inbox.
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -113,9 +114,46 @@ test("an invited person creates an account, invites a teammate by email, and res
   await resetPage.waitForURL("**/git/repos");
   await forgetful.close();
 
-  await page.context().clearCookies();
+  // The reset ended the session Ada had open before it.
+  await page.goto("/profile");
+  await page.waitForURL(/\/login\?signed_out=session$/);
+  await expect(page.getByTestId("signed-out")).toHaveText("You were signed out.");
+
   await signIn(page, inviteEmail, password);
   await page.waitForURL(/error=credentials/);
   await signIn(page, inviteEmail, "a password from the inbox");
   await page.waitForURL("**/git/repos");
+
+  // Signed in on a second device, Ada changes her password on the first. The first stays signed
+  // in; the second is signed out.
+  const phoneContext = await browser.newContext();
+  const phone = await phoneContext.newPage();
+  await signIn(phone, inviteEmail, "a password from the inbox");
+  await phone.waitForURL("**/git/repos");
+
+  await page.goto("/profile");
+  await page.waitForLoadState("networkidle");
+  await page.getByTestId("current-password").fill("a password from the inbox");
+  await page.getByTestId("new-password").fill("a password changed in place");
+  await page.getByTestId("confirm-password").fill("a password changed in place");
+  await page.getByTestId("password-submit").click();
+  await expect(page.getByText("Password changed. Your other sessions were signed out.")).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole("heading", { level: 1, name: "Ada Lovelace" })).toBeVisible();
+
+  await phone.goto("/profile");
+  await phone.waitForURL(/\/login\?signed_out=session$/);
+  await expect(phone.getByTestId("signed-out")).toHaveText("You were signed out.");
+  await signIn(phone, inviteEmail, "a password changed in place");
+  await phone.waitForURL("**/git/repos");
+
+  // Signing out of all devices ends both.
+  await page.waitForLoadState("networkidle");
+  await page.getByTestId("signout-everywhere").click();
+  await page.getByTestId("signout-everywhere-submit").click();
+  await page.waitForURL(/\/login\?signed_out=everywhere$/);
+  await expect(page.getByTestId("signed-out")).toHaveText("You were signed out of all devices.");
+  await phone.goto("/profile");
+  await phone.waitForURL(/\/login\?signed_out=session$/);
+  await phoneContext.close();
 });

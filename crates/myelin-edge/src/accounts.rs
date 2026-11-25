@@ -78,6 +78,10 @@ pub enum AccountError {
     /// A reset link changes only the password; it does not take a name.
     UnexpectedDisplayName,
     LoginFailed,
+    /// The current password given to change it is not the person's password.
+    WrongPassword,
+    /// The person signs in another way and has no password to change.
+    NoPassword,
     /// Unknown, expired, used, or superseded invitation; deliberately one answer.
     InvitationNotFound,
     WeakPassword,
@@ -106,6 +110,8 @@ impl core::fmt::Display for AccountError {
                 formatter.write_str("a password reset takes only a password")
             }
             Self::LoginFailed => formatter.write_str("login failed"),
+            Self::WrongPassword => formatter.write_str("the current password is not right"),
+            Self::NoPassword => formatter.write_str("this account signs in without a password"),
             Self::InvitationNotFound => formatter.write_str("invitation not found"),
             Self::WeakPassword => {
                 formatter.write_str("the password must be between 10 and 1024 characters long")
@@ -166,6 +172,14 @@ pub struct IssuedInvitation {
 pub enum MemberInvitation {
     Emailed { email: String, expires_at_unix: i64 },
     HandedOver(IssuedInvitation),
+}
+
+/// A person whose password was just confirmed, and the moment the session made for them counts
+/// as issued: by the database clock, and never before the person's session cutoff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignedIn {
+    pub principal: Principal,
+    pub issued_at_unix: i64,
 }
 
 /// What the person sends to accept a link. A join needs their name; a reset does not.
@@ -362,7 +376,7 @@ impl AccountService {
     /// Each attempt takes a slot in the email's window before it verifies anything, so a burst
     /// of guesses at one email gets at most the window's worth of verifications. A slot is only
     /// given back for an attempt that never verified (the hash gate was busy) or that succeeded.
-    pub fn login(&self, email: &str, password: String) -> Result<Principal, AccountError> {
+    pub fn login(&self, email: &str, password: String) -> Result<SignedIn, AccountError> {
         // A malformed email cannot belong to an account and is not counted, but it pays for a
         // verification like any other attempt so the answer reveals nothing.
         let digest = Email::parse(email).map(|email| self.digester.digest(&email));
@@ -391,14 +405,14 @@ impl AccountService {
         };
         #[cfg(any(test, feature = "test-support"))]
         self.reached(Checkpoint::PasswordVerified);
-        let principal = match account {
+        let signed_in = match account {
             Some(account) if verified => self.still_signs_in(&account)?,
             _ => None,
         };
-        match (principal, slot) {
-            (Some(principal), Some(slot)) => {
+        match (signed_in, slot) {
+            (Some(signed_in), Some(slot)) => {
                 self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
-                Ok(principal)
+                Ok(signed_in)
             }
             // The failure was already counted when its slot was taken.
             _ => Err(AccountError::LoginFailed),
@@ -418,14 +432,17 @@ impl AccountService {
 
     /// The person behind a verified password, if the password is still the stored one and the
     /// person is still active. A reset that lands during verification makes this `None`.
-    fn still_signs_in(&self, account: &AccountRow) -> Result<Option<Principal>, AccountError> {
+    fn still_signs_in(&self, account: &AccountRow) -> Result<Option<SignedIn>, AccountError> {
         let Some(principal) =
             self.active_human(&account.tenant, &account.region, &account.principal_id)?
         else {
             return Ok(None);
         };
-        let current = self.block(async { Ok(self.store.still_signs_in(account).await?) })?;
-        Ok(current.then_some(principal))
+        let issued_at = self.block(async { Ok(self.store.still_signs_in(account).await?) })?;
+        Ok(issued_at.map(|issued_at_unix| SignedIn {
+            principal,
+            issued_at_unix,
+        }))
     }
 
     fn active_human(
@@ -495,7 +512,7 @@ impl AccountService {
     /// Accepts a link: a join creates the person, a reset replaces their password. Either way the
     /// person is signed in as the result. The link is found before any password is hashed, so
     /// only someone holding a live link can make this Edge run Argon2.
-    pub fn accept(&self, code: &str, acceptance: Acceptance) -> Result<Principal, AccountError> {
+    pub fn accept(&self, code: &str, acceptance: Acceptance) -> Result<SignedIn, AccountError> {
         let live = self.block(self.live_link(code))?;
         match live.invitation.kind {
             InvitationKind::Join => self.accept_join(live, acceptance),
@@ -507,7 +524,7 @@ impl AccountService {
         &self,
         live: LiveLink,
         acceptance: Acceptance,
-    ) -> Result<Principal, AccountError> {
+    ) -> Result<SignedIn, AccountError> {
         let display_name = display_name(acceptance.display_name.as_deref())?;
         let password = Password::new(acceptance.password)?;
         // The common conflict is answered before a hash or a key is made for it.
@@ -572,19 +589,13 @@ impl AccountService {
         &self,
         live: LiveLink,
         acceptance: Acceptance,
-    ) -> Result<Principal, AccountError> {
+    ) -> Result<SignedIn, AccountError> {
         if acceptance.display_name.is_some() {
             return Err(AccountError::UnexpectedDisplayName);
         }
         let password = Password::new(acceptance.password)?;
         let password_phc = self.hashing(|| password.hash())?;
-        let notice = self.mail.as_ref().map(|outbox| {
-            let letter = Letter::PasswordChanged {
-                to: live.email.as_str().to_string(),
-                sign_in: self.sign_in_help(),
-            };
-            (outbox.clone(), letter)
-        });
+        let notice = self.password_changed_notice(live.email.as_str());
         let outcome = self.block(async {
             Ok(self
                 .store
@@ -594,18 +605,98 @@ impl AccountService {
         self.signed_in_after(&live.invitation, outcome)
     }
 
+    fn password_changed_notice(&self, email: &str) -> Option<(MailOutbox, Letter)> {
+        self.mail.as_ref().map(|outbox| {
+            let letter = Letter::PasswordChanged {
+                to: email.to_string(),
+                reset: self.reset_help(),
+            };
+            (outbox.clone(), letter)
+        })
+    }
+
     fn signed_in_after(
         &self,
         invitation: &Invitation,
         outcome: AcceptOutcome,
-    ) -> Result<Principal, AccountError> {
+    ) -> Result<SignedIn, AccountError> {
         match outcome {
-            AcceptOutcome::Accepted { principal_id } => self
+            AcceptOutcome::Accepted {
+                principal_id,
+                issued_at_unix,
+            } => self
                 .active_human(&invitation.tenant, &invitation.region, &principal_id)?
+                .map(|principal| SignedIn {
+                    principal,
+                    issued_at_unix,
+                })
                 .ok_or(AccountError::InvitationNotFound),
             AcceptOutcome::Gone => Err(AccountError::InvitationNotFound),
             AcceptOutcome::EmailTaken => Err(AccountError::AccountExists),
         }
+    }
+
+    /// A signed-in person changes their password. A wrong current password counts against the
+    /// same per-email allowance as a failed sign-in. On success every session the person holds
+    /// ends, and they are signed in afresh.
+    pub fn change_password(
+        &self,
+        person: &Principal,
+        current: String,
+        new: String,
+    ) -> Result<SignedIn, AccountError> {
+        let new = Password::new(new)?;
+        let (tenant, region) = (&person.tenant.0, &person.region.0);
+        let (account, slot) = self.block(async {
+            let account = self
+                .store
+                .account_of(tenant, region, &person.principal_id.0)
+                .await?
+                .ok_or(AccountError::NoPassword)?;
+            let bucket = Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &account.email_digest);
+            let slot = self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
+            Ok((account, slot))
+        })?;
+        let verified = self
+            .hashing(|| self.verify(current, Some(&account.password_phc)))
+            .and_then(|verified| {
+                if verified {
+                    self.hashing(|| new.hash())
+                } else {
+                    Err(AccountError::WrongPassword)
+                }
+            });
+        let password_phc = match verified {
+            Ok(password_phc) => password_phc,
+            Err(AccountError::WrongPassword) => return Err(AccountError::WrongPassword),
+            Err(refused) => {
+                let _ = self.block(async {
+                    self.give_back(&[slot]).await;
+                    Ok(())
+                });
+                return Err(refused);
+            }
+        };
+        let notice = match self.mail {
+            Some(_) => self
+                .profile(person)?
+                .and_then(|profile| self.password_changed_notice(&profile.email)),
+            None => None,
+        };
+        // `None`: the password changed, or the person was disabled, since it was verified.
+        let cutoff = self
+            .block(async {
+                Ok(self
+                    .store
+                    .change_password(&account, password_phc, notice)
+                    .await?)
+            })?
+            .ok_or(AccountError::WrongPassword)?;
+        self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
+        Ok(SignedIn {
+            principal: person.clone(),
+            issued_at_unix: cutoff,
+        })
     }
 
     /// A signed-in member invites a teammate into their own organization. A member can only make
@@ -778,8 +869,8 @@ impl AccountService {
         }
     }
 
-    /// Where a person who did not change their own password goes next.
-    fn sign_in_help(&self) -> Option<String> {
+    /// Where a person who did not change their own password asks for a reset.
+    fn reset_help(&self) -> Option<String> {
         match &self.links {
             LinkOrigin::Ready(origin) => Some(format!("{origin}/login?help=password")),
             LinkOrigin::Unset | LinkOrigin::Refused(_) => None,

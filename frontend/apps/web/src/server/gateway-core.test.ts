@@ -34,6 +34,23 @@ describe("gateway-core (the cookie-auth lifecycle, doc 10 §5)", () => {
     expect(doFetch).not.toHaveBeenCalled();
   });
 
+  it("says a refused session was refused, and a missing one was not", async () => {
+    const missing = runGateway({
+      getToken: () => null,
+      doFetch: vi.fn(),
+      refresh: async () => null,
+      clearSession: () => {},
+    });
+    await expect(missing).rejects.toMatchObject({ refused: false });
+    const refused = runGateway({
+      getToken: () => "revoked",
+      doFetch: async () => unauthorized(),
+      refresh: async () => null,
+      clearSession: () => {},
+    });
+    await expect(refused).rejects.toMatchObject({ refused: true });
+  });
+
   it("returns the parsed JSON body on a 2xx", async () => {
     const out = await runGateway<{ ok: boolean }>({
       getToken: () => "t",

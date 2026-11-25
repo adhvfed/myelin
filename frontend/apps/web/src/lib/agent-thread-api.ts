@@ -45,6 +45,7 @@ import {
   validAgentToolPalette,
   type AgentToolDefinition,
 } from "./agent-tool-palette";
+import { loginAfter } from "./auth-return";
 
 export type AgentThreadErrorKind = "bad-input" | "not-found" | "conflict" | "unavailable" | "error";
 export type AgentThreadMutationResult =
@@ -107,7 +108,7 @@ async function authed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) throw new AgentThreadRouteError("bad-input");
       if (error.status === 403 || error.status === 404) throw new AgentThreadRouteError("not-found");
@@ -508,7 +509,7 @@ export const mutateAgentThread = action(async (input: unknown) => {
     }
     return respond({ ok: false, error: "bad-input" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) return respond({ ok: false, error: "bad-input" });
       if (error.status === 403 || error.status === 404) {

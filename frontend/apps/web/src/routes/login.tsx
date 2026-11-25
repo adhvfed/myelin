@@ -48,6 +48,11 @@ export default function Login() {
 
   const error = () => (typeof params.error === "string" ? params.error : "");
   const credentialsRejected = () => error() === "credentials";
+  const signedOut = () => {
+    if (params.signed_out === "everywhere") return "You were signed out of all devices.";
+    if (params.signed_out === "session") return "You were signed out.";
+    return "";
+  };
   const returnTo = () => safeAuthReturnTo(params.return_to);
   const busy = () =>
     passwordPending.pending || ssoPending.pending || devPending.pending || resetPending.pending;
@@ -85,6 +90,11 @@ export default function Login() {
         <Show when={error()}>
           <p role="alert" id="login-error-msg" class="auth-alert" data-testid="login-error">
             {errorCopy(error())}
+          </p>
+        </Show>
+        <Show when={signedOut() && !error()}>
+          <p role="status" class="auth-note" data-testid="signed-out">
+            {signedOut()}
           </p>
         </Show>
         <Show when={params.help === "password" && !error()}>

@@ -43,6 +43,8 @@ pub struct PrincipalRow {
     pub profile_ref: Option<ProfileRef>,
     pub data_role: myelin_identity::DataRole,
     pub status: PrincipalStatus,
+    /// Human sessions issued before this unix second are refused.
+    pub sessions_not_before: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,17 +276,19 @@ impl PrincipalStore {
             profile_ref,
             data_role,
             status,
+            sessions_not_before: None,
         };
 
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
-                inner
-                    .partitions
-                    .entry(part_key.clone())
-                    .or_default()
-                    .insert(principal_id.0.clone(), row.clone());
+                let partition = inner.partitions.entry(part_key.clone()).or_default();
+                let mut row = row;
+                row.sessions_not_before = partition
+                    .get(&principal_id.0)
+                    .and_then(|stored| stored.sessions_not_before);
+                partition.insert(principal_id.0.clone(), row.clone());
                 if let Some(enc) = sealed {
                     inner
                         .profiles
@@ -311,6 +315,7 @@ impl PrincipalStore {
                     status: serde_json::to_string(&row.status)
                         .expect("principal.status serializes"),
                     profile: blob,
+                    sessions_not_before: None,
                 };
                 pg.block(pg.backing.put_principal(&scope.tenant().0, drow))
                     .map_err(|e| PrincipalError::Storage(e.to_string()))?;
@@ -341,6 +346,7 @@ impl PrincipalStore {
             profile_ref: None,
             data_role,
             status,
+            sessions_not_before: None,
         };
         let link_key = Self::link_key(&scheme, &subject_key);
         match &self.backend {
@@ -369,6 +375,7 @@ impl PrincipalStore {
                     status: serde_json::to_string(&row.status)
                         .expect("principal.status serializes"),
                     profile: None,
+                    sessions_not_before: None,
                 };
                 pg.block(pg.backing.put_principal_and_link_credential(
                     &scope.tenant().0,
@@ -403,6 +410,7 @@ impl PrincipalStore {
                 nonce: sealed.nonce.to_vec(),
                 ciphertext: sealed.ciphertext,
             }),
+            sessions_not_before: None,
         })
     }
 
@@ -464,6 +472,36 @@ impl PrincipalStore {
                 .map_err(|e| PrincipalError::Storage(e.to_string()))?
                 .map(|drow| Self::durable_to_row(scope, drow))
                 .transpose(),
+        }
+    }
+
+    /// Ends every human session the person holds and returns the new cutoff, the first unix
+    /// second whose sessions stay valid; `None` when there is no such person.
+    pub fn end_sessions(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+    ) -> Result<Option<i64>, PrincipalError> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PrincipalBackend::Memory(inner_arc) => {
+                let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(row) = inner
+                    .partitions
+                    .get_mut(&Self::part_key(scope))
+                    .and_then(|partition| partition.get_mut(&principal_id.0))
+                else {
+                    return Ok(None);
+                };
+                let cutoff = (crate::clock::unix_seconds() + 1)
+                    .max(row.sessions_not_before.unwrap_or(0) + 1);
+                row.sessions_not_before = Some(cutoff);
+                Ok(Some(cutoff))
+            }
+            PrincipalBackend::Pg(pg) => pg
+                .block(pg.backing.end_sessions(&scope.tenant().0, &principal_id.0))
+                .map_err(|e| PrincipalError::Storage(e.to_string())),
         }
     }
 
@@ -774,6 +812,7 @@ impl PrincipalStore {
                 .map_err(|_| PrincipalError::CorruptPrincipal { field: "data_role" })?,
             status: serde_json::from_str(&drow.status)
                 .map_err(|_| PrincipalError::CorruptPrincipal { field: "status" })?,
+            sessions_not_before: drow.sessions_not_before,
         })
     }
 }

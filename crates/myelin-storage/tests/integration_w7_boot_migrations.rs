@@ -129,6 +129,7 @@ async fn durable_principal_write_succeeds_after_the_boot_sequence() {
         data_role: "\"Processor\"".into(),
         status: "\"Active\"".into(),
         profile: None,
+        sessions_not_before: None,
     };
     backing.put_principal(&tenant, row.clone()).await.expect(
         "the durable principal write COMMITS after the boot-migrations fix (was the defect)",

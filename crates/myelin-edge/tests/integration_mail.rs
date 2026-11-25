@@ -404,6 +404,7 @@ impl Cell {
                 },
             )
             .unwrap()
+            .principal
     }
 }
 
@@ -492,7 +493,8 @@ async fn an_emailed_invitation_reaches_only_the_invitee_and_its_link_works() {
                 password: "compile the future".into(),
             },
         )
-        .unwrap();
+        .unwrap()
+        .principal;
     assert_eq!(joined.tenant.0, tenant);
 }
 
@@ -841,8 +843,24 @@ async fn forgot_password_answers_alike_and_mails_only_a_capped_few() {
     assert!(notices[1].header("Subject").unwrap().contains("changed"));
     assert!(notices[1]
         .decoded()
+        .contains("All other sessions were signed out."));
+    assert!(notices[1]
+        .decoded()
         .contains("\n\nhttps://myelin.example/login?help=password\n"));
-    accounts.login(&ada, "a fresh passphrase".into()).unwrap();
+    let signed_in = accounts.login(&ada, "a fresh passphrase".into()).unwrap();
+
+    // Changing it while signed in sends the same notice.
+    accounts
+        .change_password(
+            &signed_in.principal,
+            "a fresh passphrase".into(),
+            "another fresh passphrase".into(),
+        )
+        .unwrap();
+    assert_eq!(deliver(&worker).await.sent, 1);
+    let notices = smtp.delivered_to(&ada);
+    assert_eq!(notices.len(), 3);
+    assert!(notices[2].header("Subject").unwrap().contains("changed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

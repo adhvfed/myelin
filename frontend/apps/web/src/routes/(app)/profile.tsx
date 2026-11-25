@@ -1,9 +1,17 @@
 import { Icon, useToast, type IconName } from "@myelin/design-system";
 import { Title } from "@solidjs/meta";
 import { createAsync, useAction, useSubmission } from "@solidjs/router";
-import { createSignal, For, onMount, Show, type JSX } from "solid-js";
+import { createEffect, createSignal, For, onMount, Show, type JSX } from "solid-js";
 import { useAppViewer } from "~/components/AppShell";
-import { createInvitation, getAuthConfig, logout, type InvitationResult } from "~/lib/auth";
+import {
+  changePassword,
+  createInvitation,
+  getAuthConfig,
+  logout,
+  logoutEverywhere,
+  type InvitationResult,
+  type PasswordChangeResult,
+} from "~/lib/auth";
 import { applyTheme, restoreTheme, THEMES, type Theme } from "~/lib/theme";
 
 const THEME_COPY: Record<Theme, { label: string; copy: string }> = {
@@ -35,7 +43,8 @@ export default function Profile() {
         <ProfileCard icon="gate" title="Data residency" copy="Myelin keeps execution and durable product data inside the assigned region."><dl><div><dt>Active region</dt><dd><strong>{viewer.region}</strong></dd></div><div><dt>Residency</dt><dd>EU sovereign boundary</dd></div></dl></ProfileCard>
         <ProfileCard icon="settings" title="Appearance" copy="Choose a mode for this browser. The setting persists without changing your organization profile."><div class="profile-theme-options" role="radiogroup" aria-label="Appearance"><For each={THEMES}>{(option) => <button type="button" role="radio" aria-checked={theme() === option} disabled={!interactive()} onClick={() => chooseTheme(option)}><span class={`profile-theme-swatch ${option}`} aria-hidden="true" /><strong>{THEME_COPY[option].label}</strong><small>{THEME_COPY[option].copy}</small></button>}</For></div></ProfileCard>
         <InviteCard />
-        <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button></ProfileCard>
+        <PasswordCard />
+        <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><div class="profile-signout-actions"><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button><SignOutEverywhere disabled={!interactive()} /></div></ProfileCard>
       </div>
     </div>
   </>;
@@ -132,6 +141,137 @@ function InviteCard() {
         )}
       </Show>
     </ProfileCard>
+  );
+}
+
+const MIN_PASSWORD_LENGTH = 10;
+
+const PASSWORD_ERRORS: Record<string, string> = {
+  wrong_password: "That isn't your current password.",
+  weak_password: `The new password is too short. Use at least ${MIN_PASSWORD_LENGTH} characters.`,
+  password_mismatch: "The two new passwords don't match.",
+  rate_limited: "Too many attempts. Wait a few minutes, then try again.",
+  no_password: "You sign in with single sign-on, so there's no Myelin password to change.",
+};
+
+function passwordError(result: PasswordChangeResult): string {
+  if (result.ok) return "";
+  return PASSWORD_ERRORS[result.reason] ?? "The password couldn't be changed. Try again in a moment.";
+}
+
+/** Change the password. Every other session ends; this browser stays signed in. */
+function PasswordCard() {
+  const changing = useSubmission(changePassword);
+  const config = createAsync(() => getAuthConfig());
+  const toast = useToast();
+  const [length, setLength] = createSignal(0);
+  let form: HTMLFormElement | undefined;
+  const failure = () => {
+    const result = changing.result;
+    return result && !result.ok ? result.reason : undefined;
+  };
+  createEffect(() => {
+    if (changing.result?.ok && !changing.pending) {
+      form?.reset();
+      setLength(0);
+      toast.show({ title: "Password changed. Your other sessions were signed out.", variant: "success" });
+    }
+  });
+  return (
+    <Show when={config()?.password_login_enabled}>
+      <ProfileCard
+        icon="gate"
+        title="Password"
+        copy="Changing it signs you out everywhere else. This browser stays signed in."
+      >
+        <form ref={form} action={changePassword} method="post" class="profile-password-form" data-testid="password-form">
+          <label>
+            <span>Current password</span>
+            <input
+              name="current_password"
+              type="password"
+              required
+              autocomplete="current-password"
+              aria-invalid={failure() === "wrong_password" ? "true" : undefined}
+              aria-describedby={failure() ? "password-change-error" : undefined}
+              data-testid="current-password"
+            />
+          </label>
+          <label>
+            <span>New password</span>
+            <input
+              name="new_password"
+              type="password"
+              required
+              minlength={MIN_PASSWORD_LENGTH}
+              autocomplete="new-password"
+              aria-describedby="new-password-hint"
+              aria-invalid={failure() === "weak_password" ? "true" : undefined}
+              data-testid="new-password"
+              onInput={(event) => setLength([...event.currentTarget.value].length)}
+            />
+          </label>
+          <p id="new-password-hint" class="profile-password-hint">
+            <span>At least {MIN_PASSWORD_LENGTH} characters.</span>
+            <span aria-hidden="true" data-met={length() >= MIN_PASSWORD_LENGTH ? "" : undefined}>
+              {Math.min(length(), MIN_PASSWORD_LENGTH)} / {MIN_PASSWORD_LENGTH}
+            </span>
+          </p>
+          <label>
+            <span>Confirm new password</span>
+            <input
+              name="confirm_password"
+              type="password"
+              required
+              autocomplete="new-password"
+              aria-invalid={failure() === "password_mismatch" ? "true" : undefined}
+              data-testid="confirm-password"
+            />
+          </label>
+          <Show when={changing.result && !changing.result.ok ? changing.result : undefined} keyed>
+            {(result) => (
+              <p role="alert" id="password-change-error" class="profile-invite-error" data-testid="password-error">
+                {passwordError(result)}
+              </p>
+            )}
+          </Show>
+          <button type="submit" data-testid="password-submit" aria-busy={changing.pending ? "true" : undefined}>
+            {changing.pending ? "Changing…" : "Change password"}
+          </button>
+        </form>
+      </ProfileCard>
+    </Show>
+  );
+}
+
+/** Sign out of every device, this one included, after a short confirmation. */
+function SignOutEverywhere(props: { disabled: boolean }) {
+  const [confirming, setConfirming] = createSignal(false);
+  const ending = useSubmission(logoutEverywhere);
+  return (
+    <Show
+      when={confirming()}
+      fallback={
+        <button type="button" class="profile-signout" disabled={props.disabled} onClick={() => setConfirming(true)} data-testid="signout-everywhere">
+          <Icon name="close" /> Sign out of all devices
+        </button>
+      }
+    >
+      <form action={logoutEverywhere} method="post" class="profile-signout-confirm" data-testid="signout-everywhere-confirm">
+        <p>Sign out on every device, including this one?</p>
+        <div>
+          <button type="submit" class="profile-signout" aria-busy={ending.pending ? "true" : undefined} data-testid="signout-everywhere-submit">
+            {ending.pending ? "Signing out…" : "Sign out everywhere"}
+          </button>
+          <button type="button" onClick={() => setConfirming(false)}>Cancel</button>
+        </div>
+        <Show when={ending.result && !ending.result.ok}>
+          <p role="alert" class="profile-invite-error" data-testid="signout-everywhere-error">
+            Your other devices couldn't be signed out just now. Try again in a moment.
+          </p>
+        </Show>
+      </form>
+    </Show>
   );
 }
 

@@ -106,7 +106,7 @@ struct PendingAuthorization {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StoredAuthorization {
     pending: PendingAuthorization,
-    approval: Option<DeviceApproval>,
+    approval: Option<(DeviceApproval, i64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +193,9 @@ const PRODUCTION_START_POLICY: StartPolicy = StartPolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceAuthorizationClaim {
     pub approval: DeviceApproval,
+    /// When a signed-in browser vouched for this login. The CLI session counts as issued then, so
+    /// ending the person's sessions after that also ends it.
+    pub approved_at_unix: i64,
     pub session_jti: String,
     pub authorization_expires_at_unix: i64,
 }
@@ -342,14 +345,14 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
             authorizations.remove(&device_digest);
             return Ok(ApprovalOutcome::Expired);
         }
-        if let Some(existing) = &stored.approval {
+        if let Some((existing, _)) = &stored.approval {
             return Ok(if existing == &approval {
                 ApprovalOutcome::AlreadyApproved
             } else {
                 ApprovalOutcome::NotFound
             });
         }
-        stored.approval = Some(approval);
+        stored.approval = Some((approval, now_unix));
         Ok(ApprovalOutcome::Approved)
     }
 
@@ -373,11 +376,12 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
             authorizations.remove(&device_digest);
             return Ok(ClaimOutcome::Expired);
         }
-        let Some(approval) = stored.approval.clone() else {
+        let Some((approval, approved_at_unix)) = stored.approval.clone() else {
             return Ok(ClaimOutcome::Pending);
         };
         Ok(ClaimOutcome::Approved(DeviceAuthorizationClaim {
             approval,
+            approved_at_unix,
             session_jti: device_session_jti(&device_digest),
             authorization_expires_at_unix: stored.pending.expires_at_unix,
         }))
@@ -585,8 +589,8 @@ impl PgDeviceAuthorizationStore {
             .await
             .map_err(DeviceAuthorizationStoreError::database)?;
         let row = sqlx::query(
-            "SELECT verifier_challenge, expires_at_unix, approved_principal, approved_authority, \
-                    source_expires_unix \
+            "SELECT verifier_challenge, expires_at_unix, approved_at_unix, approved_principal, \
+                    approved_authority, source_expires_unix \
                FROM auth_device_authorization WHERE device_digest = $1 FOR UPDATE",
         )
         .bind(device_digest.as_slice())
@@ -631,6 +635,9 @@ impl PgDeviceAuthorizationStore {
         };
         let authority: Option<serde_json::Value> = row.get("approved_authority");
         let source_expiry: Option<i64> = row.get("source_expires_unix");
+        let approved_at_unix: Option<i64> = row.get("approved_at_unix");
+        let approved_at_unix = approved_at_unix
+            .ok_or_else(|| DeviceAuthorizationStoreError::corrupt("approval time is missing"))?;
         let approval = approval_from_json(
             principal,
             authority.ok_or_else(|| {
@@ -646,6 +653,7 @@ impl PgDeviceAuthorizationStore {
             .map_err(DeviceAuthorizationStoreError::database)?;
         Ok(ClaimOutcome::Approved(DeviceAuthorizationClaim {
             approval,
+            approved_at_unix,
             session_jti: device_session_jti(&device_digest),
             authorization_expires_at_unix: expires_at_unix,
         }))
@@ -1100,6 +1108,7 @@ mod tests {
             broker.claim(&started.device_code, &verifier).unwrap(),
             ClaimOutcome::Approved(DeviceAuthorizationClaim {
                 approval: approval(),
+                approved_at_unix: 1_800_000_000,
                 session_jti: device_session_jti(&digest("device", &started.device_code)),
                 authorization_expires_at_unix: 1_800_000_000 + DEVICE_AUTHORIZATION_TTL_SECS,
             }),

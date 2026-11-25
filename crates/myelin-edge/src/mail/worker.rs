@@ -347,7 +347,7 @@ mod tests {
             &id,
             &Letter::PasswordChanged {
                 to: "not an address".into(),
-                sign_in: None
+                reset: None
             }
         )
         .is_err());

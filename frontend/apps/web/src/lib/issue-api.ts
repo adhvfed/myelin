@@ -13,6 +13,7 @@ import {
   parseIssueCreateReceipt,
   parseIssuesPage,
 } from "./mutation-response";
+import { loginAfter } from "./auth-return";
 
 export type IssueStateCategory = "unstarted" | "started" | "completed" | "cancelled";
 
@@ -60,7 +61,7 @@ async function issueAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) throw new IssueRouteError("bad-input");
       if (error.status === 404 || error.status === 403) throw new IssueRouteError("not-found");

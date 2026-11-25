@@ -6,6 +6,7 @@ import { action, query, redirect } from "@solidjs/router";
 import {
   clearCurrentSession,
   getSessionRecord,
+  hasSessionCookie,
   issueSession,
 } from "../server/session";
 import {
@@ -27,10 +28,12 @@ import { devLoginAllowed, type DevLoginEnv } from "./dev-login-guard";
 import {
   AccountError,
   edgeAcceptInvitation,
+  edgeChangePassword,
   edgeCreateInvitation,
   edgeForgotPassword,
   edgeGetInvitation,
   edgePasswordLogin,
+  edgeSignOut,
   validInvitationCode,
 } from "../server/account-gateway";
 import type {
@@ -39,7 +42,13 @@ import type {
   EdgeInvitation,
   EdgeSessionGrant,
 } from "../server/account-gateway";
-import { authFailureDestination, DEFAULT_AUTH_RETURN_TO, safeAuthReturnTo } from "./auth-return";
+import {
+  authFailureDestination,
+  DEFAULT_AUTH_RETURN_TO,
+  loginAfter,
+  safeAuthReturnTo,
+  SIGNED_OUT_DESTINATION,
+} from "./auth-return";
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
 import {
   toAuthConfig,
@@ -75,7 +84,7 @@ export const getViewer = query(async (): Promise<Viewer | null> => {
 export const requireViewer = query(async (): Promise<Viewer | null> => {
   "use server";
   const rec = await getSessionRecord();
-  if (!rec) throw redirect("/login");
+  if (!rec) throw redirect(hasSessionCookie() ? SIGNED_OUT_DESTINATION : "/login");
 
   let who: EdgeWhoami;
   try {
@@ -83,7 +92,7 @@ export const requireViewer = query(async (): Promise<Viewer | null> => {
   } catch (error) {
     if (isUnauthorized(error)) {
       await clearCurrentSession();
-      throw redirect("/login");
+      throw redirect(loginAfter(error));
     }
     return null;
   }
@@ -277,7 +286,7 @@ export const createInvitation = action(async (formData: FormData): Promise<Invit
   try {
     return { ok: true, ...(await edgeCreateInvitation(email)) };
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     const retryAfterSecs = error instanceof AccountError ? error.retryAfterSecs : undefined;
     return { ok: false, reason: accountFailure(error), ...(retryAfterSecs ? { retryAfterSecs } : {}) };
   }
@@ -328,9 +337,56 @@ export const startSso = action(async (formData: FormData) => {
   throw redirect(destination);
 }, "start-sso");
 
-/** Log out: clear the server-side session + the cookie, return to /login. */
+/** Sign out: end this session at the edge, then clear the web session and its cookie. */
 export const logout = action(async () => {
   "use server";
+  const rec = await getSessionRecord();
+  if (rec && (await edgeSignOut(rec.token, rec.scheme, false)) === "failed") {
+    // The web session is cleared anyway: this browser is signed out either way, and the edge
+    // session, which nothing holds any more, ends when it expires.
+    console.warn("Sign-out could not reach the edge; the web session was cleared regardless.");
+  }
   await clearCurrentSession();
   throw redirect("/login");
 }, "logout");
+
+/** Sign out of every device: end all of the person's sessions at the edge, this one included. */
+export const logoutEverywhere = action(async (): Promise<{ ok: false }> => {
+  "use server";
+  const rec = await getSessionRecord();
+  if (!rec) throw redirect("/login");
+  const outcome = await edgeSignOut(rec.token, rec.scheme, true);
+  // Unlike a plain sign-out, a failure here would leave the other devices signed in, so this
+  // browser keeps its session to say so and let the person try again.
+  if (outcome === "failed") return { ok: false };
+  await clearCurrentSession();
+  throw redirect(outcome === "signed_out" ? "/login?signed_out=everywhere" : SIGNED_OUT_DESTINATION);
+}, "logout-everywhere");
+
+export type PasswordChangeResult = { ok: true } | { ok: false; reason: AccountFailure };
+
+/** Change the password while signed in. The edge ends every session the person held and answers
+ * with a fresh one, which replaces this browser's. */
+export const changePassword = action(
+  async (formData: FormData): Promise<PasswordChangeResult> => {
+    "use server";
+    const current = String(formData.get("current_password") ?? "");
+    const next = String(formData.get("new_password") ?? "");
+    const confirm = String(formData.get("confirm_password") ?? "");
+    if (!current || current.length > 4_096) return { ok: false, reason: "wrong_password" };
+    if (next.length > 4_096) return { ok: false, reason: "weak_password" };
+    if (next !== confirm) return { ok: false, reason: "password_mismatch" };
+    try {
+      await signInWithGrant(await edgeChangePassword(current, next));
+      return { ok: true };
+    } catch (error) {
+      const reason = accountFailure(error);
+      if (reason === "signed_out") {
+        await clearCurrentSession();
+        throw redirect(SIGNED_OUT_DESTINATION);
+      }
+      return { ok: false, reason };
+    }
+  },
+  "change-password",
+);

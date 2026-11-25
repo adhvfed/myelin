@@ -199,6 +199,8 @@ pub struct CapabilityToken {
     pub dpop_bound: bool,
     pub purpose: CredentialPurpose,
     pub audience: CredentialAudience,
+    /// The signed `iat`. Every human session carries one; older machine credentials may not.
+    pub issued_at_unix: Option<i64>,
     pub exp_unix: i64,
 }
 
@@ -392,6 +394,7 @@ impl TokenVerifier for StructuralTokenVerifier {
             dpop_bound,
             purpose,
             audience,
+            issued_at_unix: None,
             exp_unix: myelin_events::clock::MAX_RFC3339_UNIX_SECONDS,
         })
     }
@@ -460,6 +463,10 @@ impl CapabilityAuthenticator {
 
     pub fn revocations(&self) -> &RevocationStore {
         &self.revocations
+    }
+
+    pub fn principals(&self) -> &PrincipalStore {
+        &self.store
     }
 
     pub fn authenticate_identity(
@@ -586,6 +593,9 @@ impl CapabilityAuthenticator {
                 )));
             }
         }
+        if token.purpose == CredentialPurpose::HumanSession {
+            ensure_session_not_ended(&token, row.sessions_not_before)?;
+        }
 
         let principal = Principal::new(
             token.tenant.clone(),
@@ -672,6 +682,28 @@ impl CapabilityAuthenticator {
             token.tenant.clone(),
         );
         TenantScope::from_verified_token(&principal, token.region.clone())
+    }
+}
+
+/// A human session issued before the person's cutoff was ended by a sign-out everywhere or a
+/// password change. A session without an issue time cannot be placed against it, so it is refused.
+fn ensure_session_not_ended(
+    token: &CapabilityToken,
+    sessions_not_before: Option<i64>,
+) -> myelin_identity::Result<()> {
+    let issued_at = token.issued_at_unix.ok_or_else(|| {
+        AuthzError::FailClosed(format!(
+            "human session `{}` carries no signed `iat` - refused",
+            token.jti
+        ))
+    })?;
+    match sessions_not_before {
+        Some(cutoff) if issued_at < cutoff => Err(AuthzError::FailClosed(format!(
+            "human session `{}` was issued at {issued_at}, before the person's sessions were \
+             ended at {cutoff} - refused",
+            token.jti
+        ))),
+        _ => Ok(()),
     }
 }
 

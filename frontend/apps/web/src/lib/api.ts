@@ -104,6 +104,7 @@ export {
   mapStatusToKind,
   type RepoErrorKind,
 } from "./repo-error";
+import { loginAfter } from "./auth-return";
 export * from "./chat-api";
 export * from "./agent-thread-api";
 export * from "./knowledge-api";
@@ -533,7 +534,7 @@ async function authed<T>(
   try {
     return await fetcher();
   } catch (e) {
-    if (isUnauthorized(e)) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect(loginAfter(e));
     if (e instanceof GatewayError) throw new RepoRouteError(statusKind(e.status));
     // A transport/parse failure with no HTTP status is the retryable error kind.
     throw new RepoRouteError("error");
@@ -544,7 +545,7 @@ async function treeAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (isUnauthorized(e)) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect(loginAfter(e));
     if (e instanceof GatewayError) {
       if (e.status === 409) throw new RepoRouteError("stale-tree");
       throw new RepoRouteError(mapStatusToKind(e.status));
@@ -557,7 +558,7 @@ async function prDiffAuthed<T>(fetcher: () => Promise<T>): Promise<T | PrDiffCap
   try {
     return await fetcher();
   } catch (e) {
-    if (isUnauthorized(e)) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect(loginAfter(e));
     if (e instanceof GatewayError) {
       if (e.status === 413) return { state: "diff-too-large" };
       throw new RepoRouteError(mapPrDiffStatusToKind(e.status));
@@ -571,7 +572,7 @@ async function ciAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (isUnauthorized(e)) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect(loginAfter(e));
     if (e instanceof GatewayError) {
       if (e.status === 400) throw new CiRouteError("bad-input");
       if (e.status === 404) throw new CiRouteError("not-found");
@@ -587,7 +588,7 @@ async function inboxAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
   try {
     return await fetcher();
   } catch (e) {
-    if (isUnauthorized(e)) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect(loginAfter(e));
     // Mutation callers deliberately distinguish stale/missing approvals (404/409) from transport
     // outages. Preserve the status here; read queries map it to an opaque availability error below.
     if (e instanceof GatewayError) throw e;
@@ -643,7 +644,7 @@ export const createRepo = action(async (value: string) => {
     const receipt = parseRepoCreateReceipt(response, slug);
     return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
   } catch (error) {
-    if (isUnauthorized(error)) throw redirect("/login");
+    if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof GatewayError) {
       if (error.status === 400) return result({ ok: false, error: "bad-input" });
       if (error.status === 403) return result({ ok: false, error: "forbidden" });
@@ -713,7 +714,7 @@ export const ciRunMutate = action(async (m: CiRunMutation) => {
     const receipt = parseCiCancelReceipt(response, parsed.run);
     return respond(receipt ? { ok: true, op: "cancel", receipt } : { ok: false, error: "error" });
   } catch (e) {
-    if (isUnauthorized(e)) throw redirect("/login");
+    if (isUnauthorized(e)) throw redirect(loginAfter(e));
     return respond({
       ok: false,
       error: e instanceof GatewayError ? ciRunMutationErrorKind(e.status) : "error",

@@ -4,6 +4,7 @@ import {
   authFailureDestination,
   authenticationDestination,
   DEFAULT_AUTH_RETURN_TO,
+  loginAfter,
   MAX_AUTH_RETURN_TO_BYTES,
   safeAuthReturnTo,
 } from "./auth-return";
@@ -52,5 +53,13 @@ describe("safeAuthReturnTo", () => {
     expect(authFailureDestination("sso_failed", DEFAULT_AUTH_RETURN_TO)).toBe(
       "/login?error=sso_failed",
     );
+  });
+});
+
+describe("loginAfter", () => {
+  it("says the person was signed out only when the edge refused their session", () => {
+    expect(loginAfter({ refused: true })).toBe("/login?signed_out=session");
+    expect(loginAfter({ refused: false })).toBe("/login");
+    expect(loginAfter({})).toBe("/login");
   });
 });

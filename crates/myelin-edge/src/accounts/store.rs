@@ -220,8 +220,10 @@ pub(crate) enum IssueOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AcceptOutcome {
+    /// `issued_at_unix` is when the session made for the person counts as issued.
     Accepted {
         principal_id: String,
+        issued_at_unix: i64,
     },
     /// Unknown, expired, already used, or no longer applicable. Callers answer 404 for all.
     Gone,
@@ -273,9 +275,12 @@ impl From<sqlx::Error> for Abort {
     }
 }
 
-fn settle(result: Result<String, Abort>) -> Result<AcceptOutcome, StoreError> {
+fn settle(result: Result<(String, i64), Abort>) -> Result<AcceptOutcome, StoreError> {
     match result {
-        Ok(principal_id) => Ok(AcceptOutcome::Accepted { principal_id }),
+        Ok((principal_id, issued_at_unix)) => Ok(AcceptOutcome::Accepted {
+            principal_id,
+            issued_at_unix,
+        }),
         Err(Abort::Gone) => Ok(AcceptOutcome::Gone),
         Err(Abort::EmailTaken) => Ok(AcceptOutcome::EmailTaken),
         Err(Abort::Store(error)) => Err(error),
@@ -606,30 +611,30 @@ impl AccountStore {
                                 "a freshly minted principal id already exists".into(),
                             )));
                         }
-                        let created = sqlx::query(&format!(
+                        let created: Option<i64> = sqlx::query_scalar(&format!(
                             "INSERT INTO auth_password_account \
                                (email_digest, tenant_id, region, principal_id, password_phc, \
                                 changed_at_unix) \
                              VALUES ($1, $2, $3, $4, $5, {DB_NOW}) \
-                             ON CONFLICT (email_digest) DO NOTHING"
+                             ON CONFLICT (email_digest) DO NOTHING \
+                             RETURNING changed_at_unix"
                         ))
                         .bind(email_digest.as_slice())
                         .bind(&tenant)
                         .bind(&region)
                         .bind(&principal.principal_id)
                         .bind(&password_phc)
-                        .execute(&mut *conn)
-                        .await?
-                        .rows_affected();
-                        if created != 1 {
+                        .fetch_optional(&mut *conn)
+                        .await?;
+                        let Some(created_at_unix) = created else {
                             return Err(Abort::EmailTaken);
-                        }
+                        };
                         crate::mail::withdraw(conn, &[code.to_vec()]).await?;
                         #[cfg(any(test, feature = "test-support"))]
                         if let Some(hook) = &checkpoint {
                             hook(super::Checkpoint::JoinAccountStored);
                         }
-                        Ok(principal.principal_id)
+                        Ok((principal.principal_id, created_at_unix))
                     })
                 },
             )
@@ -638,8 +643,8 @@ impl AccountStore {
     }
 
     /// Consumes a reset invitation and replaces the password of the active account it names,
-    /// ending the person's other reset links and withdrawing any mail still carrying them.
-    /// `notice`, the letter telling the owner, is queued only if the password changes.
+    /// ending the person's sessions and other reset links and withdrawing any mail still carrying
+    /// them. `notice`, the letter telling the owner, is queued only if the password changes.
     pub(crate) async fn accept_reset(
         &self,
         code: &CodeDigest,
@@ -683,65 +688,36 @@ impl AccountStore {
                         if consumed != 1 {
                             return Err(Abort::Gone);
                         }
-                        let active: Option<String> = sqlx::query_scalar(
-                            "SELECT status FROM principal \
-                              WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
-                              FOR SHARE",
-                        )
-                        .bind(&tenant)
-                        .bind(&region)
-                        .bind(&principal_id)
-                        .fetch_optional(&mut *conn)
-                        .await?;
-                        if active.as_deref() != Some(ACTIVE_PRINCIPAL_STATUS_JSON) {
+                        if !is_active(conn, &tenant, &region, &principal_id).await? {
                             return Err(Abort::Gone);
                         }
-                        let changed = sqlx::query(&format!(
-                            "UPDATE auth_password_account \
-                                SET password_phc = $1, changed_at_unix = {DB_NOW} \
-                              WHERE email_digest = $2 AND tenant_id = $3 AND region = $4 \
-                                AND principal_id = $5"
-                        ))
-                        .bind(&password_phc)
-                        .bind(email_digest.as_slice())
-                        .bind(&tenant)
-                        .bind(&region)
-                        .bind(&principal_id)
-                        .execute(&mut *conn)
+                        if !set_password(
+                            conn,
+                            &tenant,
+                            &region,
+                            &principal_id,
+                            &email_digest,
+                            &password_phc,
+                            None,
+                        )
                         .await?
-                        .rows_affected();
-                        if changed != 1 {
+                        {
                             return Err(Abort::Gone);
                         }
                         #[cfg(any(test, feature = "test-support"))]
                         if let Some(hook) = &checkpoint {
                             hook(super::Checkpoint::ResetPasswordReplaced);
                         }
-                        // The new password ends every other reset link the person holds, expired
-                        // or not. An expired one may be held by another issue's cleanup; that
-                        // cleanup is the last thing its transaction does, so this waits at most
-                        // for that commit and cannot close a cycle.
-                        let mut ended: Vec<Vec<u8>> = sqlx::query_scalar(
-                            "DELETE FROM auth_invitation \
-                              WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
-                                AND kind = 'reset' \
-                             RETURNING code_digest",
-                        )
-                        .bind(&tenant)
-                        .bind(&region)
-                        .bind(&principal_id)
-                        .fetch_all(&mut *conn)
-                        .await?;
-                        ended.push(code.to_vec());
-                        crate::mail::withdraw(conn, &ended).await?;
+                        end_reset_links(conn, &tenant, &region, &principal_id, Some(&code)).await?;
                         #[cfg(any(test, feature = "test-support"))]
                         if let Some(hook) = &checkpoint {
                             hook(super::Checkpoint::ResetLinksEnded);
                         }
+                        let cutoff = end_sessions(conn, &tenant, &region, &principal_id).await?;
                         if let Some((outbox, letter)) = notice {
                             outbox.enqueue(conn, &letter, None).await?;
                         }
-                        Ok(principal_id)
+                        Ok((principal_id, cutoff))
                     })
                 },
             )
@@ -749,10 +725,16 @@ impl AccountStore {
         )
     }
 
-    /// Whether the account still has exactly the password hash that was just verified and its
-    /// person is still active. Sign-in asks this last, so a password replaced while the old one
-    /// was being verified does not sign anyone in.
-    pub(crate) async fn still_signs_in(&self, account: &AccountRow) -> Result<bool, StoreError> {
+    /// When the session for a sign-in counts as issued, if the account still has exactly the
+    /// password hash that was just verified and its person is still active; `None` otherwise.
+    /// Sign-in asks this last, so a password replaced while the old one was being verified does
+    /// not sign anyone in. It is the database's present moment, raised to the person's session
+    /// cutoff: read in the same snapshot as the hash, so a cutoff seen here came before the
+    /// password was confirmed.
+    pub(crate) async fn still_signs_in(
+        &self,
+        account: &AccountRow,
+    ) -> Result<Option<i64>, StoreError> {
         let email_digest = account.email_digest;
         let tenant = account.tenant.clone();
         let region = account.region.clone();
@@ -760,13 +742,14 @@ impl AccountStore {
         let password_phc = account.password_phc.clone();
         with_tenant_tx_error(&self.pool, &account.tenant, &account.region, move |conn| {
             Box::pin(async move {
-                let found: Option<i32> = sqlx::query_scalar(
-                    "SELECT 1 FROM auth_password_account account \
+                sqlx::query_scalar(&format!(
+                    "SELECT GREATEST({DB_NOW}, COALESCE(person.sessions_not_before, 0)) \
+                       FROM auth_password_account account \
                        JOIN principal person USING (tenant_id, region, principal_id) \
                       WHERE account.email_digest = $1 AND account.tenant_id = $2 \
                         AND account.region = $3 AND account.principal_id = $4 \
-                        AND account.password_phc = $5 AND person.status = $6",
-                )
+                        AND account.password_phc = $5 AND person.status = $6"
+                ))
                 .bind(email_digest.as_slice())
                 .bind(&tenant)
                 .bind(&region)
@@ -775,11 +758,87 @@ impl AccountStore {
                 .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                 .fetch_optional(&mut *conn)
                 .await
-                .map_err(StoreError::database)?;
-                Ok(found.is_some())
+                .map_err(StoreError::database)
             })
         })
         .await
+    }
+
+    /// The password account of a signed-in person, if they have one.
+    pub(crate) async fn account_of(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal_id: &str,
+    ) -> Result<Option<AccountRow>, StoreError> {
+        // @tenant-cross-scope: the account table is keyed by email digest, not tenant-scoped; the
+        // lookup names the verified person's tenant itself.
+        let row = sqlx::query(
+            "SELECT email_digest, password_phc FROM auth_password_account \
+              WHERE tenant_id = $1 AND region = $2 AND principal_id = $3",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(principal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::database)?;
+        row.map(|row| {
+            Ok(AccountRow {
+                email_digest: digest(row.get("email_digest"))?,
+                tenant: tenant.to_string(),
+                region: region.to_string(),
+                principal_id: principal_id.to_string(),
+                password_phc: row.get("password_phc"),
+            })
+        })
+        .transpose()
+    }
+
+    /// Replaces a signed-in person's password, if `account`'s hash (the one just verified) is
+    /// still the stored one and the person is still active. Ends their sessions and reset links,
+    /// queues `notice`, and returns the new session cutoff; `None` when nothing changed.
+    pub(crate) async fn change_password(
+        &self,
+        account: &AccountRow,
+        password_phc: String,
+        notice: Option<(MailOutbox, Letter)>,
+    ) -> Result<Option<i64>, StoreError> {
+        let (tenant, region) = (account.tenant.clone(), account.region.clone());
+        let account = account.clone();
+        let outcome = with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                let (tenant, region) = (&account.tenant, &account.region);
+                let principal_id = &account.principal_id;
+                lock_email(conn, tenant, region, &account.email_digest).await?;
+                if !is_active(conn, tenant, region, principal_id).await?
+                    || !set_password(
+                        conn,
+                        tenant,
+                        region,
+                        principal_id,
+                        &account.email_digest,
+                        &password_phc,
+                        Some(&account.password_phc),
+                    )
+                    .await?
+                {
+                    return Err(Abort::Gone);
+                }
+                end_reset_links(conn, tenant, region, principal_id, None).await?;
+                let cutoff = end_sessions(conn, tenant, region, principal_id).await?;
+                if let Some((outbox, letter)) = notice {
+                    outbox.enqueue(conn, &letter, None).await?;
+                }
+                Ok(cutoff)
+            })
+        })
+        .await;
+        match outcome {
+            Ok(cutoff) => Ok(Some(cutoff)),
+            Err(Abort::Gone | Abort::EmailTaken) => Ok(None),
+            Err(Abort::Store(error)) => Err(error),
+        }
     }
 
     /// The tenant's human-facing name: its placement slug when it has one.
@@ -794,6 +853,91 @@ impl AccountStore {
             .filter(|slug| !slug.trim().is_empty())
             .unwrap_or_else(|| tenant.to_string()))
     }
+}
+
+async fn is_active(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    principal_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM principal \
+          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
+          FOR SHARE",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(principal_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(status.as_deref() == Some(ACTIVE_PRINCIPAL_STATUS_JSON))
+}
+
+/// Stores the new password hash; with `replacing`, only while that is still the stored one.
+async fn set_password(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    principal_id: &str,
+    email_digest: &EmailDigest,
+    password_phc: &str,
+    replacing: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let changed = sqlx::query(&format!(
+        "UPDATE auth_password_account \
+            SET password_phc = $1, changed_at_unix = {DB_NOW} \
+          WHERE email_digest = $2 AND tenant_id = $3 AND region = $4 AND principal_id = $5 \
+            AND ($6::text IS NULL OR password_phc = $6)"
+    ))
+    .bind(password_phc)
+    .bind(email_digest.as_slice())
+    .bind(tenant)
+    .bind(region)
+    .bind(principal_id)
+    .bind(replacing)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(changed == 1)
+}
+
+/// A new password ends every reset link the person holds, expired or not, and withdraws the
+/// mail still carrying them. An expired one may be held by another issue's cleanup; that
+/// cleanup is the last thing its transaction does, so this waits at most for that commit and
+/// cannot close a cycle.
+async fn end_reset_links(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    principal_id: &str,
+    used: Option<&CodeDigest>,
+) -> Result<(), sqlx::Error> {
+    let mut ended: Vec<Vec<u8>> = sqlx::query_scalar(
+        "DELETE FROM auth_invitation \
+          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 AND kind = 'reset' \
+         RETURNING code_digest",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(principal_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    ended.extend(used.map(|code| code.to_vec()));
+    crate::mail::withdraw(conn, &ended).await
+}
+
+/// Ends the person's sessions and returns the new cutoff, which the session made for them after
+/// the change counts as issued at.
+async fn end_sessions(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    principal_id: &str,
+) -> Result<i64, Abort> {
+    DurablePrincipalBacking::end_sessions_in_tx(conn, tenant, region, principal_id)
+        .await?
+        .ok_or(Abort::Gone)
 }
 
 /// Serializes everything that issues or ends links for one email in one organization.

@@ -25,9 +25,13 @@ export class GatewayError extends Error {
 const UNAUTHORIZED_BRAND_KEY = "myelin.gateway.Unauthorized.v1";
 
 export class Unauthorized extends Error {
-  constructor(message = "Unauthorized") {
+  /** The edge refused a session this browser held (it was signed out, or its password changed),
+   * as opposed to there being no session at all. */
+  readonly refused: boolean;
+  constructor(message = "Unauthorized", options: { refused?: boolean } = {}) {
     super(message);
     this.name = "Unauthorized";
+    this.refused = options.refused === true;
     Object.defineProperty(this, Symbol.for(UNAUTHORIZED_BRAND_KEY), { value: true });
   }
 }
@@ -77,12 +81,12 @@ export async function runGateway<T = unknown>(deps: GatewayDeps): Promise<T> {
     const fresh = await deps.refresh();
     if (!fresh) {
       await deps.clearSession();
-      throw new Unauthorized("session refresh failed");
+      throw new Unauthorized("session refresh failed", { refused: true });
     }
     res = await deps.doFetch(fresh);
     if (res.status === 401) {
       await deps.clearSession();
-      throw new Unauthorized("still unauthorized after one refresh");
+      throw new Unauthorized("still unauthorized after one refresh", { refused: true });
     }
   }
 

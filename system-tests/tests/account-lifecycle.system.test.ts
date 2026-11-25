@@ -45,6 +45,20 @@ async function whoami(token: string): Promise<JsonRecord> {
   return (await systemClient.json("/v1/whoami", { token, tokenScheme: "session" })).body;
 }
 
+async function expectSignedOut(token: string): Promise<void> {
+  await systemClient.json("/v1/whoami", { token, tokenScheme: "session", expectedStatus: 401 });
+}
+
+async function asPerson(token: string, path: string, body: unknown, expectedStatus = 200) {
+  return systemClient.json(path, {
+    method: "POST",
+    token,
+    tokenScheme: "session",
+    body,
+    expectedStatus,
+  });
+}
+
 describe("a person's account", () => {
   test("is created from an invitation, signs in with a password, invites a teammate, and is reset by the operator", async () => {
     const config = await systemClient.json("/v1/auth/config", anonymous);
@@ -235,6 +249,10 @@ describe("a person's account", () => {
       body: { display_name: "Hedy Lamarr", password: "frequency hopping" },
     });
 
+    // Hedy is signed in on two devices when she forgets her password.
+    const laptop = expectSession(await signIn(email, "frequency hopping"));
+    const phone = expectSession(await signIn(email, "frequency hopping"));
+
     // Every address gets the same answer, whether or not it has an account.
     const forgot = (address: string) =>
       systemClient.json("/v1/auth/password/forgot", {
@@ -265,12 +283,16 @@ describe("a person's account", () => {
       }),
     );
     expect(await whoami(session)).toMatchObject({ email, display_name: "Hedy Lamarr" });
+    await expectSignedOut(laptop);
+    await expectSignedOut(phone);
     await signIn(email, "frequency hopping", 401);
     expectSession(await signIn(email, "spread spectrum"));
 
     const [, notice] = await mailTo(email, 2);
     expect(notice!.subject).toBe("Your Myelin password was changed");
     expect(notice!.text).toContain(email);
+    expect(notice!.text).toContain("All other sessions were signed out.");
+    expect(notice!.text).toMatch(/If this wasn't you, reset your password:\s+https?:\/\/\S+\/login\?help=password/);
     expect(await mailSoFar(nobody)).toEqual([]);
 
     // Three reset mails an hour reach one address; further requests are dropped unseen.
@@ -282,6 +304,68 @@ describe("a person's account", () => {
     expect(dropped.body).toEqual(unknown.body);
     await new Promise((resolve) => setTimeout(resolve, 5_000));
     expect(await mailSoFar(email)).toHaveLength(4);
+  });
+
+  test("changes the password while signed in, and signs out of one device or all of them", async () => {
+    const email = uniqueEmail("noether");
+    const code = codeOf(await operatorLink("invite", email));
+    const laptop = expectSession(
+      await systemClient.json(`/v1/auth/invitations/${code}/accept`, {
+        method: "POST",
+        ...anonymous,
+        body: { display_name: "Emmy Noether", password: "symmetry and conservation" },
+      }),
+    );
+    const phone = expectSession(await signIn(email, "symmetry and conservation"));
+
+    const wrong = await asPerson(
+      laptop,
+      "/v1/auth/password/change",
+      { current_password: "not the password", new_password: "invariant theory" },
+      403,
+    );
+    expect(wrong.body).toMatchObject({ error: { code: "wrong_password" } });
+    await whoami(phone);
+
+    const changed = await asPerson(laptop, "/v1/auth/password/change", {
+      current_password: "symmetry and conservation",
+      new_password: "invariant theory",
+    });
+    const fresh = expectSession(changed);
+    expect(await whoami(fresh)).toMatchObject({ email, display_name: "Emmy Noether" });
+    await expectSignedOut(laptop);
+    await expectSignedOut(phone);
+    await signIn(email, "symmetry and conservation", 401);
+    // The operator's link was handed over, not mailed, so the notice is the first mail.
+    const [notice] = await mailTo(email);
+    expect(notice!.subject).toBe("Your Myelin password was changed");
+    expect(notice!.text).toContain("All other sessions were signed out.");
+
+    // Signing out ends only the session that asks, and an ended session cannot ask again.
+    const tablet = expectSession(await signIn(email, "invariant theory"));
+    const signedOut = await asPerson(tablet, "/v1/auth/logout", {});
+    expect(signedOut.body).toEqual({ signed_out: "session" });
+    expectNoStore(signedOut);
+    await expectSignedOut(tablet);
+    await asPerson(tablet, "/v1/auth/logout", {}, 401);
+    await whoami(fresh);
+
+    // Signing out everywhere ends every session, the asking one included.
+    const desktop = expectSession(await signIn(email, "invariant theory"));
+    const everywhere = await asPerson(desktop, "/v1/auth/logout/everywhere", {});
+    expect(everywhere.body).toEqual({ signed_out: "everywhere" });
+    await expectSignedOut(desktop);
+    await expectSignedOut(fresh);
+    expect(await whoami(expectSession(await signIn(email, "invariant theory")))).toMatchObject({
+      email,
+    });
+
+    // An operator credential is not a person's session and cannot sign anyone out.
+    await systemClient.json("/v1/auth/logout/everywhere", {
+      method: "POST",
+      body: {},
+      expectedStatus: 403,
+    });
   });
 
   test("links are never echoed back and oversized sign-in bodies are refused", async () => {
