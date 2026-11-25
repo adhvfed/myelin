@@ -64,7 +64,7 @@ test("an invited person creates an account, invites a teammate by email, and res
   const teammate = inviteEmail.replace("account-", "teammate-");
   await page.getByTestId("invite-email").fill(teammate);
   await page.getByTestId("invite-submit").click();
-  await expect(page.getByTestId("invite-sent")).toContainText(`Invitation sent to ${teammate}`);
+  await expect(page.getByTestId("invite-sent")).toContainText(`We're emailing an invitation to ${teammate}`);
   const teammateLink = await emailedLink(teammate);
   await page.getByTestId("invite-email").fill(inviteEmail);
   await page.getByTestId("invite-submit").click();

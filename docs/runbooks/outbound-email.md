@@ -36,8 +36,10 @@ recording the send means the message goes out again, with the same Message-ID.
 - `smtps://host:port`: TLS from the first byte (implicit TLS).
 - `smtp://host:port`: no TLS. Allowed only when the host is `localhost` or a loopback address.
 
-The edge refuses to start on anything else, including credentials written into the URL. Without a
-port, the default is 587 for STARTTLS, 465 for implicit TLS, and 25 for plain loopback SMTP.
+The edge refuses to start on anything else, including credentials written into the URL, and on a
+mode the port does not speak: STARTTLS on 465 or 2465, or implicit TLS on 25, 587 or 2587. Without
+a port, the default is 587 for STARTTLS, 465 for implicit TLS, and 25 for plain loopback SMTP. A
+send that takes longer than a minute in all, at any stage, counts as a failure and is retried.
 Links in mail point at `MYELIN_WEB_PUBLIC_URL`, which must be set.
 
 ## Scaleway Transactional Email
@@ -56,6 +58,8 @@ Links in mail point at `MYELIN_WEB_PUBLIC_URL`, which must be set.
    MYELIN_SMTP_PASSWORD='<API key secret>'
    MYELIN_MAIL_FROM='Myelin <no-reply@your-verified-domain>'
    ```
+
+   For implicit TLS instead, use `smtps://smtp.tem.scw.cloud:465` (or `:2465`).
 
 4. Restart the edge. Its log says `edge: mail delivery on (…)` with the host, port, and sender, and
    `/v1/auth/config` reports `"mail_delivery_enabled": true`.

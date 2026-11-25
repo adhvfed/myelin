@@ -6,13 +6,16 @@ use std::time::Duration;
 use lettre::message::Mailbox;
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::transport::smtp::client::{Tls, TlsParameters};
+use lettre::transport::smtp::extension::ClientId;
 use lettre::transport::smtp::Error as SmtpError;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use zeroize::Zeroizing;
 
 use crate::web_origin::split_host_port;
 
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounds only the TCP connect: lettre applies its timeout to nothing after that, so a whole send
+/// is bounded by the caller's deadline instead.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Security {
@@ -142,6 +145,22 @@ fn parse_url(url: &str) -> Result<(String, u16, Security), String> {
         Security::StartTls => 587,
         Security::Implicit => 465,
     });
+    // A mode the port does not speak fails on every send, so it is refused here instead.
+    match (security, port) {
+        (Security::StartTls, 465 | 2465) => {
+            return Err(format!(
+                "MYELIN_SMTP_URL asks for STARTTLS on port {port}, which speaks implicit TLS; \
+                 use smtps://host:{port}"
+            ))
+        }
+        (Security::Implicit, 25 | 587 | 2587) => {
+            return Err(format!(
+                "MYELIN_SMTP_URL asks for implicit TLS on port {port}, which speaks STARTTLS; \
+                 use smtp://host:{port}?tls=required"
+            ))
+        }
+        _ => {}
+    }
     Ok((host.unbracketed(), port, security))
 }
 
@@ -192,7 +211,8 @@ impl Mailer {
         let mut builder = AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(&settings.host)
             .port(settings.port)
             .tls(tls)
-            .timeout(Some(SEND_TIMEOUT));
+            .hello_name(ClientId::Domain(settings.from.email.domain().to_string()))
+            .timeout(Some(CONNECT_TIMEOUT));
         if let Some((username, password)) = &settings.credentials {
             builder = builder.credentials(Credentials::new(username.clone(), password.to_string()));
         }
@@ -206,10 +226,19 @@ impl Mailer {
         &self.from
     }
 
-    pub(crate) async fn send(&self, message: Message) -> Result<(), SendFailure> {
-        self.transport
-            .send(message)
+    /// Sends one message, giving up at `deadline` whatever stage the conversation is in: a relay
+    /// that stops talking mid-handshake or mid-data must not hold the worker.
+    pub(crate) async fn send(
+        &self,
+        message: Message,
+        deadline: Duration,
+    ) -> Result<(), SendFailure> {
+        tokio::time::timeout(deadline, self.transport.send(message))
             .await
+            .map_err(|_| SendFailure {
+                kind: "timeout",
+                code: None,
+            })?
             .map(drop)
             .map_err(Into::into)
     }
@@ -252,6 +281,12 @@ mod tests {
                 465,
                 Security::Implicit,
             ),
+            (
+                "smtps://smtp.tem.scw.cloud:2465",
+                "smtp.tem.scw.cloud",
+                2465,
+                Security::Implicit,
+            ),
         ] {
             let parsed = settings(url).unwrap().unwrap();
             assert_eq!(
@@ -262,6 +297,11 @@ mod tests {
         }
         for refused in [
             "smtp://smtp.tem.scw.cloud:587",
+            "smtp://smtp.tem.scw.cloud:465?tls=required",
+            "smtp://smtp.tem.scw.cloud:2465?tls=required",
+            "smtps://smtp.tem.scw.cloud:587",
+            "smtps://smtp.tem.scw.cloud:2587",
+            "smtps://smtp.tem.scw.cloud:25",
             "smtp://10.0.0.5:25",
             "smtp://smtp.example?tls=opportunistic",
             "smtps://smtp.example?tls=required",

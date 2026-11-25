@@ -87,7 +87,7 @@ impl MailOutbox {
     ) -> Result<(), sqlx::Error> {
         let mut id = [0_u8; 16];
         OsRng.fill_bytes(&mut id);
-        let (nonce, payload) = self.seal(&id, letter);
+        let (nonce, payload) = self.seal(&id, link, letter);
         // @tenant-cross-scope: the outbox belongs to the cell, not a tenant; rows are sealed.
         sqlx::query(&format!(
             "INSERT INTO edge_mail_outbox \
@@ -120,7 +120,7 @@ impl MailOutbox {
                 SELECT message_id FROM edge_mail_outbox \
                  WHERE cell_id = $1 AND next_attempt_unix <= {DB_NOW} \
                  ORDER BY next_attempt_unix LIMIT 1 FOR UPDATE SKIP LOCKED) \
-             RETURNING message_id, attempts, next_attempt_unix, payload_nonce, payload, \
+             RETURNING message_id, attempts, next_attempt_unix, payload_nonce, payload, link_digest, \
                (link_digest IS NULL OR EXISTS ( \
                   SELECT 1 FROM auth_invitation \
                    WHERE code_digest = edge_mail_outbox.link_digest \
@@ -139,11 +139,21 @@ impl MailOutbox {
         };
         let nonce: Vec<u8> = row.get("payload_nonce");
         let payload: Vec<u8> = row.get("payload");
+        let link: Option<Vec<u8>> = row.get("link_digest");
+        let link = match link.map(|link| <[u8; 32]>::try_from(link.as_slice())) {
+            None => None,
+            Some(Ok(link)) => Some(link),
+            Some(Err(_)) => {
+                return Err(sqlx::Error::Protocol(
+                    "a link digest is not 32 bytes".into(),
+                ))
+            }
+        };
         Ok(Some(Claimed {
             id,
             attempts: row.get("attempts"),
             claimed_until: row.get("next_attempt_unix"),
-            letter: self.open(&id, &nonce, &payload),
+            letter: self.open(&id, link.as_ref(), &nonce, &payload),
             link_live: row.get("link_live"),
         }))
     }
@@ -227,7 +237,12 @@ impl MailOutbox {
         })
     }
 
-    fn seal(&self, id: &MessageId, letter: &Letter) -> ([u8; NONCE_BYTES], Vec<u8>) {
+    fn seal(
+        &self,
+        id: &MessageId,
+        link: Option<&[u8; 32]>,
+        letter: &Letter,
+    ) -> ([u8; NONCE_BYTES], Vec<u8>) {
         let plain = Zeroizing::new(serde_json::to_vec(letter).expect("a letter serializes"));
         let mut nonce = [0_u8; NONCE_BYTES];
         OsRng.fill_bytes(&mut nonce);
@@ -237,14 +252,20 @@ impl MailOutbox {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: &plain,
-                    aad: &self.binding(id),
+                    aad: &self.binding(id, link),
                 },
             )
             .expect("AES-256-GCM encryption of a letter cannot fail");
         (nonce, sealed)
     }
 
-    fn open(&self, id: &MessageId, nonce: &[u8], payload: &[u8]) -> Option<Letter> {
+    fn open(
+        &self,
+        id: &MessageId,
+        link: Option<&[u8; 32]>,
+        nonce: &[u8],
+        payload: &[u8],
+    ) -> Option<Letter> {
         if nonce.len() != NONCE_BYTES {
             return None;
         }
@@ -254,7 +275,7 @@ impl MailOutbox {
                     Nonce::from_slice(nonce),
                     Payload {
                         msg: payload,
-                        aad: &self.binding(id),
+                        aad: &self.binding(id, link),
                     },
                 )
                 .ok()?,
@@ -262,12 +283,20 @@ impl MailOutbox {
         serde_json::from_slice(&plain).ok()
     }
 
-    /// A row opens only as itself, in its own cell.
-    fn binding(&self, id: &MessageId) -> Vec<u8> {
-        let mut binding = b"myelin.edge.mail.v1\0".to_vec();
+    /// A row opens only as itself, in its own cell, with the link digest it was queued with, so
+    /// clearing or swapping that column cannot get a dead link's letter past the liveness check.
+    fn binding(&self, id: &MessageId, link: Option<&[u8; 32]>) -> Vec<u8> {
+        let mut binding = b"myelin.edge.mail.v2\0".to_vec();
         binding.extend_from_slice(self.cell.as_bytes());
         binding.push(0);
         binding.extend_from_slice(id);
+        match link {
+            Some(link) => {
+                binding.push(1);
+                binding.extend_from_slice(link);
+            }
+            None => binding.push(0),
+        }
         binding
     }
 
@@ -307,14 +336,25 @@ mod tests {
     #[test]
     fn a_sealed_letter_opens_only_as_itself_in_its_own_cell() {
         let outbox = MailOutbox::new("cell-a", Zeroizing::new([7; 32]));
-        let (nonce, sealed) = outbox.seal(&[1; 16], &letter());
+        let link = Some(&[3; 32]);
+        let (nonce, sealed) = outbox.seal(&[1; 16], link, &letter());
         let printed = String::from_utf8_lossy(&sealed);
         assert!(!printed.contains("ada@example.com") && !printed.contains("secret-code"));
-        assert_eq!(outbox.open(&[1; 16], &nonce, &sealed), Some(letter()));
-        assert_eq!(outbox.open(&[2; 16], &nonce, &sealed), None);
+        assert_eq!(outbox.open(&[1; 16], link, &nonce, &sealed), Some(letter()));
+        assert_eq!(outbox.open(&[2; 16], link, &nonce, &sealed), None);
+        assert_eq!(
+            outbox.open(&[1; 16], None, &nonce, &sealed),
+            None,
+            "a cleared link digest"
+        );
+        assert_eq!(
+            outbox.open(&[1; 16], Some(&[4; 32]), &nonce, &sealed),
+            None,
+            "a swapped link digest"
+        );
         let other_cell = MailOutbox::new("cell-b", Zeroizing::new([7; 32]));
-        assert_eq!(other_cell.open(&[1; 16], &nonce, &sealed), None);
+        assert_eq!(other_cell.open(&[1; 16], link, &nonce, &sealed), None);
         let other_key = MailOutbox::new("cell-a", Zeroizing::new([8; 32]));
-        assert_eq!(other_key.open(&[1; 16], &nonce, &sealed), None);
+        assert_eq!(other_key.open(&[1; 16], link, &nonce, &sealed), None);
     }
 }

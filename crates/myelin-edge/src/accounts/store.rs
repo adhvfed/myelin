@@ -63,10 +63,22 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE auth_rate_limit TO myelin_app;
 "#;
 
 /// The account tables, then the mail outbox that carries their links.
+/// Who made each link, so an operator's new reset link can revoke only the operator's earlier
+/// ones. Links stored before this column existed were all the operator's or members' joins.
+const INVITATION_ORIGIN_DDL: &str = r#"
+ALTER TABLE auth_invitation ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'operator';
+ALTER TABLE auth_invitation ALTER COLUMN origin DROP DEFAULT;
+ALTER TABLE auth_invitation DROP CONSTRAINT IF EXISTS auth_invitation_origin_check;
+ALTER TABLE auth_invitation ADD CONSTRAINT auth_invitation_origin_check
+    CHECK (origin IN ('operator', 'member', 'requested'));
+"#;
+
+/// The account tables, the mail outbox that carries their links, and each link's origin.
 pub fn account_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("edge_0003_password_accounts", ACCOUNT_DDL),
         crate::mail::outbox_migration(),
+        Migration::plain("edge_0005_invitation_origin", INVITATION_ORIGIN_DDL),
     ])
 }
 
@@ -156,22 +168,45 @@ impl LinkMail {
     }
 }
 
-/// Who may get a link, decided under the same lock that stores it.
+/// Who may get a link, decided under the same lock that stores it, and which earlier links it
+/// replaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IssueRule {
     /// A member's join link: refused when the email has an account in this organization.
     MemberJoin,
     /// The operator's join link: refused when the email has an account anywhere in the cell.
     OperatorJoin,
-    /// A reset link for the account the email has in this organization.
-    Reset,
+    /// The operator's reset link for the account the email has in this organization.
+    OperatorReset,
+    /// A reset link someone asked for by email, for the account in this organization.
+    RequestedReset,
 }
 
 impl IssueRule {
     fn kind(self) -> InvitationKind {
         match self {
             Self::MemberJoin | Self::OperatorJoin => InvitationKind::Join,
-            Self::Reset => InvitationKind::Reset,
+            Self::OperatorReset | Self::RequestedReset => InvitationKind::Reset,
+        }
+    }
+
+    fn origin(self) -> &'static str {
+        match self {
+            Self::MemberJoin => "member",
+            Self::OperatorJoin | Self::OperatorReset => "operator",
+            Self::RequestedReset => "requested",
+        }
+    }
+
+    /// The earlier links for the same email in the same organization this one replaces. A new
+    /// join link replaces every join link. An operator's reset link replaces the operator's
+    /// earlier ones, so a link sent the wrong way can be revoked by issuing another; a requested
+    /// one replaces nothing, so nobody can void a reset link by asking for another.
+    fn supersedes(self) -> Option<&'static str> {
+        match self {
+            Self::MemberJoin | Self::OperatorJoin => Some("kind = 'join'"),
+            Self::OperatorReset => Some("kind = 'reset' AND origin = 'operator'"),
+            Self::RequestedReset => None,
         }
     }
 }
@@ -388,16 +423,14 @@ impl AccountStore {
         mail: Option<&LinkMail>,
     ) -> Result<IssueOutcome, StoreError> {
         let mut transaction = self.pool.begin().await.map_err(StoreError::database)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(format!(
-                "myelin.edge.invitation.v1:{}:{}:{}",
-                link.tenant,
-                link.region,
-                hex(&link.email_digest)
-            ))
-            .execute(&mut *transaction)
-            .await
-            .map_err(StoreError::database)?;
+        lock_email(
+            &mut transaction,
+            &link.tenant,
+            &link.region,
+            &link.email_digest,
+        )
+        .await
+        .map_err(StoreError::database)?;
         let account = account_in(&mut *transaction, &link.email_digest).await?;
         let in_this_organization = account
             .as_ref()
@@ -408,7 +441,7 @@ impl AccountStore {
                 return Ok(IssueOutcome::AccountExists)
             }
             IssueRule::OperatorJoin | IssueRule::MemberJoin => None,
-            IssueRule::Reset => match in_this_organization {
+            IssueRule::OperatorReset | IssueRule::RequestedReset => match in_this_organization {
                 Some(account) => Some(account.principal_id.clone()),
                 None => return Ok(IssueOutcome::NoSuchAccount),
             },
@@ -422,12 +455,12 @@ impl AccountStore {
         .execute(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
-        if rule.kind() == InvitationKind::Join {
-            let superseded: Vec<Vec<u8>> = sqlx::query_scalar(
+        if let Some(replaced) = rule.supersedes() {
+            let superseded: Vec<Vec<u8>> = sqlx::query_scalar(&format!(
                 "DELETE FROM auth_invitation \
-                  WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND kind = 'join' \
-                 RETURNING code_digest",
-            )
+                  WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND {replaced} \
+                 RETURNING code_digest"
+            ))
             .bind(&link.tenant)
             .bind(&link.region)
             .bind(link.email_digest.as_slice())
@@ -441,8 +474,8 @@ impl AccountStore {
         let expires_at_unix: i64 = sqlx::query_scalar(&format!(
             "INSERT INTO auth_invitation \
                (code_digest, kind, tenant_id, region, email_digest, email_nonce, \
-                email_ciphertext, principal_id, created_at_unix, expires_at_unix) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {DB_NOW}, {DB_NOW} + $9) \
+                email_ciphertext, principal_id, created_at_unix, expires_at_unix, origin) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {DB_NOW}, {DB_NOW} + $9, $10) \
              RETURNING expires_at_unix"
         ))
         .bind(code.as_slice())
@@ -454,6 +487,7 @@ impl AccountStore {
         .bind(&link.email.ciphertext)
         .bind(&principal_id)
         .bind(link.ttl_secs)
+        .bind(rule.origin())
         .fetch_one(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
@@ -599,6 +633,10 @@ impl AccountStore {
                 &invitation.region,
                 move |conn| {
                     Box::pin(async move {
+                        // Taken before anything else, as issuing takes it: a link issued while
+                        // this runs cannot outlive the new password, and two links accepted at
+                        // once take their locks in one order.
+                        lock_email(conn, &tenant, &region, &email_digest).await?;
                         let consumed = sqlx::query(&format!(
                             "DELETE FROM auth_invitation \
                               WHERE code_digest = $1 AND kind = 'reset' AND tenant_id = $2 \
@@ -715,6 +753,23 @@ impl AccountStore {
             .filter(|slug| !slug.trim().is_empty())
             .unwrap_or_else(|| tenant.to_string()))
     }
+}
+
+/// Serializes everything that issues or ends links for one email in one organization.
+async fn lock_email(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    email: &EmailDigest,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!(
+            "myelin.edge.invitation.v1:{tenant}:{region}:{}",
+            hex(email)
+        ))
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 async fn account_in<'e>(

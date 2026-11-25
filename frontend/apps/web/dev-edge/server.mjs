@@ -86,6 +86,7 @@ const state = {
   loginRateLimited: false,
   mailDeliveryEnabled: true,
   sentMail: [],
+  invitesPerRecipient: new Map(),
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
@@ -446,6 +447,7 @@ function resetAccounts() {
   state.loginRateLimited = false;
   state.mailDeliveryEnabled = true;
   state.sentMail = [];
+  state.invitesPerRecipient = new Map();
 }
 resetAccounts();
 
@@ -1649,6 +1651,11 @@ const server = createServer((req, res) => {
       }
       const email = body.email.trim().toLowerCase();
       if (state.accounts.has(email)) return send(res, 409, { error: { message: "exists" } });
+      const invited = state.invitesPerRecipient.get(email) ?? 0;
+      if (invited >= 3) {
+        return send(res, 429, { error: { code: "recipient_rate_limited", message: "slow down" } }, { "retry-after": "3600" });
+      }
+      state.invitesPerRecipient.set(email, invited + 1);
       const url = newInvitation("join", email);
       const expires_at = Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60;
       if (state.mailDeliveryEnabled) {

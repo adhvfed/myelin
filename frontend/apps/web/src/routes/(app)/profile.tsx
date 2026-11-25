@@ -45,6 +45,7 @@ const INVITE_ERRORS: Record<string, string> = {
   account_exists: "Someone with that email already has an account here.",
   invalid_email: "That doesn't look like an email address.",
   rate_limited: "Too many invitations just now. Wait a minute, then try again.",
+  recipient_rate_limited: "That address has had several invitations this hour. Wait an hour before sending another.",
 };
 
 const untilDate = (unix: number) =>
@@ -99,7 +100,7 @@ function InviteCard() {
                 <Show
                   when={created.delivery === "link" ? created : undefined}
                   keyed
-                  fallback={<p data-testid="invite-sent">Invitation sent to <strong>{created.email}</strong>. The link in it works once, until {untilDate(created.expiresAt)}.</p>}
+                  fallback={<p data-testid="invite-sent">We're emailing an invitation to <strong>{created.email}</strong>. The link in it works once, until {untilDate(created.expiresAt)}.</p>}
                 >
                   {(link) => (
                     <>

@@ -1168,7 +1168,7 @@ async fn a_new_link_replaces_only_the_same_kind_for_the_same_email_in_the_same_o
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_persons_reset_links_all_work_until_one_is_used_which_ends_only_theirs() {
+async fn an_operators_new_reset_link_revokes_their_earlier_one_for_that_person_only() {
     let _turn = ONE_AT_A_TIME.lock().await;
     let cell = cell().await;
     let tenant = unique("t-reset-scope");
@@ -1205,19 +1205,14 @@ async fn a_persons_reset_links_all_work_until_one_is_used_which_ends_only_theirs
     let other_person = reset(second.clone()).await;
     let newer = reset(first.clone()).await;
 
-    assert!(
-        cell.accounts.invitation(&older).is_ok(),
-        "asking for another reset link does not void the first"
-    );
-    assert!(cell.accounts.invitation(&newer).is_ok());
-    cell.accounts
-        .accept(&older, reset_to("a brand new passphrase"))
-        .expect("the older link still resets the password");
     assert_eq!(
-        cell.accounts.invitation(&newer).unwrap_err(),
+        cell.accounts.invitation(&older).unwrap_err(),
         AccountError::InvitationNotFound,
-        "a new password ends the person's other reset links"
+        "reissuing revokes the operator's earlier link, say one sent the wrong way"
     );
+    cell.accounts
+        .accept(&newer, reset_to("a brand new passphrase"))
+        .expect("the newer link resets the password");
     assert!(
         cell.accounts.invitation(&other_person).is_ok(),
         "another person's reset link is untouched"

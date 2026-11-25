@@ -109,12 +109,13 @@ services:
       timeout: 30s
     startup_message: "NATS: localhost:{{NATS_PORT}}"
 
-  # Catches every email the edge sends in development; nothing leaves this machine.
+  # Catches every email the edge sends in development; nothing leaves this machine. Its inbox
+  # holds live links and has no login, so it listens on loopback only.
   mailpit:
     image: axllent/mailpit:v1.34.0@sha256:23a2ef85bc50853ab3093645d1d64679afd8887e89da5e48a88940c172591a4e
     ports:
-      - "{{MAILPIT_SMTP_PORT}}:1025"
-      - "{{MAILPIT_WEB_PORT}}:8025"
+      - "127.0.0.1:{{MAILPIT_SMTP_PORT}}:1025"
+      - "127.0.0.1:{{MAILPIT_WEB_PORT}}:8025"
     healthcheck:
       command: /mailpit readyz
       timeout: 30s

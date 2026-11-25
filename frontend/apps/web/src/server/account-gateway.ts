@@ -17,6 +17,7 @@ export interface EdgeSessionGrant {
 export type AccountFailure =
   | "credentials" // unknown email, wrong password, or an account that may not sign in
   | "rate_limited"
+  | "recipient_rate_limited" // this address has had its invitations for the hour
   | "link_invalid" // unknown, expired, or already-used invitation
   | "weak_password"
   | "account_exists"
@@ -174,7 +175,11 @@ export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedIn
     if (error instanceof GatewayError) {
       if (error.status === 409) throw new AccountError("account_exists");
       if (error.status === 400 || error.status === 422) throw new AccountError("invalid_email");
-      if (error.status === 429) throw new AccountError("rate_limited");
+      if (error.status === 429) {
+        throw new AccountError(
+          error.code === "recipient_rate_limited" ? "recipient_rate_limited" : "rate_limited",
+        );
+      }
       throw new AccountError("unavailable");
     }
     throw error;

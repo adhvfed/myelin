@@ -53,6 +53,13 @@ const INVITES_PER_MEMBER: Limit = Limit {
     hits: 50,
     window_secs: 60 * 60,
 };
+/// Invitations to one address from one organization, however many members send them, so
+/// members cannot flood a stranger's inbox.
+const INVITES_PER_RECIPIENT: Limit = Limit {
+    name: "invitation.recipient",
+    hits: 3,
+    window_secs: 60 * 60,
+};
 /// Emailed reset links per address, so the form cannot be used to flood someone's inbox.
 /// Requests past it are dropped without a word.
 const RESET_REQUESTS_PER_EMAIL: Limit = Limit {
@@ -76,6 +83,10 @@ pub enum AccountError {
     AccountExists,
     NoSuchAccount,
     RateLimited {
+        retry_after_secs: u64,
+    },
+    /// This address has had as many invitations from the organization as it may for now.
+    RecipientRateLimited {
         retry_after_secs: u64,
     },
     Busy,
@@ -105,6 +116,10 @@ impl core::fmt::Display for AccountError {
             Self::RateLimited { retry_after_secs } => {
                 write!(formatter, "too many attempts; retry in {retry_after_secs}s")
             }
+            Self::RecipientRateLimited { retry_after_secs } => write!(
+                formatter,
+                "this address was invited too often; retry in {retry_after_secs}s"
+            ),
             Self::Busy => formatter.write_str("sign-in is busy; retry shortly"),
             Self::LinksUnavailable => formatter.write_str(
                 "invitation links need MYELIN_WEB_PUBLIC_URL set to the web app's https origin",
@@ -598,6 +613,18 @@ impl AccountService {
             inviter_key.extend_from_slice(inviter.principal_id.0.as_bytes());
             let bucket = Self::bucket(&INVITES_PER_MEMBER, &inviter_key);
             self.reserve(&INVITES_PER_MEMBER, bucket).await?;
+            let mut invitee_key = inviter.tenant.0.as_bytes().to_vec();
+            invitee_key.push(0);
+            invitee_key.extend_from_slice(&self.digester.digest(&email));
+            let bucket = Self::bucket(&INVITES_PER_RECIPIENT, &invitee_key);
+            self.reserve(&INVITES_PER_RECIPIENT, bucket)
+                .await
+                .map_err(|error| match error {
+                    AccountError::RateLimited { retry_after_secs } => {
+                        AccountError::RecipientRateLimited { retry_after_secs }
+                    }
+                    other => other,
+                })?;
             // Only an account in the inviter's own organization is reported, so a member cannot
             // probe which addresses have accounts elsewhere in the cell. An address taken in
             // another organization gets a link that fails when it is accepted.
@@ -640,6 +667,13 @@ impl AccountService {
     /// account.
     pub fn forgot_password(&self, email: &str) {
         let Ok(permit) = self.reset_requests.clone().try_acquire_owned() else {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "edge.accounts.reset_request_dropped",
+                    "reason": "too many reset requests in progress",
+                })
+            );
             return;
         };
         let service = self.clone();
@@ -683,7 +717,7 @@ impl AccountService {
             return Ok(());
         }
         let issued = self.block(self.issue(
-            IssueRule::Reset,
+            IssueRule::RequestedReset,
             &account.tenant,
             &account.region,
             email,
@@ -732,7 +766,7 @@ impl AccountService {
     ) -> Result<IssuedInvitation, AccountError> {
         let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
         self.issue(
-            IssueRule::Reset,
+            IssueRule::OperatorReset,
             tenant,
             &self.region,
             email,

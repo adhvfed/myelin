@@ -18,8 +18,11 @@ use super::transport::{MailSettings, Mailer, SendFailure};
 
 #[derive(Clone, Debug)]
 pub struct DeliverySchedule {
-    /// How long one worker holds a letter while it tries to send it.
+    /// How long one worker holds a letter while it tries to send it. Longer than `send_deadline`,
+    /// so a send that runs out of time ends before another worker may take its letter.
     pub claim_secs: i64,
+    /// The most one send may take, from connecting to the relay's last reply.
+    pub send_deadline: Duration,
     /// The first retry waits this long; each later one twice as long, up to `max_retry_secs`.
     pub first_retry_secs: i64,
     pub max_retry_secs: i64,
@@ -33,6 +36,7 @@ impl Default for DeliverySchedule {
     fn default() -> Self {
         Self {
             claim_secs: 5 * 60,
+            send_deadline: Duration::from_secs(60),
             first_retry_secs: 30,
             max_retry_secs: 60 * 60,
             give_up_after_secs: 24 * 60 * 60,
@@ -127,7 +131,7 @@ impl MailWorker {
                 continue;
             }
             match message(self.mailer.from(), &claimed.id, letter) {
-                Ok(message) => match self.mailer.send(message).await {
+                Ok(message) => match self.mailer.send(message, self.schedule.send_deadline).await {
                     Ok(()) => {
                         self.outbox.sent(&self.pool, &claimed.id).await?;
                         pass.sent += 1;
@@ -220,14 +224,17 @@ impl MailWorker {
     }
 }
 
+/// Stops the worker when shut down or dropped: dropping it closes the shutdown channel, which the
+/// worker reads as a request to stop.
+#[must_use = "dropping the handle stops the mail worker"]
 pub struct MailWorkerHandle {
     shutdown: watch::Sender<bool>,
     join: JoinHandle<()>,
 }
 
 impl MailWorkerHandle {
-    /// Stops after the send in progress, if any. Its letter stays queued until it is deleted, so
-    /// nothing is lost.
+    /// Stops at once, abandoning any send in progress. That letter is still queued, so it is sent
+    /// again once its claim runs out: nothing is lost, though it may arrive twice.
     pub async fn shutdown(self) -> Result<(), String> {
         let _ = self.shutdown.send(true);
         self.join

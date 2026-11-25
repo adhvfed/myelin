@@ -92,6 +92,11 @@ fn account_error(failure: AccountError) -> EdgeResponse {
             error(&EdgeError::TooManyRequests(message))
                 .with_header("retry-after", retry_after_secs.to_string())
         }
+        AccountError::RecipientRateLimited { retry_after_secs } => no_store(EdgeResponse::json(
+            429,
+            &json!({ "error": { "code": "recipient_rate_limited", "message": message } }),
+        ))
+        .with_header("retry-after", retry_after_secs.to_string()),
         AccountError::Busy => {
             error(&EdgeError::Unavailable(message)).with_header("retry-after", "1")
         }
