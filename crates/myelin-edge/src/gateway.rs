@@ -8,6 +8,7 @@ use crate::catalogue::{Handler, HandlerCtx, Method};
 use crate::device_auth::{
     ApprovalOutcome, ClaimOutcome, DeviceApproval, DeviceAuthorizationBroker,
     DeviceAuthorizationClaim, DeviceAuthorizationError, DEVICE_AUTHORIZATION_TTL_SECS,
+    DEVICE_SESSION_JTI_PREFIX,
 };
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
@@ -19,7 +20,7 @@ use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind, RevokeTa
 use myelin_identity_service::{
     machine_scheme, CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority,
     CredentialAudience, CredentialPurpose, DpopBinding, HumanSsoAuthenticator, PrincipalStore,
-    RequestIdentity, VerifiedAssertion,
+    RequestIdentity,
 };
 use myelin_storage::TenantScope;
 use myelin_substrate::shed::{RunClass, Surface};
@@ -44,15 +45,6 @@ impl HumanSessionIssuer {
         (self.now)().map_err(|error| {
             EdgeError::Unavailable(format!("authentication clock unavailable: {error}"))
         })
-    }
-
-    fn mint(
-        &self,
-        principal: &Principal,
-        assertion: &VerifiedAssertion,
-    ) -> Result<(String, i64), EdgeError> {
-        let now = self.now_unix()?;
-        self.mint_session(principal, now, assertion.expires_at_unix)
     }
 
     /// A browser session for `principal` that counts as issued at `issued_at_unix`, ending at the
@@ -113,7 +105,7 @@ impl HumanSessionIssuer {
                 "the approved identity is not eligible for a human session".into(),
             ));
         }
-        if !session_jti.starts_with("session-device-")
+        if !session_jti.starts_with(DEVICE_SESSION_JTI_PREFIX)
             || session_jti.len() > 128
             || !session_jti.as_bytes().iter().all(u8::is_ascii_graphic)
         {
@@ -802,7 +794,7 @@ impl Gateway {
                     &|signed_in| self.mint_password_session(signed_in),
                 )),
                 PublicEndpoint::ChangePassword => {
-                    let identity = self.person_session(req)?;
+                    let identity = self.person_session(req, false)?;
                     Ok(crate::accounts::http::change_password(
                         self.accounts.as_ref(),
                         req,
@@ -855,7 +847,7 @@ impl Gateway {
                     &authorized.scope,
                     &resp,
                 );
-                Ok(resp)
+                Ok(self.rechecked(resp, &authorized.identity))
             }
             RouteKind::Sse {
                 stream,
@@ -879,12 +871,21 @@ impl Gateway {
                     }
                 };
                 let sub = self.sse.subscribe(stream, &sse_scope);
-                Ok(EdgeResponse::sse(
-                    sub,
-                    authorized.identity.capability().expires_at_unix,
+                Ok(self.rechecked(
+                    EdgeResponse::sse(sub, authorized.identity.capability().expires_at_unix),
+                    &authorized.identity,
                 ))
             }
         }
+    }
+
+    /// An event stream stays open only while the credential that opened it still holds.
+    fn rechecked(&self, response: EdgeResponse, identity: &RequestIdentity) -> EdgeResponse {
+        if !matches!(response, EdgeResponse::Sse { .. }) {
+            return response;
+        }
+        let (authn, identity) = (self.authn.clone(), identity.clone());
+        response.with_session_check(Arc::new(move || authn.still_live(&identity)))
     }
 
     fn error_response(
@@ -1008,13 +1009,33 @@ impl Gateway {
             .mint_session(&signed_in.principal, signed_in.issued_at_unix, None)
     }
 
-    /// The verified identity behind a person's own session (browser or CLI). Other credentials,
-    /// such as agent or operator tokens, cannot sign a person out or change their password.
-    fn person_session(&self, req: &EdgeRequest) -> Result<RequestIdentity, EdgeError> {
+    /// When a session minted now for `principal` counts as issued, by the database clock.
+    fn session_issue_time(
+        &self,
+        principal: &Principal,
+        vouched_at: Option<i64>,
+    ) -> Result<Option<i64>, EdgeError> {
+        let scope = TenantScope::from_verified_token(principal, principal.region.clone());
+        self.authn
+            .principals()
+            .session_issue_time(&scope, &principal.principal_id, vouched_at)
+            .map_err(|_| EdgeError::Unavailable("sign-in is temporarily unavailable".into()))
+    }
+
+    /// The verified identity behind a person's own session. Other credentials, such as agent or
+    /// operator tokens, cannot act for the person here. A CLI session can only sign itself out:
+    /// it may not be traded for a browser session or end the person's other sessions.
+    fn person_session(
+        &self,
+        req: &EdgeRequest,
+        cli_allowed: bool,
+    ) -> Result<RequestIdentity, EdgeError> {
         let identity = self.authenticate(req, None, false)?;
-        if identity.capability().purpose != CredentialPurpose::HumanSession {
+        let capability = identity.capability();
+        let from_cli = capability.jti.starts_with(DEVICE_SESSION_JTI_PREFIX);
+        if capability.purpose != CredentialPurpose::HumanSession || (from_cli && !cli_allowed) {
             return Err(EdgeError::Forbidden(
-                "only a person's own session can do this".into(),
+                "only a person's own browser session can do this".into(),
             ));
         }
         Ok(identity)
@@ -1022,7 +1043,7 @@ impl Gateway {
 
     /// `POST /v1/auth/logout`: ends the session that asks, durably, until it would have expired.
     fn logout(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
-        let identity = self.person_session(req)?;
+        let identity = self.person_session(req, true)?;
         let capability = identity.capability();
         let now = myelin_events::clock::system_clock_reading()
             .map_err(|error| EdgeError::Unavailable(format!("clock unavailable: {error}")))?;
@@ -1037,6 +1058,8 @@ impl Gateway {
                 expires_at.timestamp(),
             )
             .map_err(|_| EdgeError::Unavailable("sign-out is temporarily unavailable".into()))?;
+        // Best effort, like the rate-limit sweep: sign-outs clear away denials that expired.
+        let _ = self.authn.revocations().sweep_expired(&identity.scope);
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({ "signed_out": "session" }),
@@ -1045,7 +1068,7 @@ impl Gateway {
 
     /// `POST /v1/auth/logout/everywhere`: ends every session the person holds, this one included.
     fn logout_everywhere(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
-        let identity = self.person_session(req)?;
+        let identity = self.person_session(req, false)?;
         let ended = self
             .authn
             .principals()
@@ -1126,13 +1149,22 @@ impl Gateway {
             }
         };
         let body: DeviceApprovalRequest = parse_auth_request(&req.body, "device approval")?;
+        // The CLI session counts as issued now by the database clock, and only while the browser
+        // session vouching for it has not been ended in the meantime.
+        let vouched_at = match identity.capability().purpose {
+            CredentialPurpose::HumanSession => identity.capability().issued_at_unix,
+            _ => None,
+        };
+        let approved_at = self
+            .session_issue_time(&identity.principal, vouched_at)?
+            .ok_or_else(|| EdgeError::Unauthorized("authentication failed".into()))?;
         let approval = DeviceApproval {
             principal: identity.principal.clone(),
             authority,
             source_expires_at_unix: identity.capability().expires_at_unix,
         };
         let outcome = broker
-            .approve(&body.user_code, approval)
+            .approve(&body.user_code, approval, approved_at)
             .map_err(map_device_authorization_error)?;
         device_approval_response(outcome)
     }
@@ -1245,7 +1277,11 @@ impl Gateway {
                         "human login verified, but the session issuer is unavailable".into(),
                     )
                 })?;
-                let (access_token, expires_at) = issuer.mint(&principal, &assertion)?;
+                let issued_at = self
+                    .session_issue_time(&principal, None)?
+                    .ok_or_else(|| EdgeError::Unauthorized("login failed".into()))?;
+                let (access_token, expires_at) =
+                    issuer.mint_session(&principal, issued_at, assertion.expires_at_unix)?;
                 Ok(EdgeResponse::json(
                     200,
                     &json!({
@@ -1431,7 +1467,7 @@ mod tests {
     use crate::authz::AllowAll;
     use myelin_identity_service::{
         CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator,
-        PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+        PasetoCapabilityVerifier, PrincipalStore, RevocationStore, VerifiedAssertion,
     };
     use myelin_storage::KmsEngine;
 
@@ -1447,16 +1483,8 @@ mod tests {
             PrincipalKind::Human,
             TenantId("acme".into()),
         );
-        let assertion = VerifiedAssertion {
-            tenant: TenantId("acme".into()),
-            region: Region("fr-par".into()),
-            scheme: myelin_identity_service::scheme::OIDC.into(),
-            subject_key: "alice".into(),
-            expires_at_unix: None,
-        };
-
         assert!(matches!(
-            issuer.mint(&principal, &assertion),
+            issuer.mint_session(&principal, 1_800_000_000, None),
             Err(EdgeError::Unavailable(message)) if message.contains("clock unavailable")
         ));
     }
@@ -2795,6 +2823,272 @@ mod tests {
         let whoami_body = whoami.json_body().unwrap();
         assert_eq!(whoami_body["principal_id"], "p:alice");
         assert_eq!(whoami_body["expires_at"], upstream_expiry);
+    }
+
+    #[test]
+    fn an_sso_session_from_an_edge_whose_clock_runs_ahead_still_ends_at_a_cutoff() {
+        use myelin_identity::{DataRole, PrincipalId, PrincipalStatus};
+
+        let now = myelin_events::clock::system_clock_reading()
+            .unwrap()
+            .unix_seconds();
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[33u8; 32], &[34u8; 32]).unwrap());
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let alice = PrincipalId("p:alice".into());
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(alice.clone(), PrincipalKind::Human, TenantId("acme".into())),
+            Region("eu-west".into()),
+        );
+        store
+            .put_principal(
+                &scope,
+                alice.clone(),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .link_credential(
+                &scope,
+                myelin_identity_service::scheme::OIDC,
+                "oidc-sub-1",
+                &alice,
+            )
+            .unwrap();
+        let human = Arc::new(HumanSsoAuthenticator::with_verifier(
+            store.clone(),
+            Arc::new(SuccessfulOidcVerifier {
+                expires_at: now + 600,
+            }),
+        ));
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store.clone(),
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        ));
+        let mut builder = Gateway::builder(authn, human, Arc::new(AllowAll)).route(
+            Method::Get,
+            "/v1/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler::default()),
+        );
+        builder.human_session_issuer = Some(HumanSessionIssuer {
+            cell,
+            jtis: Arc::new(UlidMinter::new()),
+            now: Arc::new(move || Ok(now + 30)),
+        });
+        let gateway = builder.build();
+        let login = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/login",
+            "",
+            vec![],
+            serde_json::to_vec(&json!({
+                "scheme": "oidc",
+                "material": "signed-id-token",
+                "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(login.status(), 200);
+        let token = login.json_body().unwrap()["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let whoami = || {
+            gateway
+                .handle(EdgeRequest::new(
+                    "GET",
+                    "/v1/whoami",
+                    "",
+                    vec![
+                        ("authorization".into(), format!("Bearer {token}")),
+                        ("x-myelin-token-scheme".into(), "session".into()),
+                    ],
+                    vec![],
+                ))
+                .status()
+        };
+        assert_eq!(whoami(), 200);
+
+        store.end_sessions(&scope, &alice).unwrap();
+        assert_eq!(
+            whoami(),
+            401,
+            "the session counts as issued by the store's clock, not the Edge's, which runs ahead"
+        );
+    }
+
+    /// Hands back a fixed verified token per presented material, so every kind of credential can
+    /// reach the account endpoints without its real signing ceremony.
+    struct FixedTokens(BTreeMap<String, myelin_identity_service::CapabilityToken>);
+
+    impl myelin_identity_service::TokenVerifier for FixedTokens {
+        fn verify(
+            &self,
+            credential: &Credential,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            self.0
+                .get(&credential.material)
+                .cloned()
+                .ok_or_else(|| AuthzError::FailClosed("unknown test token".into()))
+        }
+
+        fn verify_for_request(
+            &self,
+            credential: &Credential,
+            _binding: &DpopBinding,
+        ) -> myelin_identity::Result<myelin_identity_service::CapabilityToken> {
+            self.verify(credential)
+        }
+    }
+
+    #[test]
+    fn only_a_browser_session_changes_a_password_or_signs_out_everywhere() {
+        use myelin_identity::{DataRole, PrincipalId, PrincipalStatus};
+        use myelin_identity_service::{Authority, CapabilityToken, MachineKind};
+
+        let now = myelin_events::clock::system_clock_reading()
+            .unwrap()
+            .unix_seconds();
+        let alice = PrincipalId("p:alice".into());
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(alice.clone(), PrincipalKind::Human, TenantId("acme".into())),
+            Region("eu-west".into()),
+        );
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        store
+            .put_principal(
+                &scope,
+                alice.clone(),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        store
+            .link_credential(&scope, "pat", "pat-subject", &alice)
+            .unwrap();
+        store
+            .link_credential(&scope, "agent", "operator-subject", &alice)
+            .unwrap();
+        let revocations = RevocationStore::new();
+        let far = myelin_events::clock::clock_reading_from_unix(now + 3_600)
+            .unwrap()
+            .timestamp();
+        revocations
+            .register_run_token_ttl(
+                &scope,
+                "run-jti",
+                myelin_events::clock::system_clock_reading()
+                    .unwrap()
+                    .timestamp(),
+                far,
+            )
+            .unwrap();
+        let token = |kind, subject: &str, jti: &str, purpose, dpop_bound| CapabilityToken {
+            tenant: TenantId("acme".into()),
+            region: Region("eu-west".into()),
+            kind,
+            subject_key: subject.into(),
+            authority: Authority::of(human_session_authority()),
+            jti: jti.into(),
+            dpop_bound,
+            purpose,
+            audience: CredentialAudience::Edge,
+            issued_at_unix: Some(now - 10),
+            exp_unix: now + 3_600,
+        };
+        let tokens = [
+            (
+                "agent-run",
+                "agent",
+                token(
+                    MachineKind::Agent,
+                    "p:alice",
+                    "run-jti",
+                    CredentialPurpose::AgentRun {
+                        run_id: "run-1".into(),
+                        delegation_snapshot: Some(1),
+                    },
+                    false,
+                ),
+            ),
+            (
+                "pat",
+                "pat",
+                token(
+                    MachineKind::Pat,
+                    "pat-subject",
+                    "pat-jti",
+                    CredentialPurpose::Pat,
+                    true,
+                ),
+            ),
+            (
+                "operator",
+                "agent",
+                token(
+                    MachineKind::Agent,
+                    "operator-subject",
+                    "operator-jti",
+                    CredentialPurpose::OperatorBootstrap,
+                    false,
+                ),
+            ),
+            (
+                "cli",
+                "session",
+                token(
+                    MachineKind::Agent,
+                    "p:alice",
+                    &format!("{DEVICE_SESSION_JTI_PREFIX}abc"),
+                    CredentialPurpose::HumanSession,
+                    false,
+                ),
+            ),
+        ];
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(FixedTokens(
+                tokens
+                    .iter()
+                    .map(|(material, _, token)| (material.to_string(), token.clone()))
+                    .collect(),
+            )),
+            revocations,
+        ));
+        let gateway = Gateway::builder(authn, human_login(), Arc::new(AllowAll)).build();
+        let call = |path: &str, material: &str, scheme: &str| {
+            gateway
+                .handle(EdgeRequest::new(
+                    "POST",
+                    path,
+                    "",
+                    vec![
+                        ("authorization".into(), format!("Bearer {material}")),
+                        ("x-myelin-token-scheme".into(), scheme.into()),
+                    ],
+                    br#"{"current_password":"a","new_password":"b"}"#.to_vec(),
+                ))
+                .status()
+        };
+        for (material, scheme, _) in &tokens {
+            for path in ["/v1/auth/password/change", "/v1/auth/logout/everywhere"] {
+                assert_eq!(call(path, material, scheme), 403, "{material} at {path}");
+            }
+        }
+        for (material, scheme, _) in &tokens[..3] {
+            assert_eq!(call("/v1/auth/logout", material, scheme), 403, "{material}");
+        }
+        assert_eq!(
+            call("/v1/auth/logout", "cli", "session"),
+            200,
+            "a CLI session may sign itself out"
+        );
     }
 
     #[test]

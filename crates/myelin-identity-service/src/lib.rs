@@ -119,7 +119,7 @@ pub use oidc::{
 };
 pub use principal_store::{
     PrincipalCredentialProvision, PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore,
-    ProfileRef, S1_TABLE,
+    ProfileRef, SessionState, S1_TABLE,
 };
 pub use project_store::{
     project_ref, validate_new_project, NewProject, PgProjectStore, Project, ProjectCreation,

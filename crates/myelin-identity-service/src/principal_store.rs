@@ -48,6 +48,14 @@ pub struct PrincipalRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionState {
+    pub status: PrincipalStatus,
+    pub sessions_not_before: Option<i64>,
+    /// Whether the session's jti is denied; `None` when this store cannot say.
+    pub jti_denied: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileRef {
     pub key_ref: PiiKeyRef,
 }
@@ -285,9 +293,14 @@ impl PrincipalStore {
                 let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
                 let partition = inner.partitions.entry(part_key.clone()).or_default();
                 let mut row = row;
-                row.sessions_not_before = partition
-                    .get(&principal_id.0)
-                    .and_then(|stored| stored.sessions_not_before);
+                // As the database trigger does: a status change ends the person's sessions.
+                row.sessions_not_before = partition.get(&principal_id.0).and_then(|stored| {
+                    if stored.status == row.status {
+                        stored.sessions_not_before
+                    } else {
+                        Some(Self::cutoff_after(stored.sessions_not_before))
+                    }
+                });
                 partition.insert(principal_id.0.clone(), row.clone());
                 if let Some(enc) = sealed {
                     inner
@@ -494,8 +507,7 @@ impl PrincipalStore {
                 else {
                     return Ok(None);
                 };
-                let cutoff = (crate::clock::unix_seconds() + 1)
-                    .max(row.sessions_not_before.unwrap_or(0) + 1);
+                let cutoff = Self::cutoff_after(row.sessions_not_before);
                 row.sessions_not_before = Some(cutoff);
                 Ok(Some(cutoff))
             }
@@ -503,6 +515,77 @@ impl PrincipalStore {
                 .block(pg.backing.end_sessions(&scope.tenant().0, &principal_id.0))
                 .map_err(|e| PrincipalError::Storage(e.to_string())),
         }
+    }
+
+    /// When a session minted now for the active person counts as issued: the present second by
+    /// the database clock, never before their cutoff. With `vouched_at` (the issue time of the
+    /// session vouching for this one), `None` also when that session has since been ended.
+    pub fn session_issue_time(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+        vouched_at: Option<i64>,
+    ) -> Result<Option<i64>, PrincipalError> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PrincipalBackend::Memory(_) => Ok(self
+                .get_principal(scope, principal_id)?
+                .filter(|row| row.status == PrincipalStatus::Active)
+                .map(|row| row.sessions_not_before.unwrap_or(0))
+                .filter(|cutoff| vouched_at.is_none_or(|vouched| *cutoff <= vouched))
+                .map(|cutoff| crate::clock::unix_seconds().max(cutoff))),
+            PrincipalBackend::Pg(pg) => pg
+                .block(pg.backing.session_issue_time(
+                    &scope.tenant().0,
+                    &principal_id.0,
+                    vouched_at,
+                ))
+                .map_err(|e| PrincipalError::Storage(e.to_string())),
+        }
+    }
+
+    /// The person's status and cutoff, and (durably, in the same read) whether `jti` is denied.
+    /// The in-memory store keeps no denylist, so it leaves that to the caller.
+    pub fn session_state(
+        &self,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+        jti: &str,
+    ) -> Result<Option<SessionState>, PrincipalError> {
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S1_TABLE));
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            PrincipalBackend::Memory(_) => {
+                Ok(self
+                    .get_principal(scope, principal_id)?
+                    .map(|row| SessionState {
+                        status: row.status,
+                        sessions_not_before: row.sessions_not_before,
+                        jti_denied: None,
+                    }))
+            }
+            PrincipalBackend::Pg(pg) => pg
+                .block(
+                    pg.backing
+                        .session_state(&scope.tenant().0, &principal_id.0, jti),
+                )
+                .map_err(|e| PrincipalError::Storage(e.to_string()))?
+                .map(|state| {
+                    Ok(SessionState {
+                        status: serde_json::from_str(&state.status)
+                            .map_err(|_| PrincipalError::CorruptPrincipal { field: "status" })?,
+                        sessions_not_before: state.sessions_not_before,
+                        jti_denied: Some(state.jti_denied),
+                    })
+                })
+                .transpose(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn cutoff_after(previous: Option<i64>) -> i64 {
+        (crate::clock::unix_seconds() + 1).max(previous.unwrap_or(0) + 1)
     }
 
     pub fn get_profile(

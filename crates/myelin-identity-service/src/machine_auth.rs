@@ -210,6 +210,7 @@ pub struct VerifiedCapabilityContext {
     pub audience: CredentialAudience,
     pub jti: String,
     pub effective_authority: Authority,
+    pub issued_at_unix: Option<i64>,
     pub expires_at_unix: i64,
     pub dpop: DpopState,
 }
@@ -593,8 +594,14 @@ impl CapabilityAuthenticator {
                 )));
             }
         }
-        if token.purpose == CredentialPurpose::HumanSession {
-            ensure_session_not_ended(&token, row.sessions_not_before)?;
+        if token.purpose == CredentialPurpose::HumanSession
+            && session_ended(token.issued_at_unix, row.sessions_not_before)
+        {
+            return Err(AuthzError::FailClosed(format!(
+                "human session `{}` has no signed `iat` or was issued before the person's \
+                 sessions were ended - refused",
+                token.jti
+            )));
         }
 
         let principal = Principal::new(
@@ -613,6 +620,7 @@ impl CapabilityAuthenticator {
                 audience: token.audience,
                 jti: token.jti,
                 effective_authority: token.authority,
+                issued_at_unix: token.issued_at_unix,
                 expires_at_unix: token.exp_unix,
                 dpop: if token.dpop_bound {
                     DpopState::Verified
@@ -621,6 +629,40 @@ impl CapabilityAuthenticator {
                 },
             }),
         })
+    }
+
+    /// Whether an identity verified earlier is still good: its person is active, a human session
+    /// was not issued before their cutoff, and a session's jti is not denied. Long-lived responses
+    /// (event streams) ask this periodically. Durably it is one read.
+    pub fn still_live(&self, identity: &RequestIdentity) -> bool {
+        let capability = identity.capability();
+        let state = match self.store.session_state(
+            &identity.scope,
+            &identity.principal.principal_id,
+            &capability.jti,
+        ) {
+            Ok(Some(state)) => state,
+            Ok(None) | Err(_) => return false,
+        };
+        if state.status != PrincipalStatus::Active {
+            return false;
+        }
+        if capability.purpose.is_run_scoped() {
+            // A run credential's jti row records its life, not a denial; its run tears it down.
+            return true;
+        }
+        let denied = state.jti_denied.unwrap_or_else(|| {
+            self.revocations.is_revoked(
+                &identity.scope,
+                &RevokeTarget::Jti(capability.jti.clone()),
+                &(self.now)(),
+            )
+        });
+        if denied {
+            return false;
+        }
+        capability.purpose != CredentialPurpose::HumanSession
+            || !session_ended(capability.issued_at_unix, state.sessions_not_before)
     }
 
     pub fn authenticate(
@@ -685,25 +727,12 @@ impl CapabilityAuthenticator {
     }
 }
 
-/// A human session issued before the person's cutoff was ended by a sign-out everywhere or a
-/// password change. A session without an issue time cannot be placed against it, so it is refused.
-fn ensure_session_not_ended(
-    token: &CapabilityToken,
-    sessions_not_before: Option<i64>,
-) -> myelin_identity::Result<()> {
-    let issued_at = token.issued_at_unix.ok_or_else(|| {
-        AuthzError::FailClosed(format!(
-            "human session `{}` carries no signed `iat` - refused",
-            token.jti
-        ))
-    })?;
-    match sessions_not_before {
-        Some(cutoff) if issued_at < cutoff => Err(AuthzError::FailClosed(format!(
-            "human session `{}` was issued at {issued_at}, before the person's sessions were \
-             ended at {cutoff} - refused",
-            token.jti
-        ))),
-        _ => Ok(()),
+/// A human session issued before the person's cutoff was ended by a sign-out everywhere, a
+/// password change, or a status change. One without an issue time cannot be placed against it.
+fn session_ended(issued_at: Option<i64>, sessions_not_before: Option<i64>) -> bool {
+    match issued_at {
+        None => true,
+        Some(issued_at) => sessions_not_before.is_some_and(|cutoff| issued_at < cutoff),
     }
 }
 

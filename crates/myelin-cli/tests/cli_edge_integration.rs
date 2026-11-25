@@ -222,3 +222,117 @@ fn issues_malformed_input_is_a_local_usage_exit() {
         "parsing precedes transport"
     );
 }
+
+/// A gateway that knows one person, and a browser-style session for them.
+fn person_with_session() -> (Arc<Gateway>, String) {
+    let cell = CellTokenAuthority::from_seed(&[5u8; 32], &[6u8; 32]).expect("cell authority");
+    let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+    store
+        .put_principal(
+            &admin_scope("acme"),
+            PrincipalId("person-ada".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            None,
+        )
+        .expect("seed person");
+    let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+        store,
+        Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+        RevocationStore::new(),
+    ));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
+    let gateway = Gateway::builder(authn, human_login, Arc::new(AllowAll))
+        .default_token_scheme("session")
+        .route(
+            Method::Get,
+            "/v1/whoami",
+            "edge.whoami",
+            Arc::new(WhoamiHandler::default()),
+        )
+        .build();
+    let token = cell.mint(&CapabilityMintSpec {
+        tenant: "acme".into(),
+        region: REGION.into(),
+        subject_key: "person-ada".into(),
+        jti: "session-cli-logout".into(),
+        issued_at_unix: Some(now()),
+        exp_unix: now() + 3600,
+        authority: myelin_edge::authz::human_session_authority(),
+        dpop_jkt: None,
+        purpose: myelin_identity_service::CredentialPurpose::HumanSession,
+        audience: myelin_identity_service::CredentialAudience::Edge,
+    });
+    (Arc::new(gateway), token)
+}
+
+/// Runs `myelin auth logout --json` against a config directory holding `token` as a stored
+/// session for `edge`.
+fn logout_with_stored_session(edge: &str, token: &str) -> serde_json::Value {
+    let config = tempfile::tempdir().expect("config dir");
+    let config_dir = config.path().to_path_buf();
+    let getenv = |name: &str| match name {
+        "MYELIN_CONFIG_DIR" => Some(config_dir.display().to_string()),
+        "MYELIN_TEST_CREDENTIAL_STORE" => Some("file".into()),
+        _ => None,
+    };
+    myelin_cli::config::store_credential(token, "session", Some(edge), Some(now() + 3600), &getenv)
+        .expect("store the session");
+    let out = Command::new(env!("CARGO_BIN_EXE_myelin"))
+        .env("MYELIN_CONFIG_DIR", &config_dir)
+        .env("MYELIN_TEST_CREDENTIAL_STORE", "file")
+        .env_remove("MYELIN_TOKEN")
+        .env_remove("MYELIN_EDGE")
+        .args(["--json", "auth", "logout"])
+        .output()
+        .expect("spawn myelin");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("logout JSON")
+}
+
+fn whoami_status(gateway: &Gateway, token: &str) -> u16 {
+    gateway
+        .handle(myelin_edge::EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![("authorization".into(), format!("Bearer {token}"))],
+            vec![],
+        ))
+        .status()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logging_out_ends_the_stored_session_at_the_edge_and_forgets_it() {
+    let (gateway, token) = person_with_session();
+    let addr = spawn(gateway.clone()).await;
+    assert_eq!(whoami_status(&gateway, &token), 200);
+
+    let outcome = logout_with_stored_session(&format!("http://{addr}"), &token);
+    assert_eq!(outcome["session_ended"], true, "{outcome}");
+    assert_eq!(outcome["stored_credential_removed"], true);
+    assert_eq!(
+        whoami_status(&gateway, &token),
+        401,
+        "the session is over at the edge"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logging_out_forgets_the_session_even_when_the_edge_cannot_be_reached() {
+    let unreachable = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let (_gateway, token) = person_with_session();
+    let outcome = logout_with_stored_session(&unreachable, &token);
+    assert_eq!(outcome["session_ended"], false, "{outcome}");
+    assert_eq!(outcome["stored_credential_removed"], true);
+}

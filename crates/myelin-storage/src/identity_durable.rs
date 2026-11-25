@@ -43,6 +43,42 @@ CREATE POLICY myelin_tenant_isolation ON principal \
 pub const PRINCIPAL_SESSIONS_NOT_BEFORE_MIGRATION: &str =
     "ALTER TABLE principal ADD COLUMN IF NOT EXISTS sessions_not_before bigint;";
 
+/// Disabling, suspending, or re-enabling a person, and a principal-wide revocation (an erasure),
+/// each end every session the person holds, so a later re-enable never revives them.
+pub const PRINCIPAL_STATUS_ENDS_SESSIONS_MIGRATION: &str = r#"
+CREATE OR REPLACE FUNCTION principal_cutoff_after(previous bigint) RETURNS bigint
+LANGUAGE sql VOLATILE AS $$
+  SELECT GREATEST(COALESCE(previous, 0) + 1,
+                  floor(extract(epoch FROM clock_timestamp()))::bigint + 1)
+$$;
+
+CREATE OR REPLACE FUNCTION principal_status_ends_sessions() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.status IS DISTINCT FROM OLD.status THEN
+    NEW.sessions_not_before := principal_cutoff_after(OLD.sessions_not_before);
+  END IF;
+  RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS principal_status_ends_sessions ON principal;
+CREATE TRIGGER principal_status_ends_sessions BEFORE UPDATE OF status ON principal
+  FOR EACH ROW EXECUTE FUNCTION principal_status_ends_sessions();
+
+CREATE OR REPLACE FUNCTION principal_revocation_ends_sessions() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE principal SET sessions_not_before = principal_cutoff_after(sessions_not_before)
+   WHERE tenant_id = NEW.tenant_id AND region = NEW.region AND principal_id = NEW.handle;
+  RETURN NULL;
+END
+$$;
+DROP TRIGGER IF EXISTS principal_revocation_ends_sessions ON revocation;
+CREATE TRIGGER principal_revocation_ends_sessions AFTER INSERT ON revocation
+  FOR EACH ROW WHEN (NEW.kind = 'principal')
+  EXECUTE FUNCTION principal_revocation_ends_sessions();
+"#;
+
 pub const REVOCATION_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS revocation (
     tenant_id  text NOT NULL,
@@ -305,6 +341,11 @@ pub fn identity_durable_migrations() -> Migrations {
         Migration::plain_on(
             "0181_principal_sessions_not_before",
             PRINCIPAL_SESSIONS_NOT_BEFORE_MIGRATION,
+            "principal",
+        ),
+        Migration::plain_on(
+            "0182_principal_status_ends_sessions",
+            PRINCIPAL_STATUS_ENDS_SESSIONS_MIGRATION,
             "principal",
         ),
     ])
@@ -1065,9 +1106,7 @@ impl DurablePrincipalBacking {
         principal_id: &str,
     ) -> Result<Option<i64>, PgError> {
         sqlx::query_scalar(
-            "UPDATE principal SET sessions_not_before = GREATEST( \
-               COALESCE(sessions_not_before, 0) + 1, \
-               floor(extract(epoch FROM clock_timestamp()))::bigint + 1) \
+            "UPDATE principal SET sessions_not_before = principal_cutoff_after(sessions_not_before) \
              WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
              RETURNING sessions_not_before",
         )
@@ -1095,6 +1134,96 @@ impl DurablePrincipalBacking {
             })
             .await
     }
+}
+
+impl DurablePrincipalBacking {
+    /// When a session minted now for an active person counts as issued: the database's present
+    /// second, raised to their cutoff. The row is locked for share, so an uncommitted cutoff is
+    /// waited for rather than missed. With `vouched_at` (the issue time of the session that
+    /// vouches for this one), `None` also when that session has since been ended.
+    pub async fn session_issue_time(
+        &self,
+        tenant: &str,
+        principal_id: &str,
+        vouched_at: Option<i64>,
+    ) -> Result<Option<i64>, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let pid = principal_id.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT GREATEST(floor(extract(epoch FROM clock_timestamp()))::bigint, \
+                                         COALESCE(sessions_not_before, 0)) \
+                           FROM principal \
+                          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
+                            AND status = $4 \
+                            AND ($5::bigint IS NULL OR COALESCE(sessions_not_before, 0) <= $5) \
+                          FOR SHARE",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&pid)
+                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+                    .bind(vouched_at)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))
+                })
+            })
+            .await
+    }
+
+    /// Everything that decides whether a verified session is still good, in one statement: the
+    /// person's status and cutoff, and whether `jti` is on the denylist now.
+    pub async fn session_state(
+        &self,
+        tenant: &str,
+        principal_id: &str,
+        jti: &str,
+    ) -> Result<Option<DurableSessionState>, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let pid = principal_id.to_string();
+        let jti = jti.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT p.status, p.sessions_not_before, EXISTS ( \
+                                SELECT 1 FROM revocation r \
+                                 WHERE r.tenant_id = p.tenant_id AND r.region = p.region \
+                                   AND r.kind = 'jti' AND r.handle = $4 \
+                                   AND (r.expires_at IS NULL \
+                                        OR r.expires_at::timestamptz > clock_timestamp())) \
+                                AS denied \
+                           FROM principal p \
+                          WHERE p.tenant_id = $1 AND p.region = $2 AND p.principal_id = $3",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&pid)
+                    .bind(&jti)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|e| PgError::Query(e.to_string()))?;
+                    Ok(row.map(|row| DurableSessionState {
+                        status: row.get("status"),
+                        sessions_not_before: row.get("sessions_not_before"),
+                        jti_denied: row.get("denied"),
+                    }))
+                })
+            })
+            .await
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurableSessionState {
+    pub status: String,
+    pub sessions_not_before: Option<i64>,
+    pub jti_denied: bool,
 }
 
 fn row_to_principal(r: &sqlx::postgres::PgRow) -> Result<DurablePrincipalRow, crate::pg::PgError> {
@@ -1310,6 +1439,34 @@ impl DurableRevocationBacking {
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
                     Ok(())
+                })
+            })
+            .await
+    }
+
+    /// Deletes up to `limit` of the tenant's per-session denials whose session has expired by
+    /// now. Such a row decides nothing: the credential it names is refused for its expiry anyway.
+    pub async fn sweep_expired_jtis(&self, tenant: &str, limit: i64) -> Result<u64, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "DELETE FROM revocation WHERE ctid IN ( \
+                           SELECT ctid FROM revocation \
+                            WHERE tenant_id = $1 AND region = $2 AND kind = 'jti' \
+                              AND expires_at IS NOT NULL \
+                              AND expires_at::timestamptz <= clock_timestamp() \
+                            LIMIT $3 FOR UPDATE SKIP LOCKED)",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(limit)
+                    .execute(&mut *conn)
+                    .await
+                    .map(|done| done.rows_affected())
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))
                 })
             })
             .await

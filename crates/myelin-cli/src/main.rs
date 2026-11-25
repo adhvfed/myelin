@@ -214,7 +214,7 @@ async fn run() -> Result<(), CliError> {
         Command::Auth { command } => match command {
             AuthCommand::Login(args) => login(&cli, *args, &getenv).await,
             AuthCommand::Status => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
-            AuthCommand::Logout => logout(&cli, &getenv),
+            AuthCommand::Logout => logout(&cli, &getenv, &read_file).await,
             AuthCommand::ConfigureGit => configure_git(&cli, &getenv, &read_file, false),
             AuthCommand::UnconfigureGit => configure_git(&cli, &getenv, &read_file, true),
             AuthCommand::GitCredential { operation } => {
@@ -557,8 +557,13 @@ fn resolve_login_project(
     )
 }
 
-fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliError> {
+async fn logout(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<(), CliError> {
     reject_auth_mutation_flags(cli)?;
+    let session_ended = end_stored_session(cli, getenv, read_file).await;
     let removed = remove_profile_credential(cli.profile.as_deref(), getenv)?;
     let environment_active = cli.token.as_deref().is_some_and(|value| !value.is_empty())
         || getenv(config::env::TOKEN).is_some_and(|value| !value.is_empty());
@@ -567,6 +572,7 @@ fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliE
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "logged_out": true,
+                "session_ended": session_ended,
                 "stored_credential_removed": removed,
                 "environment_credential_active": environment_active,
             }))
@@ -582,6 +588,44 @@ fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliE
         println!("No stored credentials were present on this device.");
     }
     Ok(())
+}
+
+/// Asks the Edge to end the stored session before it is forgotten here. Only a stored session is
+/// ended; a token given by flag or environment is left alone. Whatever the Edge says, the local
+/// credential is removed afterwards, so a failure here only means the session lives out its expiry.
+async fn end_stored_session(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> bool {
+    let Ok(Some(stored)) = load_profile_credential(cli.profile.as_deref(), getenv, read_file)
+    else {
+        return false;
+    };
+    let credential = stored.credential;
+    if credential.scheme != SESSION_SCHEME {
+        return false;
+    }
+    let edge = resolve_edge(
+        cli.edge.as_deref(),
+        Some(&credential.scheme),
+        credential.edge_url.as_deref(),
+        getenv,
+    );
+    let call = EdgeCall {
+        method: HttpMethod::Post,
+        path: "/v1/auth/logout".into(),
+        query: None,
+        payload: Some(b"{}".to_vec()),
+        idempotency_key: None,
+        retry_policy: RetryPolicy::None,
+    };
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        execute(&edge, &credential.token, &call),
+    )
+    .await;
+    matches!(ended, Ok(Ok(_)))
 }
 
 fn reject_auth_mutation_flags(cli: &Cli) -> Result<(), CliError> {

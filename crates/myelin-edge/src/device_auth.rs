@@ -20,6 +20,8 @@ pub const DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS: u64 = 2;
 pub const DEVICE_AUTHORIZATION_MAX_OUTSTANDING: u64 = 2_048;
 pub const DEVICE_AUTHORIZATION_MAX_STARTS_PER_MINUTE: u64 = 300;
 pub const DEVICE_AUTHORIZATION_TABLE: &str = "auth_device_authorization";
+/// Every CLI session's jti starts with this; a browser session's never does.
+pub const DEVICE_SESSION_JTI_PREFIX: &str = "session-device-";
 
 const SECRET_BYTES: usize = 32;
 const SECRET_B64URL_LEN: usize = 43;
@@ -265,6 +267,7 @@ trait DeviceAuthorizationStore: Send + Sync {
         user_code_digest: [u8; 32],
         approval: DeviceApproval,
         now_unix: i64,
+        approved_at_unix: i64,
     ) -> Result<ApprovalOutcome, DeviceAuthorizationStoreError>;
 
     fn claim(
@@ -327,6 +330,7 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
         user_code_digest: [u8; 32],
         approval: DeviceApproval,
         now_unix: i64,
+        approved_at_unix: i64,
     ) -> Result<ApprovalOutcome, DeviceAuthorizationStoreError> {
         let mut authorizations = self
             .authorizations
@@ -352,7 +356,7 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
                 ApprovalOutcome::NotFound
             });
         }
-        stored.approval = Some((approval, now_unix));
+        stored.approval = Some((approval, approved_at_unix));
         Ok(ApprovalOutcome::Approved)
     }
 
@@ -492,6 +496,7 @@ impl PgDeviceAuthorizationStore {
         user_code_digest: [u8; 32],
         approval: DeviceApproval,
         now_unix: i64,
+        approved_at_unix: i64,
     ) -> Result<ApprovalOutcome, DeviceAuthorizationStoreError> {
         let mut transaction = self
             .pool
@@ -563,7 +568,7 @@ impl PgDeviceAuthorizationStore {
               WHERE device_digest = $1",
         )
         .bind(&device_digest)
-        .bind(now_unix)
+        .bind(approved_at_unix)
         .bind(principal)
         .bind(authority)
         .bind(approval.source_expires_at_unix)
@@ -675,8 +680,9 @@ impl DeviceAuthorizationStore for PgDeviceAuthorizationStore {
         user_code_digest: [u8; 32],
         approval: DeviceApproval,
         now_unix: i64,
+        approved_at_unix: i64,
     ) -> Result<ApprovalOutcome, DeviceAuthorizationStoreError> {
-        self.drive(self.approve_async(user_code_digest, approval, now_unix))
+        self.drive(self.approve_async(user_code_digest, approval, now_unix, approved_at_unix))
     }
 
     fn claim(
@@ -805,8 +811,9 @@ impl DeviceAuthorizationBroker {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+    /// The Edge clock that judges start limits and expiry; approval times come from the database.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.now = Arc::new(move || Ok(now()));
         self
     }
@@ -887,10 +894,13 @@ impl DeviceAuthorizationBroker {
         ))
     }
 
+    /// Records the approval. `approved_at_unix` is when the approving session vouched for it, by
+    /// the database clock; the CLI session it leads to counts as issued then.
     pub(crate) fn approve(
         &self,
         user_code: &str,
         approval: DeviceApproval,
+        approved_at_unix: i64,
     ) -> Result<ApprovalOutcome, DeviceAuthorizationError> {
         let user_code = canonical_user_code(user_code).ok_or(
             DeviceAuthorizationError::InvalidInput("the user code is malformed"),
@@ -901,6 +911,7 @@ impl DeviceAuthorizationBroker {
                 digest("user", &user_code),
                 approval,
                 (self.now)().map_err(DeviceAuthorizationError::Clock)?,
+                approved_at_unix,
             )
             .map_err(DeviceAuthorizationError::Store)
     }
@@ -1014,7 +1025,7 @@ fn digest(namespace: &str, value: &str) -> [u8; 32] {
 
 fn device_session_jti(device_digest: &[u8; 32]) -> String {
     format!(
-        "session-device-{}",
+        "{DEVICE_SESSION_JTI_PREFIX}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(device_digest)
     )
 }
@@ -1075,7 +1086,7 @@ mod tests {
         );
         assert_eq!(
             broker
-                .approve(&started.user_code.to_lowercase(), approval())
+                .approve(&started.user_code.to_lowercase(), approval(), 1_800_000_000)
                 .unwrap(),
             ApprovalOutcome::Approved
         );
@@ -1095,7 +1106,9 @@ mod tests {
             .with_clock(|| 1_800_000_000);
         let verifier = verifier();
         let started = broker.begin(&challenge(&verifier)).unwrap();
-        broker.approve(&started.user_code, approval()).unwrap();
+        broker
+            .approve(&started.user_code, approval(), 1_800_000_000)
+            .unwrap();
         let attacker_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([8_u8; 32]);
 
         assert_eq!(

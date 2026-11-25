@@ -1353,3 +1353,218 @@ async fn a_join_that_loses_the_email_inside_its_transaction_rolls_back_and_keeps
         "the rival keeps theirs"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_wrong_current_passwords_is_verified_no_more_than_the_limit_allows() {
+    const LIMIT: usize = 10;
+    const BURST: usize = 40;
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-change-burst");
+    let email = format!("{}@example.com", unique("noether"));
+    let person = cell.join_person(&tenant, &email, "Emmy").await;
+
+    let verified = Arc::new(AtomicUsize::new(0));
+    let counting = cell
+        .service(Some("https://myelin.example"))
+        .with_checkpoint({
+            let verified = verified.clone();
+            move |checkpoint| {
+                if checkpoint == Checkpoint::PasswordVerified {
+                    verified.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+    let start = Arc::new(Barrier::new(BURST));
+    let attempts: Vec<_> = (0..BURST)
+        .map(|_| {
+            let (accounts, start, person) = (counting.clone(), start.clone(), person.clone());
+            tokio::task::spawn_blocking(move || {
+                start.wait();
+                accounts.change_password(
+                    &person,
+                    "wrong password!".into(),
+                    "a perfectly good new passphrase".into(),
+                )
+            })
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for attempt in attempts {
+        answers.push(attempt.await.unwrap());
+    }
+    let count = |wanted: fn(&AccountError) -> bool| {
+        answers
+            .iter()
+            .filter(|answer| answer.as_ref().is_err_and(wanted))
+            .count()
+    };
+    let wrong = count(|error| *error == AccountError::WrongPassword);
+    let limited = count(|error| matches!(error, AccountError::RateLimited { .. }));
+    let busy = count(|error| *error == AccountError::Busy);
+    assert_eq!(wrong + limited + busy, BURST, "no other answer is possible");
+    assert!(
+        verified.load(Ordering::SeqCst) <= LIMIT,
+        "{} current passwords were verified in one window; the limit is {LIMIT}",
+        verified.load(Ordering::SeqCst)
+    );
+    assert!(
+        limited >= BURST - LIMIT - busy,
+        "attempts past the limit are refused before verifying (limited {limited})"
+    );
+    assert!(matches!(
+        cell.accounts.login(&email, PASSWORD.into()),
+        Err(AccountError::RateLimited { .. })
+    ));
+}
+
+/// Stops `accounts` once it has verified a current password, until the test lets it go on.
+fn paused_after_verifying(accounts: AccountService) -> (AccountService, Arc<PauseGate>) {
+    let gate = Arc::new(PauseGate::default());
+    let paused = accounts.with_checkpoint({
+        let gate = gate.clone();
+        move |checkpoint| {
+            if checkpoint == Checkpoint::PasswordVerified {
+                gate.hold();
+            }
+        }
+    });
+    (paused, gate)
+}
+
+#[derive(Default)]
+struct PauseGate {
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl PauseGate {
+    fn hold(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_held(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-change-race");
+    let email = format!("{}@example.com", unique("meitner"));
+    let person = cell.join_person(&tenant, &email, "Lise").await;
+
+    // Another change lands after this one verified the current password.
+    let (paused, gate) = paused_after_verifying(cell.service(Some("https://myelin.example")));
+    let losing = {
+        let person = person.clone();
+        tokio::task::spawn_blocking(move || {
+            paused.change_password(&person, PASSWORD.into(), "the losing passphrase".into())
+        })
+    };
+    tokio::task::spawn_blocking({
+        let gate = gate.clone();
+        move || gate.wait_until_held()
+    })
+    .await
+    .unwrap();
+    cell.accounts
+        .change_password(&person, PASSWORD.into(), "the winning passphrase".into())
+        .expect("the other change wins");
+    gate.release();
+    assert_eq!(
+        losing.await.unwrap().unwrap_err(),
+        AccountError::PasswordChangedElsewhere
+    );
+    cell.accounts
+        .login(&email, "the winning passphrase".into())
+        .expect("the winner's password stands");
+
+    // Nine wrong guesses, then one change refused because the person was disabled meanwhile.
+    for attempt in 1..=9 {
+        assert_eq!(
+            cell.accounts
+                .change_password(
+                    &person,
+                    "wrong password!".into(),
+                    "whatever passphrase".into()
+                )
+                .unwrap_err(),
+            AccountError::WrongPassword,
+            "guess {attempt}"
+        );
+    }
+    let scope = myelin_storage::TenantScope::from_verified_token(&person, person.region.clone());
+    let (paused, gate) = paused_after_verifying(cell.service(Some("https://myelin.example")));
+    let refused = {
+        let person = person.clone();
+        tokio::task::spawn_blocking(move || {
+            paused.change_password(
+                &person,
+                "the winning passphrase".into(),
+                "a passphrase never stored".into(),
+            )
+        })
+    };
+    tokio::task::spawn_blocking({
+        let gate = gate.clone();
+        move || gate.wait_until_held()
+    })
+    .await
+    .unwrap();
+    let set_status = |status| {
+        cell.principals
+            .put_principal(
+                &scope,
+                person.principal_id.clone(),
+                person.kind.clone(),
+                person.data_role,
+                status,
+                None,
+            )
+            .unwrap();
+    };
+    set_status(PrincipalStatus::Disabled);
+    gate.release();
+    assert_eq!(
+        refused.await.unwrap().unwrap_err(),
+        AccountError::SessionEnded
+    );
+    set_status(PrincipalStatus::Active);
+
+    // The refused change gave its slot back, so one more guess fits in the window.
+    assert_eq!(
+        cell.accounts
+            .change_password(
+                &person,
+                "wrong password!".into(),
+                "whatever passphrase".into()
+            )
+            .unwrap_err(),
+        AccountError::WrongPassword,
+        "the tenth guess"
+    );
+    assert!(matches!(
+        cell.accounts.change_password(
+            &person,
+            "wrong password!".into(),
+            "whatever passphrase".into()
+        ),
+        Err(AccountError::RateLimited { .. })
+    ));
+}

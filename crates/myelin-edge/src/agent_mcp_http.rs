@@ -940,6 +940,7 @@ mod tests {
                     audience: CredentialAudience::Edge,
                     jti: "run-jti".into(),
                     effective_authority: Authority::of(["run.view"]),
+                    issued_at_unix: None,
                     expires_at_unix: i64::MAX,
                     dpop: myelin_identity_service::DpopState::Unbound,
                 },

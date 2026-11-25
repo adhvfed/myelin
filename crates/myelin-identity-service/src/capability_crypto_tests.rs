@@ -713,3 +713,27 @@ fn signer_malformed_run_deadline_produces_unusable_token() {
         "malformed deadline should fail as an expired token"
     );
 }
+
+#[test]
+fn a_signed_issue_time_must_lie_between_now_plus_skew_and_the_expiry() {
+    let cell = cell();
+    let verify = |issued_at: Option<i64>, exp: i64| {
+        let token = cell.mint(&CapabilityMintSpec {
+            issued_at_unix: issued_at,
+            exp_unix: exp,
+            ..spec("acme", &["edge.operator"], None)
+        });
+        verifier(cell.trust_anchor()).verify_material(&token, MachineKind::Agent)
+    };
+    assert!(verify(Some(NOW), NOW + 300).is_ok());
+    assert!(verify(None, NOW + 300).is_ok(), "a run token carries none");
+    assert!(
+        verify(Some(NOW + 60), NOW + 300).is_ok(),
+        "a minute of skew is allowed"
+    );
+    assert!(verify(Some(NOW + 61), NOW + 300).is_err(), "too far ahead");
+    assert!(
+        verify(Some(NOW + 200), NOW + 100).is_err(),
+        "issued after it expires"
+    );
+}

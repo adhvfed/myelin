@@ -16,6 +16,9 @@ const V4_PUBLIC_HEADER: &str = "v4.public.";
 const DPOP_HEADER: &str = "dpop.v1.";
 const MACAROON_DOMAIN: &[u8] = b"myelin.cap.macaroon.v1";
 const SHA256_BYTES: usize = 32;
+/// How far a signed `iat` may lie ahead of the verifier's clock: clock skew, plus a session
+/// cutoff that repeated sign-outs within one second pushed a little into the future.
+const MAX_ISSUED_AHEAD_SECS: i64 = 60;
 
 fn b64url_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -683,6 +686,14 @@ impl PasetoCapabilityVerifier {
             return Err(refuse(format!(
                 "capability token expired: exp={exp} <= now={now}"
             )));
+        }
+        if let Some(issued_at) = issued_at_unix {
+            if issued_at > exp || issued_at > now.saturating_add(MAX_ISSUED_AHEAD_SECS) {
+                return Err(refuse(format!(
+                    "capability token `iat`={issued_at} is after its expiry or too far ahead of \
+                     now={now} - refused"
+                )));
+            }
         }
 
         let mut tag = macaroon_root_tag(&self.anchor.mac_key, &sig);

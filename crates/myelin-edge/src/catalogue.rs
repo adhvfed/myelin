@@ -157,6 +157,7 @@ pub(crate) fn test_request_identity(principal: &Principal, scope: &TenantScope) 
                 audience: myelin_identity_service::CredentialAudience::Edge,
                 jti: "test-handler-context".into(),
                 effective_authority: myelin_identity_service::Authority::of(["edge.operator"]),
+                issued_at_unix: None,
                 expires_at_unix: i64::MAX,
                 dpop: myelin_identity_service::DpopState::Unbound,
             },

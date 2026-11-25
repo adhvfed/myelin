@@ -991,6 +991,7 @@ fn to_hyper_with_permit(
             headers,
             sub,
             expires_at_unix,
+            still_live,
         } => {
             drop(large_response_permit);
             if !handler_response_headers_are_safe(&headers) {
@@ -1005,7 +1006,11 @@ fn to_hyper_with_permit(
                 builder = builder.header(k, v);
             }
             builder
-                .body(sse_body(sub.into_receiver(), expires_at_unix))
+                .body(sse_body(
+                    sub.into_receiver(),
+                    expires_at_unix,
+                    still_live.map(|check| (check, SESSION_RECHECK_INTERVAL)),
+                ))
                 .unwrap_or_else(|_| response_render_failure())
         }
     }
@@ -1122,9 +1127,14 @@ impl Body for BudgetedBytesBody {
     }
 }
 
+/// How often an open event stream asks whether its credential still holds (signed out, ended by
+/// a password change, or its person disabled).
+const SESSION_RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+
 fn sse_body(
     rx: tokio::sync::broadcast::Receiver<crate::sse::SseEvent>,
     expires_at_unix: i64,
+    recheck: Option<(crate::request::SessionCheck, Duration)>,
 ) -> EdgeBody {
     let expiry = u64::try_from(expires_at_unix)
         .ok()
@@ -1135,6 +1145,11 @@ fn sse_body(
     let stream = ExpiringSseStream {
         events: BroadcastStream::new(rx),
         expiry: Box::pin(tokio::time::sleep(remaining)),
+        recheck: recheck.map(|(check, every)| Recheck {
+            check,
+            every: tokio::time::interval_at(tokio::time::Instant::now() + every, every),
+            running: None,
+        }),
         connected: false,
         done: false,
     };
@@ -1144,8 +1159,35 @@ fn sse_body(
 struct ExpiringSseStream {
     events: BroadcastStream<crate::sse::SseEvent>,
     expiry: Pin<Box<tokio::time::Sleep>>,
+    recheck: Option<Recheck>,
     connected: bool,
     done: bool,
+}
+
+struct Recheck {
+    check: crate::request::SessionCheck,
+    every: tokio::time::Interval,
+    running: Option<tokio::task::JoinHandle<bool>>,
+}
+
+impl Recheck {
+    /// Ready(false) once a check has said the credential no longer holds (or could not run).
+    fn poll_still_live(&mut self, cx: &mut Context<'_>) -> Poll<bool> {
+        loop {
+            if let Some(running) = self.running.as_mut() {
+                match Pin::new(running).poll(cx) {
+                    Poll::Ready(Ok(true)) => self.running = None,
+                    Poll::Ready(_) => return Poll::Ready(false),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            if self.every.poll_tick(cx).is_pending() {
+                return Poll::Pending;
+            }
+            let check = self.check.clone();
+            self.running = Some(tokio::task::spawn_blocking(move || check()));
+        }
+    }
 }
 
 impl tokio_stream::Stream for ExpiringSseStream {
@@ -1162,7 +1204,12 @@ impl tokio_stream::Stream for ExpiringSseStream {
                 b": connected\n\n",
             )))));
         }
-        if this.expiry.as_mut().poll(cx).is_ready() {
+        if this.expiry.as_mut().poll(cx).is_ready()
+            || this
+                .recheck
+                .as_mut()
+                .is_some_and(|recheck| recheck.poll_still_live(cx) == Poll::Ready(false))
+        {
             this.done = true;
             return Poll::Ready(None);
         }
@@ -1197,7 +1244,7 @@ mod tests {
         )
         .expect("test clock fits i64")
             + 60;
-        let mut body = sse_body(receiver, future_expiry);
+        let mut body = sse_body(receiver, future_expiry, None);
 
         let frame = body
             .frame()
@@ -1224,7 +1271,7 @@ mod tests {
         )
         .expect("test clock fits i64")
             + 60;
-        let mut body = sse_body(receiver, future_expiry);
+        let mut body = sse_body(receiver, future_expiry, None);
         let _connected = body.frame().await;
         assert!(
             body.frame().await.is_none(),
@@ -1236,10 +1283,57 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_sse_body_ends_once_its_session_no_longer_holds() {
+        let (sender, receiver) = tokio::sync::broadcast::channel(2);
+        let live = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let checks = Arc::new(AtomicUsize::new(0));
+        let check: crate::request::SessionCheck = {
+            let (live, checks) = (live.clone(), checks.clone());
+            Arc::new(move || {
+                checks.fetch_add(1, Ordering::SeqCst);
+                live.load(Ordering::SeqCst)
+            })
+        };
+        let far = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+            + 3_600;
+        let mut body = sse_body(receiver, far, Some((check, Duration::from_millis(20))));
+        let _connected = body.frame().await;
+        sender.send(crate::sse::SseEvent::data("one")).unwrap();
+        assert!(
+            body.frame().await.is_some(),
+            "a live session keeps streaming"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), body.frame())
+                .await
+                .is_err(),
+            "while the session holds, the stream stays open"
+        );
+        assert!(
+            checks.load(Ordering::SeqCst) >= 2,
+            "it was checked meanwhile"
+        );
+
+        live.store(false, Ordering::SeqCst);
+        let ended = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await
+            .expect("the stream ends within a check or two");
+        assert!(ended.is_none(), "an ended session ends its stream");
+        drop(body);
+        assert_eq!(sender.receiver_count(), 0);
+    }
+
     #[tokio::test]
     async fn expired_capability_deadline_terminates_sse_body() {
         let (sender, receiver) = tokio::sync::broadcast::channel(2);
-        let mut body = sse_body(receiver, 0);
+        let mut body = sse_body(receiver, 0, None);
 
         tokio::task::yield_now().await;
         let _connected = body.frame().await;

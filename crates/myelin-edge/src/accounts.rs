@@ -25,8 +25,8 @@ use credentials::{DummyHash, Email, InvitationCode, Password, WeakPassword};
 pub use store::account_migrations;
 pub(crate) use store::InvitationKind;
 use store::{
-    AcceptOutcome, AccountRow, AccountStore, Invitation, IssueOutcome, IssueRule, LinkLetter,
-    LinkMail, NewInvitation, Reservation, Slot,
+    AcceptOutcome, AccountRow, AccountStore, ChangeOutcome, Invitation, IssueOutcome, IssueRule,
+    LinkLetter, LinkMail, NewInvitation, Reservation, Slot,
 };
 
 pub const JOIN_INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -82,6 +82,10 @@ pub enum AccountError {
     WrongPassword,
     /// The person signs in another way and has no password to change.
     NoPassword,
+    /// A reset or another change replaced the password while this change was being made.
+    PasswordChangedElsewhere,
+    /// The session asking was ended (its person was disabled) while it asked.
+    SessionEnded,
     /// Unknown, expired, used, or superseded invitation; deliberately one answer.
     InvitationNotFound,
     WeakPassword,
@@ -112,6 +116,10 @@ impl core::fmt::Display for AccountError {
             Self::LoginFailed => formatter.write_str("login failed"),
             Self::WrongPassword => formatter.write_str("the current password is not right"),
             Self::NoPassword => formatter.write_str("this account signs in without a password"),
+            Self::PasswordChangedElsewhere => {
+                formatter.write_str("your password was just changed elsewhere")
+            }
+            Self::SessionEnded => formatter.write_str("this session has ended"),
             Self::InvitationNotFound => formatter.write_str("invitation not found"),
             Self::WeakPassword => {
                 formatter.write_str("the password must be between 10 and 1024 characters long")
@@ -224,6 +232,9 @@ pub enum Checkpoint {
     ResetPasswordReplaced,
     /// Inside a reset's transaction: the other reset links are ended; nothing is committed yet.
     ResetLinksEnded,
+    /// Inside a reset's or change's transaction: the person's sessions are ended; nothing is
+    /// committed yet.
+    SessionsEnded,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -394,13 +405,10 @@ impl AccountService {
         let verified = match self.hashing(|| self.verify(password, stored_phc)) {
             Ok(verified) => verified,
             Err(busy) => {
-                if let Some(slot) = slot {
-                    let _ = self.block(async {
-                        self.give_back(&[slot]).await;
-                        Ok(())
-                    });
-                }
-                return Err(busy);
+                return Err(match slot {
+                    Some(slot) => self.refund(slot, busy),
+                    None => busy,
+                })
             }
         };
         #[cfg(any(test, feature = "test-support"))]
@@ -657,46 +665,59 @@ impl AccountService {
             let slot = self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
             Ok((account, slot))
         })?;
-        let verified = self
-            .hashing(|| self.verify(current, Some(&account.password_phc)))
-            .and_then(|verified| {
-                if verified {
-                    self.hashing(|| new.hash())
-                } else {
-                    Err(AccountError::WrongPassword)
-                }
-            });
-        let password_phc = match verified {
-            Ok(password_phc) => password_phc,
-            Err(AccountError::WrongPassword) => return Err(AccountError::WrongPassword),
-            Err(refused) => {
-                let _ = self.block(async {
-                    self.give_back(&[slot]).await;
-                    Ok(())
-                });
-                return Err(refused);
+        let verified = self.hashing(|| self.verify(current, Some(&account.password_phc)));
+        #[cfg(any(test, feature = "test-support"))]
+        self.reached(Checkpoint::PasswordVerified);
+        let password_phc = match verified.and_then(|verified| {
+            if verified {
+                self.hashing(|| new.hash())
+            } else {
+                Err(AccountError::WrongPassword)
             }
+        }) {
+            Ok(password_phc) => password_phc,
+            // A wrong guess keeps the slot it took; that is the point of taking it first.
+            Err(AccountError::WrongPassword) => return Err(AccountError::WrongPassword),
+            Err(refused) => return Err(self.refund(slot, refused)),
         };
-        let notice = match self.mail {
-            Some(_) => self
-                .profile(person)?
-                .and_then(|profile| self.password_changed_notice(&profile.email)),
+        let notice = match self.mail.as_ref().map(|_| self.profile(person)) {
+            Some(Ok(profile)) => {
+                profile.and_then(|profile| self.password_changed_notice(&profile.email))
+            }
+            Some(Err(error)) => return Err(self.refund(slot, error)),
             None => None,
         };
-        // `None`: the password changed, or the person was disabled, since it was verified.
-        let cutoff = self
-            .block(async {
-                Ok(self
-                    .store
-                    .change_password(&account, password_phc, notice)
-                    .await?)
-            })?
-            .ok_or(AccountError::WrongPassword)?;
+        let outcome = self.block(async {
+            Ok(self
+                .store
+                .change_password(&account, password_phc, notice)
+                .await?)
+        });
+        let cutoff = match outcome {
+            Ok(ChangeOutcome::Changed { cutoff }) => cutoff,
+            Ok(ChangeOutcome::ChangedElsewhere) => {
+                return Err(self.refund(slot, AccountError::PasswordChangedElsewhere))
+            }
+            Ok(ChangeOutcome::Inactive) => {
+                return Err(self.refund(slot, AccountError::SessionEnded))
+            }
+            Err(error) => return Err(self.refund(slot, error)),
+        };
         self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
         Ok(SignedIn {
             principal: person.clone(),
             issued_at_unix: cutoff,
         })
+    }
+
+    /// Gives back a slot taken for an attempt that never got to verify a guess, and passes its
+    /// error on.
+    fn refund(&self, slot: Slot, error: AccountError) -> AccountError {
+        let _ = self.block(async {
+            self.give_back(&[slot]).await;
+            Ok(())
+        });
+        error
     }
 
     /// A signed-in member invites a teammate into their own organization. A member can only make

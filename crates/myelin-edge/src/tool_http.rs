@@ -269,6 +269,7 @@ mod tests {
             audience: CredentialAudience::Edge,
             jti: "tool-http-test".into(),
             effective_authority: Authority::of(grants.iter().copied()),
+            issued_at_unix: None,
             expires_at_unix: i64::MAX,
             dpop: DpopState::Unbound,
         }

@@ -260,6 +260,8 @@ impl From<PgError> for StoreError {
 enum Abort {
     Gone,
     EmailTaken,
+    /// The password hash checked against is no longer the stored one.
+    Replaced,
     Store(StoreError),
 }
 
@@ -281,7 +283,7 @@ fn settle(result: Result<(String, i64), Abort>) -> Result<AcceptOutcome, StoreEr
             principal_id,
             issued_at_unix,
         }),
-        Err(Abort::Gone) => Ok(AcceptOutcome::Gone),
+        Err(Abort::Gone | Abort::Replaced) => Ok(AcceptOutcome::Gone),
         Err(Abort::EmailTaken) => Ok(AcceptOutcome::EmailTaken),
         Err(Abort::Store(error)) => Err(error),
     }
@@ -292,6 +294,17 @@ fn settle(result: Result<(String, i64), Abort>) -> Result<AcceptOutcome, StoreEr
 pub(crate) struct Slot {
     pub bucket: [u8; 32],
     window_ends_at_unix: i64,
+}
+
+/// What a password change did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChangeOutcome {
+    /// Replaced; sessions issued before `cutoff` are ended.
+    Changed { cutoff: i64 },
+    /// A reset or another change replaced the password after it was verified.
+    ChangedElsewhere,
+    /// The person is no longer active.
+    Inactive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -714,6 +727,10 @@ impl AccountStore {
                             hook(super::Checkpoint::ResetLinksEnded);
                         }
                         let cutoff = end_sessions(conn, &tenant, &region, &principal_id).await?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(hook) = &checkpoint {
+                            hook(super::Checkpoint::SessionsEnded);
+                        }
                         if let Some((outbox, letter)) = notice {
                             outbox.enqueue(conn, &letter, None).await?;
                         }
@@ -729,8 +746,8 @@ impl AccountStore {
     /// password hash that was just verified and its person is still active; `None` otherwise.
     /// Sign-in asks this last, so a password replaced while the old one was being verified does
     /// not sign anyone in. It is the database's present moment, raised to the person's session
-    /// cutoff: read in the same snapshot as the hash, so a cutoff seen here came before the
-    /// password was confirmed.
+    /// cutoff. Both rows are locked for share, so a reset or change that has replaced the hash but
+    /// not yet committed is waited for, and then the hash no longer matches.
     pub(crate) async fn still_signs_in(
         &self,
         account: &AccountRow,
@@ -748,7 +765,8 @@ impl AccountStore {
                        JOIN principal person USING (tenant_id, region, principal_id) \
                       WHERE account.email_digest = $1 AND account.tenant_id = $2 \
                         AND account.region = $3 AND account.principal_id = $4 \
-                        AND account.password_phc = $5 AND person.status = $6"
+                        AND account.password_phc = $5 AND person.status = $6 \
+                      FOR SHARE"
                 ))
                 .bind(email_digest.as_slice())
                 .bind(&tenant)
@@ -796,37 +814,45 @@ impl AccountStore {
     }
 
     /// Replaces a signed-in person's password, if `account`'s hash (the one just verified) is
-    /// still the stored one and the person is still active. Ends their sessions and reset links,
-    /// queues `notice`, and returns the new session cutoff; `None` when nothing changed.
+    /// still the stored one and the person is still active. Ends their sessions and reset links
+    /// and queues `notice`.
     pub(crate) async fn change_password(
         &self,
         account: &AccountRow,
         password_phc: String,
         notice: Option<(MailOutbox, Letter)>,
-    ) -> Result<Option<i64>, StoreError> {
+    ) -> Result<ChangeOutcome, StoreError> {
         let (tenant, region) = (account.tenant.clone(), account.region.clone());
         let account = account.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let checkpoint = self.checkpoint.clone();
         let outcome = with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
             Box::pin(async move {
                 let (tenant, region) = (&account.tenant, &account.region);
                 let principal_id = &account.principal_id;
                 lock_email(conn, tenant, region, &account.email_digest).await?;
-                if !is_active(conn, tenant, region, principal_id).await?
-                    || !set_password(
-                        conn,
-                        tenant,
-                        region,
-                        principal_id,
-                        &account.email_digest,
-                        &password_phc,
-                        Some(&account.password_phc),
-                    )
-                    .await?
-                {
+                if !is_active(conn, tenant, region, principal_id).await? {
                     return Err(Abort::Gone);
+                }
+                if !set_password(
+                    conn,
+                    tenant,
+                    region,
+                    principal_id,
+                    &account.email_digest,
+                    &password_phc,
+                    Some(&account.password_phc),
+                )
+                .await?
+                {
+                    return Err(Abort::Replaced);
                 }
                 end_reset_links(conn, tenant, region, principal_id, None).await?;
                 let cutoff = end_sessions(conn, tenant, region, principal_id).await?;
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(hook) = &checkpoint {
+                    hook(super::Checkpoint::SessionsEnded);
+                }
                 if let Some((outbox, letter)) = notice {
                     outbox.enqueue(conn, &letter, None).await?;
                 }
@@ -835,8 +861,9 @@ impl AccountStore {
         })
         .await;
         match outcome {
-            Ok(cutoff) => Ok(Some(cutoff)),
-            Err(Abort::Gone | Abort::EmailTaken) => Ok(None),
+            Ok(cutoff) => Ok(ChangeOutcome::Changed { cutoff }),
+            Err(Abort::Replaced) => Ok(ChangeOutcome::ChangedElsewhere),
+            Err(Abort::Gone | Abort::EmailTaken) => Ok(ChangeOutcome::Inactive),
             Err(Abort::Store(error)) => Err(error),
         }
     }

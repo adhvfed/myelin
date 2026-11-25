@@ -137,6 +137,18 @@ impl RevocationStore {
         self.insert(scope, kind, handle, now, Some(expires_at))
     }
 
+    /// Best effort: drops a bounded batch of the tenant's per-session denials whose sessions have
+    /// expired, so signing out does not grow the table forever.
+    pub fn sweep_expired(&self, scope: &TenantScope) -> Result<u64, myelin_storage::ProviderError> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            RevocationBackend::Memory(_) => Ok(0),
+            RevocationBackend::Pg(pg) => {
+                pg.block(pg.backing.sweep_expired_jtis(&scope.tenant().0, 64))
+            }
+        }
+    }
+
     pub fn disable_principal(
         &self,
         scope: &TenantScope,

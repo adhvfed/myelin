@@ -173,8 +173,12 @@ pub enum EdgeResponse {
         headers: Vec<(String, String)>,
         sub: SseSubscription,
         expires_at_unix: i64,
+        still_live: Option<SessionCheck>,
     },
 }
+
+/// Asked periodically while an event stream is open; `false` ends the stream. It blocks.
+pub type SessionCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
 impl EdgeResponse {
     pub fn json(status: u16, value: &Value) -> EdgeResponse {
@@ -195,6 +199,25 @@ impl EdgeResponse {
             headers: Vec::new(),
             sub,
             expires_at_unix,
+            still_live: None,
+        }
+    }
+
+    /// An event stream ends as soon as `check` says its credential no longer holds.
+    pub fn with_session_check(self, check: SessionCheck) -> EdgeResponse {
+        match self {
+            EdgeResponse::Sse {
+                headers,
+                sub,
+                expires_at_unix,
+                ..
+            } => EdgeResponse::Sse {
+                headers,
+                sub,
+                expires_at_unix,
+                still_live: Some(check),
+            },
+            bytes => bytes,
         }
     }
 

@@ -1307,6 +1307,7 @@ async fn the_address_cap_answers_429_with_its_code_and_wait() {
                 audience: CredentialAudience::Edge,
                 jti: "invite-429".into(),
                 effective_authority: Authority::of(["edge.invitations.create"]),
+                issued_at_unix: None,
                 expires_at_unix: i64::MAX,
                 dpop: DpopState::Unbound,
             }),

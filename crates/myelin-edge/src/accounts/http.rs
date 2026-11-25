@@ -93,6 +93,11 @@ fn account_error(failure: AccountError) -> EdgeResponse {
             &json!({ "error": { "code": "wrong_password", "message": message } }),
         )),
         AccountError::NoPassword => error(&EdgeError::Conflict(message)),
+        AccountError::PasswordChangedElsewhere => no_store(EdgeResponse::json(
+            409,
+            &json!({ "error": { "code": "password_changed_elsewhere", "message": message } }),
+        )),
+        AccountError::SessionEnded => error(&EdgeError::Unauthorized(message)),
         AccountError::InvitationNotFound | AccountError::NoSuchAccount => {
             error(&EdgeError::NotFound(message))
         }

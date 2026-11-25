@@ -5,11 +5,13 @@
 //! session the Edge issues.
 
 use myelin_config::{Mode, MyelinConfig};
+use myelin_edge::accounts::{Acceptance, Checkpoint};
 use myelin_edge::catalogue::Method;
 use myelin_edge::{
-    account_migrations, device_authorization_migrations, AccountService, AllowAll,
+    account_migrations, device_authorization_migrations, AccountError, AccountService, AllowAll,
     DeviceAuthorizationBroker, EdgeRequest, EmailDigester, Gateway, WhoamiHandler,
 };
+use myelin_identity::{Credential, RevokeTarget};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, CredentialAudience,
@@ -50,8 +52,10 @@ fn now() -> i64 {
 struct Stack {
     provider: SubstrateProvider,
     principals: PrincipalStore,
+    seal: SealKey,
     accounts: AccountService,
     cell: Arc<CellTokenAuthority>,
+    authn: Arc<CapabilityAuthenticator>,
     gateway: Gateway,
 }
 
@@ -83,14 +87,7 @@ async fn stack() -> Stack {
         DurablePrincipalBacking::new(provider.clone()),
         runtime.clone(),
     );
-    let accounts = AccountService::new(
-        provider.db_pool().clone(),
-        principals.clone(),
-        EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
-        provider.config().region.clone(),
-        Some("https://myelin.example".into()),
-        runtime.clone(),
-    );
+    let accounts = account_service(&provider, &principals, &seal);
     let cell = Arc::new(CellTokenAuthority::generate());
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
         principals.clone(),
@@ -101,13 +98,16 @@ async fn stack() -> Stack {
         ),
     ));
     let human = Arc::new(HumanSsoAuthenticator::production(principals.clone()));
+    // The Edge's own clock runs half a minute ahead of the database's; session issue times must
+    // not follow it.
     let devices = DeviceAuthorizationBroker::with_pg(
         provider.db_pool().clone(),
         runtime,
         "https://myelin.example/cli/auth",
     )
-    .expect("device broker");
-    let gateway = Gateway::builder(authn, human, Arc::new(AllowAll))
+    .expect("device broker")
+    .with_clock(|| now() + 30);
+    let gateway = Gateway::builder(authn.clone(), human, Arc::new(AllowAll))
         .default_token_scheme("session")
         .with_human_session_issuer(cell.clone())
         .with_accounts(accounts.clone())
@@ -122,10 +122,27 @@ async fn stack() -> Stack {
     Stack {
         provider,
         principals,
+        seal,
         accounts,
         cell,
+        authn,
         gateway,
     }
+}
+
+fn account_service(
+    provider: &SubstrateProvider,
+    principals: &PrincipalStore,
+    seal: &SealKey,
+) -> AccountService {
+    AccountService::new(
+        provider.db_pool().clone(),
+        principals.clone(),
+        EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
+        provider.config().region.clone(),
+        Some("https://myelin.example".into()),
+        tokio::runtime::Handle::current(),
+    )
 }
 
 impl Stack {
@@ -473,7 +490,7 @@ async fn the_cutoff_refuses_sessions_issued_before_its_second_and_admits_its_own
     let stack = stack().await;
     let email = email();
     let (person, _) = stack.person(&email).await;
-    let cutoff = now() + 100;
+    let cutoff = now() + 30;
     stack.set_cutoff(&person, cutoff).await;
 
     assert_eq!(stack.whoami(&stack.sso_session(&person, cutoff - 1)), 401);
@@ -544,4 +561,221 @@ async fn a_disabled_person_is_refused_whatever_session_they_hold() {
         json!({}),
     );
     assert_eq!(status, 401);
+}
+
+impl Stack {
+    fn service(&self) -> AccountService {
+        account_service(&self.provider, &self.principals, &self.seal)
+    }
+
+    fn identity(&self, token: &str) -> myelin_identity_service::RequestIdentity {
+        self.authn
+            .authenticate_identity(
+                &Credential {
+                    scheme: "session".into(),
+                    material: token.into(),
+                },
+                None,
+            )
+            .expect("a live session")
+    }
+
+    fn set_status(&self, person: &Principal, status: PrincipalStatus) {
+        self.principals
+            .put_principal(
+                &scope_of(person),
+                person.principal_id.clone(),
+                PrincipalKind::Human,
+                person.data_role,
+                status,
+                None,
+            )
+            .unwrap();
+    }
+}
+
+fn scope_of(person: &Principal) -> TenantScope {
+    TenantScope::from_verified_token(
+        &Principal::stub(
+            PrincipalId("test".into()),
+            PrincipalKind::Human,
+            TenantId(person.tenant.0.clone()),
+        ),
+        Region(person.region.0.clone()),
+    )
+}
+
+fn code_of(url: &str) -> String {
+    url.rsplit_once("/join/").expect("a link").1.to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_racing_a_reset_waits_for_it_and_then_fails() {
+    let stack = stack().await;
+    let email = email();
+    let (person, _) = stack.person(&email).await;
+    let (reached, reached_rx) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new((reached, released));
+    let resetting = stack.service().with_checkpoint(move |checkpoint| {
+        if checkpoint == Checkpoint::SessionsEnded {
+            let gate = gate.lock().unwrap();
+            gate.0.send(()).unwrap();
+            gate.1.recv().unwrap();
+        }
+    });
+    let link = stack
+        .accounts
+        .operator_reset_link(&person.tenant.0, &email, None)
+        .await
+        .unwrap();
+    let code = code_of(&link.url);
+    let reset = tokio::task::spawn_blocking(move || {
+        resetting.accept(
+            &code,
+            Acceptance {
+                display_name: None,
+                password: NEW_PASSWORD.into(),
+            },
+        )
+    });
+    tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    // The reset has replaced the password and ended the sessions but not committed.
+    let signing_in = {
+        let (accounts, email) = (stack.accounts.clone(), email.clone());
+        tokio::task::spawn_blocking(move || accounts.login(&email, PASSWORD.into()))
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !signing_in.is_finished(),
+        "a sign-in with the old password waits for the reset to commit"
+    );
+    release.send(()).unwrap();
+    reset.await.unwrap().expect("the reset commits");
+    assert_eq!(
+        signing_in.await.unwrap().unwrap_err(),
+        AccountError::LoginFailed,
+        "then the old password no longer matches"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_stream_learns_when_its_session_ends() {
+    let stack = stack().await;
+    let email = email();
+    let (person, laptop) = stack.person(&email).await;
+    let phone = stack.sign_in(&email, PASSWORD);
+    let (laptop_identity, phone_identity) = (stack.identity(&laptop), stack.identity(&phone));
+    assert!(stack.authn.still_live(&laptop_identity));
+
+    stack.call("POST", "/v1/auth/logout", Some(&laptop), json!({}));
+    assert!(!stack.authn.still_live(&laptop_identity), "signed out");
+    assert!(
+        stack.authn.still_live(&phone_identity),
+        "the other session holds"
+    );
+
+    stack.call(
+        "POST",
+        "/v1/auth/logout/everywhere",
+        Some(&phone),
+        json!({}),
+    );
+    assert!(
+        !stack.authn.still_live(&phone_identity),
+        "signed out everywhere"
+    );
+
+    let tablet = stack.identity(&stack.sign_in(&email, PASSWORD));
+    let link = stack
+        .accounts
+        .operator_reset_link(&person.tenant.0, &email, None)
+        .await
+        .unwrap();
+    let after_reset = stack.accept(&link.url, json!({ "password": NEW_PASSWORD }));
+    assert!(!stack.authn.still_live(&tablet), "ended by the reset");
+
+    let after_reset = stack.identity(&after_reset);
+    assert!(stack.authn.still_live(&after_reset));
+    stack.set_status(&person, PrincipalStatus::Disabled);
+    assert!(
+        !stack.authn.still_live(&after_reset),
+        "the person was disabled"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disabling_a_person_ends_their_sessions_for_good() {
+    let stack = stack().await;
+    let email = email();
+    let (person, joined) = stack.person(&email).await;
+    let cli = stack.device_session(&joined);
+
+    stack.set_status(&person, PrincipalStatus::Disabled);
+    stack.set_status(&person, PrincipalStatus::Active);
+    assert_eq!(
+        stack.whoami(&joined),
+        401,
+        "re-enabling does not revive a session"
+    );
+    assert_eq!(stack.whoami(&cli), 401);
+    let fresh = stack.sign_in(&email, PASSWORD);
+    assert_eq!(stack.whoami(&fresh), 200, "the person signs in again");
+
+    // A principal-wide revocation (as an erasure records) ends sessions the same way.
+    stack
+        .authn
+        .revocations()
+        .disable_principal(
+            &scope_of(&person),
+            &person.principal_id,
+            myelin_events::clock::system_clock_reading()
+                .unwrap()
+                .timestamp(),
+        )
+        .unwrap();
+    assert_eq!(stack.whoami(&fresh), 401);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signing_out_sweeps_denials_whose_sessions_have_expired() {
+    let stack = stack().await;
+    let email = email();
+    let (person, session) = stack.person(&email).await;
+    let scope = scope_of(&person);
+    let clock = |unix| {
+        myelin_events::clock::clock_reading_from_unix(unix)
+            .unwrap()
+            .timestamp()
+    };
+    stack
+        .authn
+        .revocations()
+        .revoke_until(
+            &scope,
+            &RevokeTarget::Jti("session-long-gone".into()),
+            clock(now() - 7_200),
+            clock(now() - 3_600),
+        )
+        .unwrap();
+    assert_eq!(stack.jti_revocation_expiries(&person).await.len(), 1);
+
+    let (status, _) = stack.call("POST", "/v1/auth/logout", Some(&session), json!({}));
+    assert_eq!(status, 200);
+    let left = stack.jti_revocation_expiries(&person).await;
+    assert_eq!(
+        left.len(),
+        1,
+        "only the denial that still matters is kept: {left:?}"
+    );
+    let expiry = chrono::DateTime::parse_from_rfc3339(left[0].as_deref().unwrap())
+        .unwrap()
+        .timestamp();
+    assert!(
+        expiry > now(),
+        "the kept one is the session just signed out"
+    );
 }

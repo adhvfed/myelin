@@ -1050,6 +1050,7 @@ mod tests {
                 audience: CredentialAudience::Edge,
                 jti: "session".into(),
                 effective_authority: Authority::of(authority.iter().copied()),
+                issued_at_unix: None,
                 expires_at_unix: i64::MAX,
                 dpop: DpopState::Unbound,
             }),
