@@ -116,6 +116,16 @@ impl MailWorker {
                 }
                 continue;
             };
+            if !claimed.link_live {
+                self.outbox.failed(&self.pool, &claimed, 0, 0).await?;
+                log_dropped(
+                    &claimed.id,
+                    claimed.attempts,
+                    "its link has expired or was used",
+                );
+                pass.dropped += 1;
+                continue;
+            }
             match message(self.mailer.from(), &claimed.id, letter) {
                 Ok(message) => match self.mailer.send(message).await {
                     Ok(()) => {

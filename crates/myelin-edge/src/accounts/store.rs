@@ -376,9 +376,10 @@ impl AccountStore {
     }
 
     /// Decides whether the link may be issued and stores it, under one per-email lock so two
-    /// issuances cannot interleave. The new link supersedes older unused links of its own kind
-    /// for the same email in the same organization, and withdraws any mail still carrying them;
-    /// a join link never touches a reset link. `mail` is queued in the same transaction.
+    /// issuances cannot interleave. A join link supersedes older join links for the same email in
+    /// the same organization, and withdraws any mail still carrying them. Reset links live side
+    /// by side until one is accepted, so nobody can void a reset link by asking for another.
+    /// `mail` is queued in the same transaction.
     pub(crate) async fn issue(
         &self,
         code: &CodeDigest,
@@ -421,21 +422,22 @@ impl AccountStore {
         .execute(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
-        let superseded: Vec<Vec<u8>> = sqlx::query_scalar(
-            "DELETE FROM auth_invitation \
-              WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND kind = $4 \
-             RETURNING code_digest",
-        )
-        .bind(&link.tenant)
-        .bind(&link.region)
-        .bind(link.email_digest.as_slice())
-        .bind(rule.kind().as_str())
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(StoreError::database)?;
-        crate::mail::withdraw(&mut transaction, &superseded)
+        if rule.kind() == InvitationKind::Join {
+            let superseded: Vec<Vec<u8>> = sqlx::query_scalar(
+                "DELETE FROM auth_invitation \
+                  WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND kind = 'join' \
+                 RETURNING code_digest",
+            )
+            .bind(&link.tenant)
+            .bind(&link.region)
+            .bind(link.email_digest.as_slice())
+            .fetch_all(&mut *transaction)
             .await
             .map_err(StoreError::database)?;
+            crate::mail::withdraw(&mut transaction, &superseded)
+                .await
+                .map_err(StoreError::database)?;
+        }
         let expires_at_unix: i64 = sqlx::query_scalar(&format!(
             "INSERT INTO auth_invitation \
                (code_digest, kind, tenant_id, region, email_digest, email_nonce, \
@@ -500,8 +502,9 @@ impl AccountStore {
         }))
     }
 
-    /// Consumes a join invitation and creates the person with their password in one transaction.
-    /// If the email already has an account nothing changes and the invitation stays unused.
+    /// Consumes a join invitation and creates the person with their password in one transaction,
+    /// withdrawing any mail still carrying the link. If the email already has an account nothing
+    /// changes and the invitation stays unused.
     pub(crate) async fn accept_join(
         &self,
         code: &CodeDigest,
@@ -563,6 +566,7 @@ impl AccountStore {
                         if created != 1 {
                             return Err(Abort::EmailTaken);
                         }
+                        crate::mail::withdraw(conn, &[code.to_vec()]).await?;
                         Ok(principal.principal_id)
                     })
                 },
@@ -571,7 +575,8 @@ impl AccountStore {
         )
     }
 
-    /// Consumes a reset invitation and replaces the password of the active account it names.
+    /// Consumes a reset invitation and replaces the password of the active account it names,
+    /// ending the person's other reset links and withdrawing any mail still carrying them.
     /// `notice`, the letter telling the owner, is queued only if the password changes.
     pub(crate) async fn accept_reset(
         &self,
@@ -640,6 +645,20 @@ impl AccountStore {
                         if changed != 1 {
                             return Err(Abort::Gone);
                         }
+                        // The new password ends every other reset link the person holds.
+                        let mut ended: Vec<Vec<u8>> = sqlx::query_scalar(
+                            "DELETE FROM auth_invitation \
+                              WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
+                                AND kind = 'reset' \
+                             RETURNING code_digest",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&principal_id)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                        ended.push(code.to_vec());
+                        crate::mail::withdraw(conn, &ended).await?;
                         if let Some((outbox, letter)) = notice {
                             outbox.enqueue(conn, &letter, None).await?;
                         }

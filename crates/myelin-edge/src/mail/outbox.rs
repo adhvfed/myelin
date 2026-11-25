@@ -54,6 +54,8 @@ pub(crate) struct Claimed {
     pub claimed_until: i64,
     /// `None` when the row cannot be opened, which no retry would change.
     pub letter: Option<Letter>,
+    /// False when the letter carries a link that has since expired or been used.
+    pub link_live: bool,
 }
 
 /// What a failed attempt led to.
@@ -76,7 +78,7 @@ impl MailOutbox {
     }
 
     /// Queues `letter` in the caller's transaction, due at once. `link` is the digest of the link
-    /// it carries, so a newer link that supersedes it also withdraws the letter.
+    /// it carries, so superseding or using the link withdraws the letter.
     pub(crate) async fn enqueue(
         &self,
         conn: &mut PgConnection,
@@ -86,6 +88,7 @@ impl MailOutbox {
         let mut id = [0_u8; 16];
         OsRng.fill_bytes(&mut id);
         let (nonce, payload) = self.seal(&id, letter);
+        // @tenant-cross-scope: the outbox belongs to the cell, not a tenant; rows are sealed.
         sqlx::query(&format!(
             "INSERT INTO edge_mail_outbox \
                (message_id, cell_id, link_digest, payload_nonce, payload, created_at_unix, \
@@ -109,6 +112,7 @@ impl MailOutbox {
         pool: &PgPool,
         lease_secs: i64,
     ) -> Result<Option<Claimed>, sqlx::Error> {
+        // @tenant-cross-scope: a worker claims its cell's mail; a link digest names one link.
         let row = sqlx::query(&format!(
             "UPDATE edge_mail_outbox \
                 SET attempts = attempts + 1, next_attempt_unix = {DB_NOW} + $2 \
@@ -116,7 +120,11 @@ impl MailOutbox {
                 SELECT message_id FROM edge_mail_outbox \
                  WHERE cell_id = $1 AND next_attempt_unix <= {DB_NOW} \
                  ORDER BY next_attempt_unix LIMIT 1 FOR UPDATE SKIP LOCKED) \
-             RETURNING message_id, attempts, next_attempt_unix, payload_nonce, payload"
+             RETURNING message_id, attempts, next_attempt_unix, payload_nonce, payload, \
+               (link_digest IS NULL OR EXISTS ( \
+                  SELECT 1 FROM auth_invitation \
+                   WHERE code_digest = edge_mail_outbox.link_digest \
+                     AND expires_at_unix > {DB_NOW})) AS link_live"
         ))
         .bind(&self.cell)
         .bind(lease_secs)
@@ -136,6 +144,7 @@ impl MailOutbox {
             attempts: row.get("attempts"),
             claimed_until: row.get("next_attempt_unix"),
             letter: self.open(&id, &nonce, &payload),
+            link_live: row.get("link_live"),
         }))
     }
 
@@ -147,6 +156,7 @@ impl MailOutbox {
         pool: &PgPool,
         give_up_after_secs: i64,
     ) -> Result<Vec<(MessageId, i32)>, sqlx::Error> {
+        // @tenant-cross-scope: the outbox belongs to the cell, not a tenant.
         let dropped: Vec<(Vec<u8>, i32)> = sqlx::query_as(&format!(
             "DELETE FROM edge_mail_outbox \
               WHERE message_id IN ( \
@@ -167,6 +177,7 @@ impl MailOutbox {
     }
 
     pub(crate) async fn sent(&self, pool: &PgPool, id: &MessageId) -> Result<(), sqlx::Error> {
+        // @tenant-cross-scope: a message id names one row of the cell's outbox.
         sqlx::query("DELETE FROM edge_mail_outbox WHERE message_id = $1")
             .bind(id.as_slice())
             .execute(pool)
@@ -183,6 +194,7 @@ impl MailOutbox {
         retry_in_secs: i64,
         give_up_after_secs: i64,
     ) -> Result<AfterFailure, sqlx::Error> {
+        // @tenant-cross-scope: a message id names one row of the cell's outbox.
         let dropped = sqlx::query(&format!(
             "DELETE FROM edge_mail_outbox \
               WHERE message_id = $1 AND next_attempt_unix = $2 \
@@ -197,6 +209,7 @@ impl MailOutbox {
         if dropped == 1 {
             return Ok(AfterFailure::GaveUp);
         }
+        // @tenant-cross-scope: a message id names one row of the cell's outbox.
         let rescheduled = sqlx::query(&format!(
             "UPDATE edge_mail_outbox SET next_attempt_unix = {DB_NOW} + $3 \
               WHERE message_id = $1 AND next_attempt_unix = $2"

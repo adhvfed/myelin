@@ -11,7 +11,9 @@ print the link and never send mail.
 A request never talks to SMTP. It writes a sealed letter to the `edge_mail_outbox` table in the
 same transaction that creates the link, and a worker in each edge sends queued mail. Letters are
 sealed under a key derived from `MYELIN_KMS_SEAL_KEY`, so the table shows neither addresses nor
-links. Several edges can share the outbox safely.
+links. Several edges can share the outbox safely. A letter whose link has been used, replaced or
+has expired is withdrawn or dropped rather than sent. A person can hold several reset links at
+once; setting a new password ends them all.
 
 A failed send is retried after 30 seconds, then after twice as long each time, up to an hour
 between tries. A letter still failing a day after it was queued is dropped. Every failure is
