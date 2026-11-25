@@ -5,16 +5,18 @@
 //! reset request never says whether an account exists.
 
 use myelin_config::{Mode, MyelinConfig};
-use myelin_edge::accounts::{Acceptance, MemberInvitation};
+use myelin_edge::accounts::{Acceptance, Checkpoint, MemberInvitation};
+use myelin_edge::catalogue::{Handler, HandlerCtx};
 use myelin_edge::mail::{DeliveryPass, DeliverySchedule};
 use myelin_edge::{
     account_migrations, AccountError, AccountService, AllowAll, EdgeRequest, EdgeResponse,
-    EmailDigester, Gateway, MailOutbox, MailSettings, MailWorker,
+    EmailDigester, Gateway, InviteHandler, MailOutbox, MailSettings, MailWorker,
 };
 use myelin_identity::{Principal, PrincipalStatus};
 use myelin_identity_service::{
-    CapabilityAuthenticator, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier,
-    PrincipalStore, RevocationStore,
+    Authority, CapabilityAuthenticator, CellTokenAuthority, CredentialAudience, CredentialContext,
+    CredentialPurpose, DpopState, HumanSsoAuthenticator, PasetoCapabilityVerifier, PrincipalStore,
+    RequestIdentity, RevocationStore, VerifiedCapabilityContext,
 };
 use myelin_storage::{
     all_durable_migrations, DurableKmsBacking, DurablePrincipalBacking, HotTables, KmsEngine,
@@ -320,6 +322,22 @@ impl Cell {
             .fetch_one(self.provider.db_pool())
             .await
             .unwrap()
+    }
+
+    /// Hits in the member's hourly invitation window, keyed as the service keys it.
+    async fn member_hits(&self, member: &Principal) -> i64 {
+        let mut bucket = blake3::Hasher::new();
+        bucket.update(b"myelin.edge.account.rate.v1\0");
+        bucket.update(b"invitation.create\0");
+        bucket.update(member.tenant.0.as_bytes());
+        bucket.update(b"\0");
+        bucket.update(member.principal_id.0.as_bytes());
+        sqlx::query_scalar::<_, i64>("SELECT hits FROM auth_rate_limit WHERE bucket = $1")
+            .bind(bucket.finalize().as_bytes().as_slice())
+            .fetch_optional(self.provider.db_pool())
+            .await
+            .unwrap()
+            .unwrap_or(0)
     }
 
     /// Queued letters that carry a link; a password-change notice carries none.
@@ -644,19 +662,19 @@ async fn delivery_retries_after_a_refusal_keeps_its_message_id_and_then_deletes(
         "a retry is the same message"
     );
 
-    // A letter refused once its time is up is dropped by that refusal. The refusal comes 1.5s
-    // after the data, past a one-second allowance, so the letter was young when it was claimed
-    // and old when it failed.
+    // A letter refused once its time is up is dropped by that refusal. The refusal comes 3s after
+    // the data, past a two-second allowance: by the database's whole-second clock the letter is
+    // at most a second old when claimed and at least two when it fails.
     let impatient = cell.worker(
         &smtp,
         DeliverySchedule {
-            give_up_after_secs: 1,
+            give_up_after_secs: 2,
             ..quick_retries()
         },
     );
     accounts.request_password_reset(&email).unwrap();
     smtp.refuse.store(true, Ordering::SeqCst);
-    smtp.modes.reply_delay_ms.store(1_500, Ordering::SeqCst);
+    smtp.modes.reply_delay_ms.store(3_000, Ordering::SeqCst);
     let before = smtp.received().len();
     let pass = impatient.deliver_due().await.unwrap();
     assert_eq!(
@@ -1133,62 +1151,6 @@ async fn a_relay_that_never_answers_costs_one_send_deadline_and_delivery_goes_on
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_reset_links_accepted_at_once_change_the_password_once() {
-    let _turn = ONE_AT_A_TIME.lock().await;
-    let cell = cell().await;
-    let smtp = FakeSmtp::start().await;
-    let accounts = cell.accounts(true);
-    let worker = cell.worker(&smtp, quick_retries());
-    let tenant = unique("t-mail-reset-race");
-    for round in 0..3 {
-        let email = format!("{}-{round}@example.com", unique("ada"));
-        cell.person(&accounts, &tenant, &email).await;
-        let handed = code_in(
-            &accounts
-                .operator_reset_link(&tenant, &email, None)
-                .await
-                .unwrap()
-                .url,
-        );
-        accounts.request_password_reset(&email).unwrap();
-        deliver(&worker).await;
-        let emailed = smtp.delivered_to(&email)[0].code();
-
-        let start = Arc::new(std::sync::Barrier::new(2));
-        let racers: Vec<_> = [
-            (handed, "operator passphrase"),
-            (emailed, "emailed passphrase"),
-        ]
-        .into_iter()
-        .map(|(code, password)| {
-            let (accounts, start) = (accounts.clone(), start.clone());
-            tokio::task::spawn_blocking(move || {
-                start.wait();
-                (password, accounts.accept(&code, new_password(password)))
-            })
-        })
-        .collect();
-        let mut outcomes = Vec::new();
-        for racer in racers {
-            outcomes.push(racer.await.unwrap());
-        }
-        let winners: Vec<&str> = outcomes
-            .iter()
-            .filter(|(_, outcome)| outcome.is_ok())
-            .map(|(password, _)| *password)
-            .collect();
-        assert_eq!(winners.len(), 1, "round {round}: {outcomes:?}");
-        for (_, outcome) in &outcomes {
-            if let Err(error) = outcome {
-                assert_eq!(error, &AccountError::InvitationNotFound, "round {round}");
-            }
-        }
-        accounts.login(&email, winners[0].into()).unwrap();
-        assert_eq!(cell.queued_links().await, 0);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_operator_reissue_revokes_only_the_operators_earlier_reset_link() {
     let _turn = ONE_AT_A_TIME.lock().await;
     let cell = cell().await;
@@ -1251,13 +1213,348 @@ async fn one_address_gets_at_most_three_invitations_an_hour_from_an_organization
         accounts.invite_member(&bob, &stranger.to_uppercase()),
         Err(AccountError::RecipientRateLimited { retry_after_secs }) if retry_after_secs > 0
     ));
+    assert_eq!(
+        cell.member_hits(&bob).await,
+        1,
+        "the refusal did not cost the member a slot"
+    );
     accounts
         .invite_member(&bob, &format!("{}@example.com", unique("someone-else")))
         .expect("other addresses are unaffected");
+
+    // An invitation that is refused is not charged to anyone.
+    let member = format!("{}@example.com", unique("member"));
+    cell.person(&accounts, &tenant, &member).await;
+    for _ in 0..5 {
+        assert_eq!(
+            accounts.invite_member(&ada, &member).unwrap_err(),
+            AccountError::AccountExists
+        );
+    }
+    assert_eq!(
+        cell.member_hits(&ada).await,
+        2,
+        "only the two invitations ada made"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_claim_that_runs_out_mid_send_is_taken_over_and_nothing_is_lost() {
+async fn with_mail_off_a_lost_link_can_be_remade_without_the_address_cap() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let accounts = cell.accounts(false);
+    let tenant = unique("t-mail-off-cap");
+    let ada = cell
+        .person(
+            &accounts,
+            &tenant,
+            &format!("{}@example.com", unique("ada")),
+        )
+        .await;
+    let stranger = format!("{}@example.com", unique("stranger"));
+    for _ in 0..5 {
+        accounts.invite_member(&ada, &stranger).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_address_cap_answers_429_with_its_code_and_wait() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let accounts = cell.accounts(true);
+    let tenant = unique("t-mail-invite-429");
+    let ada = cell
+        .person(
+            &accounts,
+            &tenant,
+            &format!("{}@example.com", unique("ada")),
+        )
+        .await;
+    let handler = InviteHandler::new(accounts);
+    let stranger = format!("{}@example.com", unique("stranger"));
+    let invite = || {
+        let request = EdgeRequest::new(
+            "POST",
+            "/v1/invitations",
+            "",
+            vec![],
+            serde_json::to_vec(&serde_json::json!({ "email": stranger })).unwrap(),
+        );
+        let scope = myelin_storage::TenantScope::from_verified_token(&ada, ada.region.clone());
+        let identity = RequestIdentity {
+            principal: ada.clone(),
+            scope: scope.clone(),
+            credential: CredentialContext::Capability(VerifiedCapabilityContext {
+                purpose: CredentialPurpose::HumanSession,
+                audience: CredentialAudience::Edge,
+                jti: "invite-429".into(),
+                effective_authority: Authority::of(["edge.invitations.create"]),
+                expires_at_unix: i64::MAX,
+                dpop: DpopState::Unbound,
+            }),
+        };
+        let params = std::collections::BTreeMap::new();
+        handler
+            .handle(&HandlerCtx {
+                identity: &identity,
+                principal: &ada,
+                scope: &scope,
+                params: &params,
+                request: &request,
+            })
+            .unwrap()
+    };
+    for _ in 0..3 {
+        assert_eq!(invite().status(), 201);
+    }
+    let refused = invite();
+    let (status, headers, body) = shape(&refused);
+    assert_eq!(status, 429);
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "recipient_rate_limited");
+    let wait: u64 = body["error"]["retry_after_secs"]
+        .as_u64()
+        .expect("the wait, in seconds");
+    assert!((1..=3600).contains(&wait), "{wait}");
+    assert!(headers.contains(&("retry-after".to_string(), wait.to_string())));
+    assert!(headers.contains(&("cache-control".to_string(), "no-store".to_string())));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_skips_a_row_another_transaction_has_locked() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let smtp = FakeSmtp::start().await;
+    let accounts = cell.accounts(true);
+    let tenant = unique("t-mail-skip-locked");
+    let ada = cell
+        .person(
+            &accounts,
+            &tenant,
+            &format!("{}@example.com", unique("ada")),
+        )
+        .await;
+    let (first, second) = (
+        format!("{}@example.com", unique("first")),
+        format!("{}@example.com", unique("second")),
+    );
+    accounts.invite_member(&ada, &first).unwrap();
+    accounts.invite_member(&ada, &second).unwrap();
+
+    // The row the worker would take first is put at the head of the queue and row-locked by an
+    // open transaction.
+    let mut holder = cell.provider.db_pool().begin().await.unwrap();
+    let held: Vec<u8> = sqlx::query_scalar(
+        "UPDATE edge_mail_outbox SET next_attempt_unix = 0 \
+          WHERE message_id = (SELECT message_id FROM edge_mail_outbox WHERE cell_id = $1 \
+                              ORDER BY message_id LIMIT 1) \
+         RETURNING message_id",
+    )
+    .bind(&cell.cell_id)
+    .fetch_one(&mut *holder)
+    .await
+    .unwrap();
+
+    let pass = tokio::time::timeout(
+        Duration::from_secs(10),
+        cell.worker(&smtp, quick_retries()).deliver_due(),
+    )
+    .await
+    .expect("the worker must not wait on a locked row")
+    .unwrap();
+    assert_eq!(pass.sent, 1);
+    let left: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT message_id FROM edge_mail_outbox WHERE cell_id = $1")
+            .bind(&cell.cell_id)
+            .fetch_all(cell.provider.db_pool())
+            .await
+            .unwrap();
+    assert_eq!(left, vec![held], "the locked row is the one left");
+    holder.rollback().await.unwrap();
+    assert_eq!(deliver(&cell.worker(&smtp, quick_retries())).await.sent, 1);
+    for to in [&first, &second] {
+        assert_eq!(smtp.delivered_to(to).len(), 1, "{to}");
+    }
+}
+
+/// Whether the concurrent step had finished while the accept was still open, and the step.
+type Concurrent<T> = Arc<Mutex<Option<(bool, std::thread::JoinHandle<T>)>>>;
+
+/// Runs `step` on its own thread when an accept reaches `at`, lets it get as far as it can for
+/// half a second while the accept's transaction stays open, and records whether it finished.
+fn while_accept_is_open<T: Send + 'static>(
+    accounts: &AccountService,
+    at: Checkpoint,
+    step: impl FnOnce() -> T + Send + 'static,
+) -> (AccountService, Concurrent<T>) {
+    let slot = Arc::new(Mutex::new(None));
+    let step = Mutex::new(Some(step));
+    let recorded = slot.clone();
+    let hooked = accounts.clone().with_checkpoint(move |checkpoint| {
+        if checkpoint != at {
+            return;
+        }
+        let Some(step) = step.lock().unwrap().take() else {
+            return;
+        };
+        let running = std::thread::spawn(step);
+        std::thread::sleep(Duration::from_millis(500));
+        *recorded.lock().unwrap() = Some((running.is_finished(), running));
+    });
+    (hooked, slot)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_reset_link_accepted_mid_reset_waits_then_finds_its_link_gone() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let smtp = FakeSmtp::start().await;
+    let accounts = cell.accounts(true);
+    let tenant = unique("t-mail-reset-race");
+    let email = format!("{}@example.com", unique("ada"));
+    cell.person(&accounts, &tenant, &email).await;
+    let handed = code_in(
+        &accounts
+            .operator_reset_link(&tenant, &email, None)
+            .await
+            .unwrap()
+            .url,
+    );
+    accounts.request_password_reset(&email).unwrap();
+    deliver(&cell.worker(&smtp, quick_retries())).await;
+    let emailed = smtp.delivered_to(&email)[0].code();
+
+    // The second accept starts once the first has replaced the password and holds that row,
+    // before the first ends the other links: the order that deadlocks without the email lock.
+    let (hooked, second) = {
+        let (accounts, emailed) = (accounts.clone(), emailed.clone());
+        while_accept_is_open(
+            &accounts.clone(),
+            Checkpoint::ResetPasswordReplaced,
+            move || accounts.accept(&emailed, new_password("the second passphrase")),
+        )
+    };
+    hooked
+        .accept(&handed, new_password("the first passphrase"))
+        .expect("the first reset succeeds");
+    let (finished_early, second) = second.lock().unwrap().take().expect("the checkpoint ran");
+    assert!(
+        !finished_early,
+        "the second accept waited for the first to commit"
+    );
+    assert_eq!(
+        second.join().unwrap().unwrap_err(),
+        AccountError::InvitationNotFound
+    );
+    accounts
+        .login(&email, "the first passphrase".into())
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_invitation_made_while_its_address_joins_sees_the_new_account() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let accounts = cell.accounts(true);
+    let tenant = unique("t-mail-join-race");
+    let ada = cell
+        .person(
+            &accounts,
+            &tenant,
+            &format!("{}@example.com", unique("ada")),
+        )
+        .await;
+    let grace = format!("{}@example.com", unique("grace"));
+    let join = code_in(
+        &accounts
+            .operator_join_link(&tenant, &grace, None)
+            .await
+            .unwrap()
+            .url,
+    );
+
+    // Ada invites Grace while Grace's own join is stored and not yet committed.
+    let (hooked, inviting) = {
+        let (accounts, grace) = (accounts.clone(), grace.clone());
+        while_accept_is_open(
+            &accounts.clone(),
+            Checkpoint::JoinAccountStored,
+            move || accounts.invite_member(&ada, &grace),
+        )
+    };
+    hooked
+        .accept(
+            &join,
+            Acceptance {
+                display_name: Some("Grace".into()),
+                password: PASSWORD.into(),
+            },
+        )
+        .unwrap();
+    let (finished_early, inviting) = inviting.lock().unwrap().take().expect("checkpoint ran");
+    assert!(
+        !finished_early,
+        "the invitation waited for the join to commit"
+    );
+    assert_eq!(
+        inviting.join().unwrap().unwrap_err(),
+        AccountError::AccountExists
+    );
+    assert_eq!(
+        cell.queued().await,
+        0,
+        "no invitation was mailed to a member"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_link_issued_mid_reset_is_issued_after_it() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let smtp = FakeSmtp::start().await;
+    let accounts = cell.accounts(true);
+    let worker = cell.worker(&smtp, quick_retries());
+    let tenant = unique("t-mail-reset-issue-race");
+    for by_operator in [false, true] {
+        let email = format!("{}-{by_operator}@example.com", unique("ada"));
+        cell.person(&accounts, &tenant, &email).await;
+        accounts.request_password_reset(&email).unwrap();
+        deliver(&worker).await;
+        let emailed = smtp.delivered_to(&email)[0].code();
+
+        // Once the reset has ended the person's other links, and before it commits, another
+        // link is issued.
+        let (hooked, issuing) = {
+            let (accounts, tenant, email) = (accounts.clone(), tenant.clone(), email.clone());
+            let runtime = tokio::runtime::Handle::current();
+            while_accept_is_open(&accounts.clone(), Checkpoint::ResetLinksEnded, move || {
+                if by_operator {
+                    runtime
+                        .block_on(accounts.operator_reset_link(&tenant, &email, None))
+                        .map(|issued| Some(issued.url))
+                } else {
+                    accounts.request_password_reset(&email).map(|()| None)
+                }
+            })
+        };
+        hooked
+            .accept(&emailed, new_password("a fresh passphrase"))
+            .unwrap();
+        let (finished_early, issuing) = issuing.lock().unwrap().take().expect("checkpoint ran");
+        assert!(
+            !finished_early,
+            "by operator: {by_operator}: the link waited for the reset to commit, so it is a \
+             link made after the new password, not one that slipped past it"
+        );
+        let issued = issuing.join().unwrap().unwrap();
+        if let Some(url) = issued {
+            assert!(accounts.invitation(&code_in(&url)).is_ok());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_dies_mid_send_leaves_its_letter_to_be_taken_over() {
     let _turn = ONE_AT_A_TIME.lock().await;
     let cell = cell().await;
     let (stuck, healthy) = (FakeSmtp::start().await, FakeSmtp::start().await);
@@ -1269,24 +1566,26 @@ async fn a_claim_that_runs_out_mid_send_is_taken_over_and_nothing_is_lost() {
     accounts.request_password_reset(&email).unwrap();
 
     let short_claim = DeliverySchedule {
-        claim_secs: 2,
+        claim_secs: 3,
+        send_deadline: Duration::from_secs(2),
         ..quick_retries()
     };
     let stalled = cell.worker(&stuck, short_claim);
     let stalled = tokio::spawn(async move { stalled.deliver_due().await });
-    // Until the claim runs out, another worker finds nothing to do.
+    // The worker dies mid-send, its letter claimed and its data sent but unanswered.
     while stuck.received().is_empty() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    stalled.abort();
+    // Until the claim runs out, another worker finds nothing to do.
     let rescuer = cell.worker(&healthy, quick_retries());
     assert_eq!(
         rescuer.deliver_due().await.unwrap(),
         DeliveryPass::default()
     );
 
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    tokio::time::sleep(Duration::from_millis(3_100)).await;
     assert_eq!(rescuer.deliver_due().await.unwrap().sent, 1);
-    stalled.abort();
     assert_eq!(cell.queued().await, 0);
     assert_eq!(
         stuck.received().len(),

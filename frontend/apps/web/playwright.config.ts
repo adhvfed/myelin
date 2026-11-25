@@ -1,8 +1,12 @@
 import { defineConfig, devices } from "@playwright/test";
 
-// Run the web app and its contract backend together in a real browser.
-const PORT = Number(process.env.PORT ?? 3000);
-const EDGE_PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
+// Run the web app and its contract backend together in a real browser. The ports are the suite's
+// own, not the app's usual 3000, so a running `fed` stack is never mistaken for the contract
+// server. Specs and the dev edge read them back from the environment.
+process.env.PORT ??= "3170";
+process.env.DEV_EDGE_PORT ??= "8787";
+const PORT = Number(process.env.PORT);
+const EDGE_PORT = Number(process.env.DEV_EDGE_PORT);
 // Playwright owns the browser revision pin. Keep an override for environments that provide their
 // own Chromium, but never guess the package manager's cache layout or revision.
 const chromiumPath = process.env.CHROMIUM_PATH?.trim() || undefined;

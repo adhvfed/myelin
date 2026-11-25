@@ -222,7 +222,9 @@ test.describe("invitation links", () => {
     }
     await page.getByTestId("invite-email").fill("linus@acme.dev");
     await page.getByTestId("invite-submit").click();
-    await expect(page.getByTestId("invite-error")).toContainText(/several invitations this hour/i);
+    await expect(page.getByTestId("invite-error")).toHaveText(
+      "That address has had several invitations recently. Try again in 42 minutes.",
+    );
   });
 
   test("without mail, a member invites a teammate and gets a link to pass on", async ({ page }) => {

@@ -62,9 +62,9 @@ REVOKE ALL ON TABLE auth_rate_limit FROM PUBLIC;
 GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE auth_rate_limit TO myelin_app;
 "#;
 
-/// The account tables, then the mail outbox that carries their links.
 /// Who made each link, so an operator's new reset link can revoke only the operator's earlier
-/// ones. Links stored before this column existed were all the operator's or members' joins.
+/// ones. Rows stored before the column existed are marked the operator's; only reset links read
+/// it.
 const INVITATION_ORIGIN_DDL: &str = r#"
 ALTER TABLE auth_invitation ADD COLUMN IF NOT EXISTS origin text NOT NULL DEFAULT 'operator';
 ALTER TABLE auth_invitation ALTER COLUMN origin DROP DEFAULT;
@@ -295,11 +295,23 @@ const DB_NOW: &str = "floor(extract(epoch FROM clock_timestamp()))::bigint";
 #[derive(Clone)]
 pub(crate) struct AccountStore {
     pool: PgPool,
+    #[cfg(any(test, feature = "test-support"))]
+    checkpoint: Option<super::CheckpointHook>,
 }
 
 impl AccountStore {
     pub(crate) fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(any(test, feature = "test-support"))]
+            checkpoint: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_checkpoint(mut self, hook: super::CheckpointHook) -> Self {
+        self.checkpoint = Some(hook);
+        self
     }
 
     pub(crate) async fn account(
@@ -410,11 +422,9 @@ impl AccountStore {
         Ok(())
     }
 
-    /// Decides whether the link may be issued and stores it, under one per-email lock so two
-    /// issuances cannot interleave. A join link supersedes older join links for the same email in
-    /// the same organization, and withdraws any mail still carrying them. Reset links live side
-    /// by side until one is accepted, so nobody can void a reset link by asking for another.
-    /// `mail` is queued in the same transaction.
+    /// Decides whether the link may be issued and stores it, under the per-email lock that
+    /// accepting a link also takes. It replaces the earlier links `IssueRule::supersedes` names,
+    /// and withdraws any mail still carrying them. `mail` is queued in the same transaction.
     pub(crate) async fn issue(
         &self,
         code: &CodeDigest,
@@ -446,11 +456,12 @@ impl AccountStore {
                 None => return Ok(IssueOutcome::NoSuchAccount),
             },
         };
-        // @tenant-cross-scope: bounded cleanup of expired, unreadable invitations.
+        // @tenant-cross-scope: bounded cleanup of expired, unreadable invitations. Rows another
+        // transaction holds are skipped, so this never waits on, or deadlocks with, anyone.
         sqlx::query(&format!(
             "DELETE FROM auth_invitation WHERE code_digest IN \
                (SELECT code_digest FROM auth_invitation WHERE expires_at_unix <= {DB_NOW} \
-                LIMIT 256)"
+                LIMIT 256 FOR UPDATE SKIP LOCKED)"
         ))
         .execute(&mut *transaction)
         .await
@@ -550,6 +561,8 @@ impl AccountStore {
         let tenant = invitation.tenant.clone();
         let region = invitation.region.clone();
         let email_digest = invitation.email_digest;
+        #[cfg(any(test, feature = "test-support"))]
+        let checkpoint = self.checkpoint.clone();
         settle(
             with_tenant_tx_error(
                 &self.pool,
@@ -557,6 +570,9 @@ impl AccountStore {
                 &invitation.region,
                 move |conn| {
                     Box::pin(async move {
+                        // Issuing takes the same lock, so a member's link for this address cannot
+                        // be decided while the account is being made.
+                        lock_email(conn, &tenant, &region, &email_digest).await?;
                         let consumed = sqlx::query(&format!(
                             "DELETE FROM auth_invitation \
                               WHERE code_digest = $1 AND kind = 'join' AND tenant_id = $2 \
@@ -601,6 +617,10 @@ impl AccountStore {
                             return Err(Abort::EmailTaken);
                         }
                         crate::mail::withdraw(conn, &[code.to_vec()]).await?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(hook) = &checkpoint {
+                            hook(super::Checkpoint::JoinAccountStored);
+                        }
                         Ok(principal.principal_id)
                     })
                 },
@@ -626,6 +646,8 @@ impl AccountStore {
         let tenant = invitation.tenant.clone();
         let region = invitation.region.clone();
         let email_digest = invitation.email_digest;
+        #[cfg(any(test, feature = "test-support"))]
+        let checkpoint = self.checkpoint.clone();
         settle(
             with_tenant_tx_error(
                 &self.pool,
@@ -683,6 +705,10 @@ impl AccountStore {
                         if changed != 1 {
                             return Err(Abort::Gone);
                         }
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(hook) = &checkpoint {
+                            hook(super::Checkpoint::ResetPasswordReplaced);
+                        }
                         // The new password ends every other reset link the person holds.
                         let mut ended: Vec<Vec<u8>> = sqlx::query_scalar(
                             "DELETE FROM auth_invitation \
@@ -697,6 +723,10 @@ impl AccountStore {
                         .await?;
                         ended.push(code.to_vec());
                         crate::mail::withdraw(conn, &ended).await?;
+                        #[cfg(any(test, feature = "test-support"))]
+                        if let Some(hook) = &checkpoint {
+                            hook(super::Checkpoint::ResetLinksEnded);
+                        }
                         if let Some((outbox, letter)) = notice {
                             outbox.enqueue(conn, &letter, None).await?;
                         }

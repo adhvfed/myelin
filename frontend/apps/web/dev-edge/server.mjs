@@ -1650,12 +1650,16 @@ const server = createServer((req, res) => {
         return send(res, 400, { error: { message: "bad request" } });
       }
       const email = body.email.trim().toLowerCase();
-      if (state.accounts.has(email)) return send(res, 409, { error: { message: "exists" } });
+      // As on the edge: the address's allowance (mail on only) is checked before the account,
+      // and a refused invitation is not charged.
       const invited = state.invitesPerRecipient.get(email) ?? 0;
-      if (invited >= 3) {
-        return send(res, 429, { error: { code: "recipient_rate_limited", message: "slow down" } }, { "retry-after": "3600" });
+      if (state.mailDeliveryEnabled && invited >= 3) {
+        return send(res, 429, {
+          error: { code: "recipient_rate_limited", message: "slow down", retry_after_secs: 2_520 },
+        }, { "retry-after": "2520" });
       }
-      state.invitesPerRecipient.set(email, invited + 1);
+      if (state.accounts.has(email)) return send(res, 409, { error: { message: "exists" } });
+      if (state.mailDeliveryEnabled) state.invitesPerRecipient.set(email, invited + 1);
       const url = newInvitation("join", email);
       const expires_at = Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60;
       if (state.mailDeliveryEnabled) {

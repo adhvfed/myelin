@@ -264,7 +264,7 @@ export const acceptInvitation = action(async (formData: FormData) => {
 
 export type InvitationResult =
   | ({ ok: true } & EdgeCreatedInvitation)
-  | { ok: false; reason: AccountFailure };
+  | { ok: false; reason: AccountFailure; retryAfterSecs?: number };
 
 /** Invite a teammate. With mail on the edge emails the link; otherwise it is shown once, to be
  * passed on by hand. */
@@ -278,7 +278,8 @@ export const createInvitation = action(async (formData: FormData): Promise<Invit
     return { ok: true, ...(await edgeCreateInvitation(email)) };
   } catch (error) {
     if (isUnauthorized(error)) throw redirect("/login");
-    return { ok: false, reason: accountFailure(error) };
+    const retryAfterSecs = error instanceof AccountError ? error.retryAfterSecs : undefined;
+    return { ok: false, reason: accountFailure(error), ...(retryAfterSecs ? { retryAfterSecs } : {}) };
   }
 }, "create-invitation");
 

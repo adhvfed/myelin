@@ -78,6 +78,14 @@ impl MailWorker {
         settings: &MailSettings,
         schedule: DeliverySchedule,
     ) -> Result<Self, String> {
+        let claim = Duration::from_secs(u64::try_from(schedule.claim_secs).unwrap_or(0));
+        if schedule.send_deadline >= claim {
+            return Err(format!(
+                "a send may take {:?} but a claim lasts only {claim:?}, so another worker could \
+                 send the same letter while the first is still sending",
+                schedule.send_deadline
+            ));
+        }
         Ok(Self {
             pool,
             outbox,
@@ -192,17 +200,17 @@ impl MailWorker {
         let worker = Arc::new(self);
         let join = tokio::spawn(async move {
             loop {
-                let pass = tokio::spawn({
+                let mut pass = tokio::spawn({
                     let worker = worker.clone();
                     async move { worker.deliver_due().await }
                 });
-                let abort = pass.abort_handle();
                 let failure = tokio::select! {
                     _ = stopping.changed() => {
-                        abort.abort();
+                        pass.abort();
+                        let _ = pass.await;
                         return;
                     }
-                    finished = pass => match finished {
+                    finished = &mut pass => match finished {
                         Ok(Ok(_)) => None,
                         Ok(Err(error)) => Some(error.to_string()),
                         Err(error) => Some(format!("a delivery pass stopped: {error}")),
@@ -233,8 +241,9 @@ pub struct MailWorkerHandle {
 }
 
 impl MailWorkerHandle {
-    /// Stops at once, abandoning any send in progress. That letter is still queued, so it is sent
-    /// again once its claim runs out: nothing is lost, though it may arrive twice.
+    /// Stops the worker, abandoning any send in progress, and returns once that pass has ended.
+    /// The abandoned letter is still queued, so it is sent again once its claim runs out: nothing
+    /// is lost, though it may arrive twice.
     pub async fn shutdown(self) -> Result<(), String> {
         let _ = self.shutdown.send(true);
         self.join
@@ -282,6 +291,34 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_send_must_end_before_its_claim_does() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://nobody@127.0.0.1:1/none")
+            .expect("a lazy pool");
+        let settings = MailSettings::parse(
+            Some("smtp://127.0.0.1:1025".into()),
+            None,
+            None,
+            Some("no-reply@myelin.test".into()),
+        )
+        .unwrap()
+        .unwrap();
+        let outbox = || MailOutbox::new("cell", zeroize::Zeroizing::new([0; 32]));
+        let worker = |schedule| MailWorker::new(pool.clone(), outbox(), &settings, schedule);
+        assert!(worker(DeliverySchedule::default()).is_ok());
+        assert!(worker(DeliverySchedule {
+            claim_secs: 60,
+            ..DeliverySchedule::default()
+        })
+        .is_err());
+        assert!(worker(DeliverySchedule {
+            claim_secs: 61,
+            ..DeliverySchedule::default()
+        })
+        .is_ok());
+    }
 
     #[test]
     fn retries_back_off_to_an_hour() {

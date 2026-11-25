@@ -1,6 +1,7 @@
 //! Mail waiting to be sent. A letter is written in the same transaction as the change it reports,
 //! so a link exists only if its mail is queued. Letters hold addresses and links, so each row is
-//! sealed under a key derived from the cell's seal key and bound to its cell and id.
+//! sealed under a key derived from the cell's seal key and bound to its cell, its id, and the
+//! link it carries.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -52,7 +53,7 @@ pub(crate) struct Claimed {
     pub id: MessageId,
     pub attempts: i32,
     pub claimed_until: i64,
-    /// `None` when the row cannot be opened, which no retry would change.
+    /// `None` when this edge cannot open the row: tampered with, or written by a newer edge.
     pub letter: Option<Letter>,
     /// False when the letter carries a link that has since expired or been used.
     pub link_live: bool,
@@ -286,9 +287,9 @@ impl MailOutbox {
     /// A row opens only as itself, in its own cell, with the link digest it was queued with, so
     /// clearing or swapping that column cannot get a dead link's letter past the liveness check.
     fn binding(&self, id: &MessageId, link: Option<&[u8; 32]>) -> Vec<u8> {
-        let mut binding = b"myelin.edge.mail.v2\0".to_vec();
+        let mut binding = b"myelin.edge.mail.v3\0".to_vec();
+        binding.extend_from_slice(&(self.cell.len() as u64).to_be_bytes());
         binding.extend_from_slice(self.cell.as_bytes());
-        binding.push(0);
         binding.extend_from_slice(id);
         match link {
             Some(link) => {

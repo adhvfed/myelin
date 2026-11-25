@@ -227,7 +227,9 @@ impl Mailer {
     }
 
     /// Sends one message, giving up at `deadline` whatever stage the conversation is in: a relay
-    /// that stops talking mid-handshake or mid-data must not hold the worker.
+    /// that stops talking mid-handshake or mid-data must not hold the worker. The deadline also
+    /// covers the closing QUIT, which lettre sends inside the same call, so a relay that accepts
+    /// the message and then stalls on QUIT has it sent again.
     pub(crate) async fn send(
         &self,
         message: Message,

@@ -26,7 +26,8 @@ export type AccountFailure =
   | "unavailable";
 
 export class AccountError extends Error {
-  constructor(readonly reason: AccountFailure) {
+  /** How long to wait, in seconds, when the edge said. */
+  constructor(readonly reason: AccountFailure, readonly retryAfterSecs?: number) {
     super(`account request failed: ${reason}`);
     this.name = "AccountError";
   }
@@ -175,11 +176,14 @@ export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedIn
     if (error instanceof GatewayError) {
       if (error.status === 409) throw new AccountError("account_exists");
       if (error.status === 400 || error.status === 422) throw new AccountError("invalid_email");
-      if (error.status === 429) {
+      if (error.status === 429 && error.code === "recipient_rate_limited") {
+        const wait = record(record(error.body)?.error)?.retry_after_secs;
         throw new AccountError(
-          error.code === "recipient_rate_limited" ? "recipient_rate_limited" : "rate_limited",
+          "recipient_rate_limited",
+          Number.isSafeInteger(wait) && (wait as number) > 0 ? (wait as number) : undefined,
         );
       }
+      if (error.status === 429) throw new AccountError("rate_limited");
       throw new AccountError("unavailable");
     }
     throw error;

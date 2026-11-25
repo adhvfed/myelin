@@ -3,7 +3,7 @@ import { Title } from "@solidjs/meta";
 import { createAsync, useAction, useSubmission } from "@solidjs/router";
 import { createSignal, For, onMount, Show, type JSX } from "solid-js";
 import { useAppViewer } from "~/components/AppShell";
-import { createInvitation, getAuthConfig, logout } from "~/lib/auth";
+import { createInvitation, getAuthConfig, logout, type InvitationResult } from "~/lib/auth";
 import { applyTheme, restoreTheme, THEMES, type Theme } from "~/lib/theme";
 
 const THEME_COPY: Record<Theme, { label: string; copy: string }> = {
@@ -45,8 +45,22 @@ const INVITE_ERRORS: Record<string, string> = {
   account_exists: "Someone with that email already has an account here.",
   invalid_email: "That doesn't look like an email address.",
   rate_limited: "Too many invitations just now. Wait a minute, then try again.",
-  recipient_rate_limited: "That address has had several invitations this hour. Wait an hour before sending another.",
 };
+
+/** The edge's wait, rounded up to whole minutes, in plain words. */
+function waitCopy(seconds: number | undefined): string {
+  if (!seconds) return "later";
+  const minutes = Math.ceil(seconds / 60);
+  return minutes === 1 ? "in a minute" : `in ${minutes} minutes`;
+}
+
+function inviteError(result: InvitationResult): string {
+  if (result.ok) return "";
+  if (result.reason === "recipient_rate_limited") {
+    return `That address has had several invitations recently. Try again ${waitCopy(result.retryAfterSecs)}.`;
+  }
+  return INVITE_ERRORS[result.reason] ?? "The link couldn't be created. Try again in a moment.";
+}
 
 const untilDate = (unix: number) =>
   new Date(unix * 1_000).toLocaleDateString(undefined, { day: "numeric", month: "long" });
@@ -91,7 +105,7 @@ function InviteCard() {
             keyed
             fallback={
               <p role="alert" class="profile-invite-error" data-testid="invite-error">
-                {INVITE_ERRORS[result.ok ? "" : result.reason] ?? "The link couldn't be created. Try again in a moment."}
+                {inviteError(result)}
               </p>
             }
           >

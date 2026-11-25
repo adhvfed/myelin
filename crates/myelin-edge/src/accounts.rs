@@ -12,6 +12,7 @@ use myelin_identity_service::{PrincipalProfile, PrincipalStore};
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -202,10 +203,17 @@ pub enum Checkpoint {
     BeforeIssuing,
     /// A join has made the new person's key and not yet stored the person.
     JoinKeyMade,
+    /// Inside a join's transaction: the account is stored; nothing is committed yet.
+    JoinAccountStored,
+    /// Inside a reset's transaction: the password is replaced and the person's other reset links
+    /// are not yet ended.
+    ResetPasswordReplaced,
+    /// Inside a reset's transaction: the other reset links are ended; nothing is committed yet.
+    ResetLinksEnded,
 }
 
 #[cfg(any(test, feature = "test-support"))]
-type CheckpointHook = Arc<dyn Fn(Checkpoint) + Send + Sync>;
+pub(crate) type CheckpointHook = Arc<dyn Fn(Checkpoint) + Send + Sync>;
 
 /// A link that was live when it was looked up. Consuming it checks again.
 struct LiveLink {
@@ -222,6 +230,7 @@ pub struct AccountService {
     links: LinkOrigin,
     mail: Option<MailOutbox>,
     reset_requests: Arc<Semaphore>,
+    dropped_resets: Arc<DroppedRequests>,
     region: String,
     runtime: Handle,
     hashing: Arc<HashGate>,
@@ -250,6 +259,7 @@ impl AccountService {
             links: LinkOrigin::from_config(web_origin),
             mail: None,
             reset_requests: Arc::new(Semaphore::new(RESET_REQUESTS_IN_FLIGHT)),
+            dropped_resets: Arc::default(),
             region: region.into(),
             runtime,
             hashing: Arc::new(HashGate::sized_for_host()),
@@ -288,7 +298,9 @@ impl AccountService {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_checkpoint(mut self, hook: impl Fn(Checkpoint) + Send + Sync + 'static) -> Self {
-        self.checkpoint = Some(Arc::new(hook));
+        let hook: CheckpointHook = Arc::new(hook);
+        self.store = self.store.with_checkpoint(hook.clone());
+        self.checkpoint = Some(hook);
         self
     }
 
@@ -608,58 +620,92 @@ impl AccountService {
     ) -> Result<MemberInvitation, AccountError> {
         self.block(async {
             let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
+            let mut taken = Vec::new();
+            // The address's allowance is checked first, so a refusal there costs the member
+            // nothing. It applies only with mail on: otherwise nothing reaches the address, and
+            // a member remaking a lost link is limited by their own allowance alone.
+            if self.mail.is_some() {
+                let mut invitee_key = inviter.tenant.0.as_bytes().to_vec();
+                invitee_key.push(0);
+                invitee_key.extend_from_slice(&self.digester.digest(&email));
+                let bucket = Self::bucket(&INVITES_PER_RECIPIENT, &invitee_key);
+                self.reserve(&INVITES_PER_RECIPIENT, bucket).await.map_err(
+                    |error| match error {
+                        AccountError::RateLimited { retry_after_secs } => {
+                            AccountError::RecipientRateLimited { retry_after_secs }
+                        }
+                        other => other,
+                    },
+                )?;
+                taken.push(bucket);
+            }
             let mut inviter_key = inviter.tenant.0.as_bytes().to_vec();
             inviter_key.push(0);
             inviter_key.extend_from_slice(inviter.principal_id.0.as_bytes());
             let bucket = Self::bucket(&INVITES_PER_MEMBER, &inviter_key);
-            self.reserve(&INVITES_PER_MEMBER, bucket).await?;
-            let mut invitee_key = inviter.tenant.0.as_bytes().to_vec();
-            invitee_key.push(0);
-            invitee_key.extend_from_slice(&self.digester.digest(&email));
-            let bucket = Self::bucket(&INVITES_PER_RECIPIENT, &invitee_key);
-            self.reserve(&INVITES_PER_RECIPIENT, bucket)
-                .await
-                .map_err(|error| match error {
-                    AccountError::RateLimited { retry_after_secs } => {
-                        AccountError::RecipientRateLimited { retry_after_secs }
-                    }
-                    other => other,
-                })?;
-            // Only an account in the inviter's own organization is reported, so a member cannot
-            // probe which addresses have accounts elsewhere in the cell. An address taken in
-            // another organization gets a link that fails when it is accepted.
-            let tenant = &inviter.tenant.0;
-            let Some(outbox) = &self.mail else {
-                return self
-                    .issue(
-                        IssueRule::MemberJoin,
-                        tenant,
-                        &inviter.region.0,
-                        email,
-                        JOIN_INVITATION_TTL_SECS,
-                        None,
-                    )
-                    .await
-                    .map(MemberInvitation::HandedOver);
+            let outcome = match self.reserve(&INVITES_PER_MEMBER, bucket).await {
+                Ok(()) => {
+                    taken.push(bucket);
+                    self.member_link(inviter, email).await
+                }
+                Err(refused) => Err(refused),
             };
-            // Mailed, the link goes only to the invitee, so opening it proves they hold the
-            // address.
-            let organization = self.store.organization_name(tenant).await?;
-            let issued = self
+            // An invitation that was not made is not charged.
+            if outcome.is_err() {
+                self.give_back(&taken).await;
+            }
+            outcome
+        })
+    }
+
+    async fn member_link(
+        &self,
+        inviter: &Principal,
+        email: Email,
+    ) -> Result<MemberInvitation, AccountError> {
+        // Only an account in the inviter's own organization is reported, so a member cannot
+        // probe which addresses have accounts elsewhere in the cell. An address taken in
+        // another organization gets a link that fails when it is accepted.
+        let tenant = &inviter.tenant.0;
+        let Some(outbox) = &self.mail else {
+            return self
                 .issue(
                     IssueRule::MemberJoin,
                     tenant,
                     &inviter.region.0,
                     email,
                     JOIN_INVITATION_TTL_SECS,
-                    Some((outbox, LinkLetter::Invitation { organization })),
+                    None,
                 )
-                .await?;
-            Ok(MemberInvitation::Emailed {
-                email: issued.email,
-                expires_at_unix: issued.expires_at_unix,
-            })
+                .await
+                .map(MemberInvitation::HandedOver);
+        };
+        // Mailed, the link goes only to the invitee, so opening it proves they hold the address.
+        let organization = self.store.organization_name(tenant).await?;
+        let issued = self
+            .issue(
+                IssueRule::MemberJoin,
+                tenant,
+                &inviter.region.0,
+                email,
+                JOIN_INVITATION_TTL_SECS,
+                Some((outbox, LinkLetter::Invitation { organization })),
+            )
+            .await?;
+        Ok(MemberInvitation::Emailed {
+            email: issued.email,
+            expires_at_unix: issued.expires_at_unix,
         })
+    }
+
+    /// Best effort: a slot that cannot be given back only throttles a little early.
+    async fn give_back(&self, buckets: &[[u8; 32]]) {
+        let Ok(now) = self.now_unix() else {
+            return;
+        };
+        for bucket in buckets {
+            let _ = self.store.release_hit(*bucket, now).await;
+        }
     }
 
     /// `POST /v1/auth/password/forgot`. The caller always gets the same answer at once; the work
@@ -667,13 +713,20 @@ impl AccountService {
     /// account.
     pub fn forgot_password(&self, email: &str) {
         let Ok(permit) = self.reset_requests.clone().try_acquire_owned() else {
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event": "edge.accounts.reset_request_dropped",
-                    "reason": "too many reset requests in progress",
-                })
-            );
+            if let Some(dropped) = self
+                .now_unix()
+                .ok()
+                .and_then(|now| self.dropped_resets.record(now))
+            {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "edge.accounts.reset_requests_dropped",
+                        "reason": "too many reset requests in progress",
+                        "dropped": dropped,
+                    })
+                );
+            }
             return;
         };
         let service = self.clone();
@@ -873,6 +926,28 @@ fn scope_for(tenant: &str, region: &str) -> TenantScope {
     )
 }
 
+/// Counts dropped reset requests so a flood of them is logged once a minute, not once each.
+#[derive(Default)]
+struct DroppedRequests {
+    minute: AtomicI64,
+    since_logged: AtomicU64,
+}
+
+impl DroppedRequests {
+    /// Counts one drop, and returns how many to log when this is the first in a new minute.
+    fn record(&self, now_unix: i64) -> Option<u64> {
+        self.since_logged.fetch_add(1, Ordering::Relaxed);
+        let minute = now_unix.div_euclid(60);
+        let last = self.minute.load(Ordering::Relaxed);
+        (last != minute
+            && self
+                .minute
+                .compare_exchange(last, minute, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok())
+        .then(|| self.since_logged.swap(0, Ordering::Relaxed))
+    }
+}
+
 /// Bounds how many password hashes run at once. Each Argon2id run holds 19 MiB and a core, so an
 /// unbounded burst would exhaust the host; callers past the bound wait briefly, then get `Busy`.
 struct HashGate {
@@ -966,6 +1041,19 @@ mod tests {
             Handle::current(),
         );
         assert!(service.dummy.is_a_full_cost_hash());
+    }
+
+    #[test]
+    fn dropped_reset_requests_are_logged_at_most_once_a_minute() {
+        let dropped = DroppedRequests::default();
+        assert_eq!(dropped.record(600), Some(1));
+        assert_eq!(dropped.record(610), None);
+        assert_eq!(dropped.record(659), None);
+        assert_eq!(
+            dropped.record(660),
+            Some(3),
+            "the next minute reports what it held back"
+        );
     }
 
     #[test]
