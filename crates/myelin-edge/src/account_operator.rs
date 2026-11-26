@@ -2,7 +2,7 @@
 //! or give them a role. A link goes to stdout alone so a script can capture it; everything else
 //! goes to stderr.
 
-use myelin_edge::{AccountError, AccountService, OrgRole};
+use myelin_edge::{AccountError, AccountService, OperatorTarget, OrgRole};
 
 pub(crate) enum AccountCommand {
     Join,
@@ -34,13 +34,16 @@ impl AccountCommand {
                 "--tenant T --email E [--role owner|admin|member] [--region R] [--ttl-hours N]"
             }
             Self::Reset => "--tenant T --email E [--region R] [--ttl-hours N]",
-            Self::Role => "--tenant T --email E --role owner|admin|member [--region R]",
+            Self::Role => {
+                "--tenant T (--email E | --principal P) --role owner|admin|member [--region R]"
+            }
         }
     }
 
     fn takes(&self, flag: &str) -> bool {
         match flag {
             "--tenant" | "--email" | "--region" => true,
+            "--principal" => matches!(self, Self::Role),
             "--ttl-hours" => !matches!(self, Self::Role),
             "--role" => !matches!(self, Self::Reset),
             _ => false,
@@ -50,16 +53,47 @@ impl AccountCommand {
 
 struct Command {
     tenant: String,
-    email: String,
+    person: Person,
     region: Option<String>,
     ttl_secs: Option<i64>,
     role: Option<OrgRole>,
 }
 
+/// Whom a command names: by email, or for `edge role` also by principal id.
+enum Person {
+    Email(String),
+    Principal(String),
+}
+
+impl Person {
+    fn target(&self) -> OperatorTarget<'_> {
+        match self {
+            Self::Email(email) => OperatorTarget::Email(email),
+            Self::Principal(id) => OperatorTarget::Principal(id),
+        }
+    }
+
+    fn email(&self) -> &str {
+        match self {
+            Self::Email(email) => email,
+            Self::Principal(_) => unreachable!("only edge role takes --principal"),
+        }
+    }
+}
+
+impl std::fmt::Display for Person {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Email(email) => formatter.write_str(email),
+            Self::Principal(id) => write!(formatter, "principal `{id}`"),
+        }
+    }
+}
+
 impl Command {
     fn parse(command: &AccountCommand, args: &[String]) -> Result<Self, String> {
-        let (mut tenant, mut email, mut region, mut ttl_hours, mut role) =
-            (None, None, None, None, None);
+        let (mut tenant, mut email, mut principal, mut region, mut ttl_hours, mut role) =
+            (None, None, None, None, None, None);
         let mut pairs = args.chunks(2);
         for pair in pairs.by_ref() {
             let [name, value] = pair else {
@@ -76,6 +110,7 @@ impl Command {
                 "--email" => &mut email,
                 "--region" => &mut region,
                 "--ttl-hours" => &mut ttl_hours,
+                "--principal" => &mut principal,
                 _ => &mut role,
             };
             if slot.replace(value.clone()).is_some() {
@@ -100,11 +135,20 @@ impl Command {
         if matches!(command, AccountCommand::Role) && role.is_none() {
             return Err("--role is required".into());
         }
+        let person = match (email, principal) {
+            (Some(email), None) => Person::Email(email),
+            (None, Some(id)) if !id.trim().is_empty() => Person::Principal(id),
+            (Some(_), Some(_)) => return Err("give --email or --principal, not both".into()),
+            _ if matches!(command, AccountCommand::Role) => {
+                return Err("--email or --principal is required".into())
+            }
+            _ => return Err("--email is required".into()),
+        };
         Ok(Self {
             tenant: tenant
                 .filter(|value| !value.trim().is_empty())
                 .ok_or("--tenant is required")?,
-            email: email.ok_or("--email is required")?,
+            person,
             region,
             ttl_secs,
             role,
@@ -137,26 +181,33 @@ pub(crate) async fn run(
             _ => 1,
         });
     };
-    let role = command.role.unwrap_or(OrgRole::Owner);
+    let role = match command.role {
+        Some(role) => role,
+        None => accounts
+            .operator_default_role(&command.tenant)
+            .await
+            .unwrap_or_else(|error| fail(error)),
+    };
+    let email = || command.person.email();
     let issued = match kind {
         AccountCommand::Join => {
             accounts
-                .operator_join_link(&command.tenant, &command.email, command.ttl_secs, role)
+                .operator_join_link(&command.tenant, email(), command.ttl_secs, role)
                 .await
         }
         AccountCommand::Reset => {
             accounts
-                .operator_reset_link(&command.tenant, &command.email, command.ttl_secs)
+                .operator_reset_link(&command.tenant, email(), command.ttl_secs)
                 .await
         }
         AccountCommand::Role => {
             accounts
-                .operator_set_role(&command.tenant, &command.email, role)
+                .operator_set_role(&command.tenant, command.person.target(), role)
                 .await
                 .unwrap_or_else(|error| fail(error));
             eprintln!(
                 "edge role: {} is now {} of tenant `{}`",
-                command.email,
+                command.person,
                 role.as_str(),
                 command.tenant
             );
@@ -194,7 +245,10 @@ mod tests {
         .unwrap();
         assert_eq!(command.tenant, "acme");
         assert_eq!(command.ttl_secs, Some(7200));
-        assert_eq!(command.role, None, "an operator's invitation grants owner");
+        assert_eq!(
+            command.role, None,
+            "the organization decides the default role"
+        );
         for invalid in [
             &["--tenant", "acme"][..],
             &["--email", "a@b.c"],
@@ -226,6 +280,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(role.role, Some(OrgRole::Admin));
+        let by_id = Command::parse(
+            &AccountCommand::Role,
+            &args(&[
+                "--tenant",
+                "acme",
+                "--principal",
+                "developer",
+                "--role",
+                "owner",
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(by_id.person, Person::Principal(ref id) if id == "developer"));
         for (command, invalid) in [
             (
                 AccountCommand::Reset,
@@ -247,6 +314,27 @@ mod tests {
                     "--ttl-hours",
                     "1",
                 ],
+            ),
+            (
+                AccountCommand::Role,
+                &["--tenant", "acme", "--role", "admin"],
+            ),
+            (
+                AccountCommand::Role,
+                &[
+                    "--tenant",
+                    "acme",
+                    "--email",
+                    "a@b.c",
+                    "--principal",
+                    "p",
+                    "--role",
+                    "admin",
+                ],
+            ),
+            (
+                AccountCommand::Join,
+                &["--tenant", "acme", "--principal", "p"],
             ),
         ] {
             assert!(

@@ -9,7 +9,7 @@
 use myelin_storage::migration::{Migration, Migrations};
 use myelin_storage::{
     with_tenant_tx_error, DurablePrincipalBacking, DurablePrincipalRow, PgError,
-    ACTIVE_PRINCIPAL_STATUS_JSON,
+    ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON,
 };
 use sqlx::{PgPool, Row};
 
@@ -143,13 +143,27 @@ ALTER TABLE auth_invitation ADD COLUMN IF NOT EXISTS roster_ciphertext bytea
     CHECK (octet_length(roster_ciphertext) <= 512);
 "#;
 
-/// The account tables, the mail outbox that carries their links, each link's origin, and roles.
+/// Who sent each member's join link, so it is honoured only while they may still grant its role.
+/// Links stored before this have no inviter and are honoured like an operator's.
+const INVITATION_INVITER_DDL: &str = r#"
+ALTER TABLE auth_invitation ADD COLUMN IF NOT EXISTS invited_by text;
+ALTER TABLE auth_invitation DROP CONSTRAINT IF EXISTS auth_invitation_inviter_fkey;
+ALTER TABLE auth_invitation ADD CONSTRAINT auth_invitation_inviter_fkey
+    FOREIGN KEY (tenant_id, region, invited_by)
+    REFERENCES principal (tenant_id, region, principal_id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS auth_invitation_inviter_idx
+    ON auth_invitation (tenant_id, region, invited_by) WHERE invited_by IS NOT NULL;
+"#;
+
+/// The account tables, the mail outbox that carries their links, each link's origin, roles, and
+/// each member's link's inviter.
 pub fn account_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("edge_0003_password_accounts", ACCOUNT_DDL),
         crate::mail::outbox_migration(),
         Migration::plain("edge_0005_invitation_origin", INVITATION_ORIGIN_DDL),
         Migration::plain("edge_0006_org_roles", ORG_ROLES_DDL),
+        Migration::plain("edge_0007_invitation_inviter", INVITATION_INVITER_DDL),
     ])
 }
 
@@ -196,6 +210,8 @@ pub(crate) struct Invitation {
     pub principal_id: Option<String>,
     /// The role a join link grants; `None` for a reset link.
     pub role: Option<OrgRole>,
+    /// The member who sent a join link; `None` for the operator's.
+    pub invited_by: Option<String>,
     pub expires_at_unix: i64,
 }
 
@@ -303,6 +319,9 @@ pub(crate) enum IssueOutcome {
     NoSuchAccount,
     /// The inviter is not, or is no longer, allowed to grant the link's role.
     NotAllowed,
+    /// A live link for the email grants a role the inviter could not grant, so it is not theirs to
+    /// replace.
+    InvitationExists,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +334,8 @@ pub(crate) enum AcceptOutcome {
     /// Unknown, expired, already used, or no longer applicable. Callers answer 404 for all.
     Gone,
     EmailTaken,
+    /// The email belongs to a person who was erased; nobody can bring them back.
+    Erased,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -353,6 +374,7 @@ impl From<PgError> for StoreError {
 enum Abort {
     Gone,
     EmailTaken,
+    Erased,
     /// The password hash checked against is no longer the stored one.
     Replaced,
     Store(StoreError),
@@ -378,6 +400,7 @@ fn settle(result: Result<(String, i64), Abort>) -> Result<AcceptOutcome, StoreEr
         }),
         Err(Abort::Gone | Abort::Replaced) => Ok(AcceptOutcome::Gone),
         Err(Abort::EmailTaken) => Ok(AcceptOutcome::EmailTaken),
+        Err(Abort::Erased) => Ok(AcceptOutcome::Erased),
         Err(Abort::Store(error)) => Err(error),
     }
 }
@@ -425,6 +448,8 @@ pub(crate) struct Roster {
     pub viewer: OrgRole,
     pub people: Vec<PersonRow>,
     pub pending: Vec<PendingRow>,
+    /// Active owners. Zero when the last was erased or revoked outside the roster.
+    pub owners: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -615,36 +640,35 @@ impl AccountStore {
         )
         .await
         .map_err(StoreError::database)?;
-        if let IssueRule::MemberJoin { inviter, role } = rule {
-            // Before anything about the email, so a member who may not invite learns nothing.
-            scope_to(&mut transaction, &link.tenant, &link.region)
-                .await
-                .map_err(StoreError::database)?;
-            lock_org(
-                &mut transaction,
-                &link.tenant,
-                &link.region,
-                OrgLock::Shared,
-            )
-            .await
-            .map_err(StoreError::database)?;
-            let allowed = role_in(&mut transaction, &link.tenant, &link.region, inviter)
-                .await
-                .map_err(StoreError::database)?
-                .is_some_and(|inviter| inviter.may_grant(role));
-            if !allowed {
-                return Ok(IssueOutcome::NotAllowed);
+        let (tenant, region) = (&link.tenant, &link.region);
+        scope_to(&mut transaction, tenant, region).await?;
+        let inviter_role = match rule {
+            IssueRule::MemberJoin { inviter, role } => {
+                // Before anything about the email, so a member who may not invite learns nothing.
+                lock_org(&mut transaction, tenant, region, OrgLock::Shared).await?;
+                match role_in(&mut transaction, tenant, region, inviter).await? {
+                    Some(inviter) if inviter.may_grant(role) => Some(inviter),
+                    _ => return Ok(IssueOutcome::NotAllowed),
+                }
             }
-        }
+            _ => None,
+        };
         let account = account_in(&mut *transaction, &link.email_digest).await?;
         let in_this_organization = account
             .as_ref()
-            .filter(|account| account.tenant == link.tenant && account.region == link.region);
+            .filter(|account| &account.tenant == tenant && &account.region == region);
+        // A removed person's address may be invited back into the organization that removed them.
+        let removed = match in_this_organization {
+            Some(account) => {
+                removed_in(&mut transaction, tenant, region, &account.principal_id).await?
+            }
+            None => false,
+        };
         let principal_id = match rule {
-            IssueRule::OperatorJoin { .. } if account.is_some() => {
+            IssueRule::OperatorJoin { .. } if account.is_some() && !removed => {
                 return Ok(IssueOutcome::AccountExists);
             }
-            IssueRule::MemberJoin { .. } if in_this_organization.is_some() => {
+            IssueRule::MemberJoin { .. } if in_this_organization.is_some() && !removed => {
                 return Ok(IssueOutcome::AccountExists);
             }
             IssueRule::OperatorJoin { .. } | IssueRule::MemberJoin { .. } => None,
@@ -653,6 +677,24 @@ impl AccountStore {
                 None => return Ok(IssueOutcome::NoSuchAccount),
             },
         };
+        if let Some(inviter) = inviter_role {
+            let pending: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT role FROM auth_invitation \
+                  WHERE tenant_id = $1 AND region = $2 AND email_digest = $3 AND kind = 'join' \
+                    AND expires_at_unix > {DB_NOW}"
+            ))
+            .bind(tenant)
+            .bind(region)
+            .bind(link.email_digest.as_slice())
+            .fetch_all(&mut *transaction)
+            .await?;
+            if pending
+                .iter()
+                .any(|role| OrgRole::parse(role).is_none_or(|role| !inviter.may_grant(role)))
+            {
+                return Ok(IssueOutcome::InvitationExists);
+            }
+        }
         if let Some(replaced) = rule.supersedes() {
             let superseded: Vec<Vec<u8>> = sqlx::query_scalar(&format!(
                 "DELETE FROM auth_invitation \
@@ -674,8 +716,9 @@ impl AccountStore {
             "INSERT INTO auth_invitation \
                (code_digest, kind, tenant_id, region, email_digest, email_nonce, \
                 email_ciphertext, principal_id, created_at_unix, expires_at_unix, origin, role, \
-                roster_nonce, roster_ciphertext) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {DB_NOW}, {DB_NOW} + $9, $10, $11, $12, $13) \
+                roster_nonce, roster_ciphertext, invited_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, {DB_NOW}, {DB_NOW} + $9, $10, $11, $12, $13, \
+                     $14) \
              RETURNING expires_at_unix"
         ))
         .bind(code.as_slice())
@@ -691,6 +734,10 @@ impl AccountStore {
         .bind(rule.role().map(OrgRole::as_str))
         .bind(roster.map(|sealed| sealed.nonce.to_vec()))
         .bind(roster.map(|sealed| sealed.ciphertext.clone()))
+        .bind(match rule {
+            IssueRule::MemberJoin { inviter, .. } => Some(inviter),
+            _ => None,
+        })
         .fetch_one(&mut *transaction)
         .await
         .map_err(StoreError::database)?;
@@ -723,7 +770,7 @@ impl AccountStore {
         // @tenant-cross-scope: an invitation link names its tenant only through its digest.
         let row = sqlx::query(&format!(
             "SELECT kind, tenant_id, region, email_digest, email_nonce, email_ciphertext, \
-                    principal_id, role, expires_at_unix \
+                    principal_id, role, invited_by, expires_at_unix \
                FROM auth_invitation WHERE code_digest = $1 AND expires_at_unix > {DB_NOW}"
         ))
         .bind(code.as_slice())
@@ -750,6 +797,7 @@ impl AccountStore {
                 .get::<Option<String>, _>("role")
                 .map(|role| OrgRole::parse(&role).ok_or_else(|| StoreError::corrupt("role")))
                 .transpose()?,
+            invited_by: row.get("invited_by"),
             expires_at_unix: row.get("expires_at_unix"),
         }))
     }
@@ -771,6 +819,7 @@ impl AccountStore {
         let Some(role) = invitation.role else {
             return Ok(AcceptOutcome::Gone);
         };
+        let invited_by = invitation.invited_by.clone();
         #[cfg(any(test, feature = "test-support"))]
         let checkpoint = self.checkpoint.clone();
         settle(
@@ -780,25 +829,15 @@ impl AccountStore {
                 &invitation.region,
                 move |conn| {
                     Box::pin(async move {
-                        // Issuing takes the same lock, so a member's link for this address cannot
-                        // be decided while the account is being made.
-                        lock_email(conn, &tenant, &region, &email_digest).await?;
-                        let consumed = sqlx::query(&format!(
-                            "DELETE FROM auth_invitation \
-                              WHERE code_digest = $1 AND kind = 'join' AND tenant_id = $2 \
-                                AND region = $3 AND email_digest = $4 \
-                                AND expires_at_unix > {DB_NOW}"
-                        ))
-                        .bind(code.as_slice())
-                        .bind(&tenant)
-                        .bind(&region)
-                        .bind(email_digest.as_slice())
-                        .execute(&mut *conn)
-                        .await?
-                        .rows_affected();
-                        if consumed != 1 {
-                            return Err(Abort::Gone);
-                        }
+                        let join = JoinLink {
+                            code: &code,
+                            tenant: &tenant,
+                            region: &region,
+                            email_digest: &email_digest,
+                            role,
+                            invited_by: invited_by.as_deref(),
+                        };
+                        consume_join(conn, &join).await?;
                         if !DurablePrincipalBacking::insert_new_principal_in_tx(
                             conn, &tenant, &region, &principal,
                         )
@@ -847,6 +886,95 @@ impl AccountStore {
                     })
                 },
             )
+            .await,
+        )
+    }
+
+    /// Consumes a join link for a removed person's address: their password is replaced, they are
+    /// active again with the link's role, and every session they held before stays ended. An
+    /// erased person cannot come back; anyone still active already has an account.
+    pub(crate) async fn accept_rejoin(
+        &self,
+        code: &CodeDigest,
+        invitation: &Invitation,
+        principal_id: &str,
+        password_phc: String,
+    ) -> Result<AcceptOutcome, StoreError> {
+        let Some(role) = invitation.role else {
+            return Ok(AcceptOutcome::Gone);
+        };
+        let code = *code;
+        let (tenant, region) = (invitation.tenant.clone(), invitation.region.clone());
+        let email_digest = invitation.email_digest;
+        let invited_by = invitation.invited_by.clone();
+        let principal_id = principal_id.to_string();
+        settle(
+            with_tenant_tx_error(&self.pool, &invitation.tenant, &invitation.region, move |conn| {
+                Box::pin(async move {
+                    let join = JoinLink {
+                        code: &code,
+                        tenant: &tenant,
+                        region: &region,
+                        email_digest: &email_digest,
+                        role,
+                        invited_by: invited_by.as_deref(),
+                    };
+                    consume_join(conn, &join).await?;
+                    let account = AccountRow {
+                        email_digest,
+                        tenant: tenant.clone(),
+                        region: region.clone(),
+                        principal_id: principal_id.clone(),
+                        password_phc: String::new(),
+                    };
+                    if locked_password(conn, &account, "FOR UPDATE").await?.is_none() {
+                        return Err(Abort::Gone);
+                    }
+                    if lock_active_person(conn, &tenant, &region, &principal_id).await? {
+                        return Err(Abort::EmailTaken);
+                    }
+                    if !removed_in(conn, &tenant, &region, &principal_id).await? {
+                        return Err(Abort::Erased);
+                    }
+                    set_password(
+                        conn,
+                        &tenant,
+                        &region,
+                        &principal_id,
+                        &email_digest,
+                        &password_phc,
+                        None,
+                    )
+                    .await?;
+                    // The status trigger moves the cutoff, so the sessions held before removal
+                    // stay ended; the new one counts as issued at the cutoff.
+                    let cutoff: i64 = sqlx::query_scalar(&format!(
+                        "UPDATE principal SET status = '{ACTIVE_PRINCIPAL_STATUS_JSON}' \
+                          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
+                         RETURNING sessions_not_before"
+                    ))
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&principal_id)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    sqlx::query(&format!(
+                        "INSERT INTO auth_org_member \
+                           (tenant_id, region, principal_id, role, joined_at_unix) \
+                         VALUES ($1, $2, $3, $4, {DB_NOW}) \
+                         ON CONFLICT (tenant_id, region, principal_id) \
+                         DO UPDATE SET role = EXCLUDED.role, joined_at_unix = EXCLUDED.joined_at_unix"
+                    ))
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&principal_id)
+                    .bind(role.as_str())
+                    .execute(&mut *conn)
+                    .await?;
+                    end_reset_links(conn, &tenant, &region, &principal_id, Some(&code)).await?;
+                    Ok((principal_id, cutoff))
+                })
+            })
             .await,
         )
     }
@@ -1079,7 +1207,7 @@ impl AccountStore {
         match outcome {
             Ok(cutoff) => Ok(ChangeOutcome::Changed { cutoff }),
             Err(Abort::Replaced) => Ok(ChangeOutcome::ChangedElsewhere),
-            Err(Abort::Gone | Abort::EmailTaken) => Ok(ChangeOutcome::Inactive),
+            Err(Abort::Gone | Abort::EmailTaken | Abort::Erased) => Ok(ChangeOutcome::Inactive),
             Err(Abort::Store(error)) => Err(error),
         }
     }
@@ -1149,10 +1277,12 @@ impl AccountStore {
                 } else {
                     Vec::new()
                 };
+                let owners = active_owners(conn, tenant, region).await?;
                 Ok(Some(Roster {
                     viewer: role,
                     people,
                     pending,
+                    owners,
                 }))
             })
         })
@@ -1188,7 +1318,16 @@ impl AccountStore {
                     None => OrgRole::Owner,
                 };
                 let Some(target_role) = role_in(conn, tenant, region, &target).await? else {
-                    return Ok(RosterOutcome::NotFound);
+                    // The operator gives a role to an active person who has none yet: one who
+                    // signs in another way, or a development login.
+                    return Ok(match (&actor, change) {
+                        (None, MemberChange::Role(role))
+                            if enrol(conn, tenant, region, &target, role).await? =>
+                        {
+                            RosterOutcome::Done
+                        }
+                        _ => RosterOutcome::NotFound,
+                    });
                 };
                 let is_self = actor.as_deref() == Some(target.as_str());
                 let allowed = actor_role.may_act_on(target_role, is_self)
@@ -1224,6 +1363,18 @@ impl AccountStore {
                         .await?;
                     }
                     MemberChange::Remove => {
+                        // Their pending invitations go with them, and so does any unsent mail.
+                        let withdrawn: Vec<Vec<u8>> = sqlx::query_scalar(
+                            "DELETE FROM auth_invitation \
+                              WHERE tenant_id = $1 AND region = $2 AND invited_by = $3 \
+                             RETURNING code_digest",
+                        )
+                        .bind(tenant)
+                        .bind(region)
+                        .bind(&target)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                        crate::mail::withdraw(conn, &withdrawn).await?;
                         sqlx::query(
                             "DELETE FROM auth_org_member \
                               WHERE tenant_id = $1 AND region = $2 AND principal_id = $3",
@@ -1245,6 +1396,53 @@ impl AccountStore {
                     }
                 }
                 Ok(RosterOutcome::Done)
+            })
+        })
+        .await
+    }
+
+    /// Gives an active person who signs in another way (SSO) a member role, if they have none.
+    pub(crate) async fn enrol_member(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal_id: &str,
+    ) -> Result<(), StoreError> {
+        let principal_id = principal_id.to_string();
+        let (tenant_owned, region_owned) = (tenant.to_string(), region.to_string());
+        with_tenant_tx_error(&self.pool, tenant, region, move |conn| {
+            Box::pin(async move {
+                let (tenant, region) = (&tenant_owned, &region_owned);
+                lock_org(conn, tenant, region, OrgLock::Shared).await?;
+                if role_in(conn, tenant, region, &principal_id)
+                    .await?
+                    .is_none()
+                {
+                    enrol(conn, tenant, region, &principal_id, OrgRole::Member).await?;
+                }
+                Ok::<_, StoreError>(())
+            })
+        })
+        .await
+    }
+
+    /// Whether anyone is an active member of the organization.
+    pub(crate) async fn has_people(&self, tenant: &str, region: &str) -> Result<bool, StoreError> {
+        let (tenant_owned, region_owned) = (tenant.to_string(), region.to_string());
+        with_tenant_tx_error(&self.pool, tenant, region, move |conn| {
+            Box::pin(async move {
+                Ok::<_, StoreError>(
+                    sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM auth_org_member AS member \
+                       JOIN principal AS person USING (tenant_id, region, principal_id) \
+                      WHERE member.tenant_id = $1 AND member.region = $2 AND person.status = $3)",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+                    .fetch_one(&mut *conn)
+                    .await?,
+                )
             })
         })
         .await
@@ -1481,6 +1679,99 @@ async fn lock_org(
         .execute(conn)
         .await?;
     Ok(())
+}
+
+/// A join link being used, and what it was issued with.
+struct JoinLink<'a> {
+    code: &'a CodeDigest,
+    tenant: &'a str,
+    region: &'a str,
+    email_digest: &'a EmailDigest,
+    role: OrgRole,
+    invited_by: Option<&'a str>,
+}
+
+/// Takes the email lock (as issuing does), then deletes the link, if it is live and its inviter
+/// may still grant its role. A member's link holds only while they could send it again.
+async fn consume_join(conn: &mut sqlx::PgConnection, link: &JoinLink<'_>) -> Result<(), Abort> {
+    let (tenant, region) = (link.tenant, link.region);
+    lock_email(conn, tenant, region, link.email_digest).await?;
+    if let Some(inviter) = link.invited_by {
+        lock_org(conn, tenant, region, OrgLock::Shared).await?;
+        if !role_in(conn, tenant, region, inviter)
+            .await?
+            .is_some_and(|inviter| inviter.may_grant(link.role))
+        {
+            return Err(Abort::Gone);
+        }
+    }
+    let consumed = sqlx::query(&format!(
+        "DELETE FROM auth_invitation \
+          WHERE code_digest = $1 AND kind = 'join' AND tenant_id = $2 AND region = $3 \
+            AND email_digest = $4 AND expires_at_unix > {DB_NOW}"
+    ))
+    .bind(link.code.as_slice())
+    .bind(tenant)
+    .bind(region)
+    .bind(link.email_digest.as_slice())
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if consumed != 1 {
+        return Err(Abort::Gone);
+    }
+    Ok(())
+}
+
+/// Whether the person was removed (disabled) and may be invited back: not erased, which is
+/// permanent.
+async fn removed_in(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    principal_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT person.status = '\"Disabled\"' AND NOT EXISTS ( \
+                SELECT 1 FROM revocation \
+                 WHERE kind = 'principal' AND expires_at IS NULL AND tenant_id = person.tenant_id \
+                   AND region = person.region AND handle = person.principal_id) \
+           FROM principal AS person \
+          WHERE person.tenant_id = $1 AND person.region = $2 AND person.principal_id = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(principal_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map(|removed| removed.unwrap_or(false))
+}
+
+/// Makes an active human with no role a member with `role`; `false` when there is no such person.
+async fn enrol(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    principal_id: &str,
+    role: OrgRole,
+) -> Result<bool, sqlx::Error> {
+    let enrolled = sqlx::query(&format!(
+        "INSERT INTO auth_org_member (tenant_id, region, principal_id, role, joined_at_unix) \
+         SELECT tenant_id, region, principal_id, $4, {DB_NOW} FROM principal \
+          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 AND kind = $5 \
+            AND status = $6 \
+         ON CONFLICT (tenant_id, region, principal_id) DO NOTHING"
+    ))
+    .bind(tenant)
+    .bind(region)
+    .bind(principal_id)
+    .bind(role.as_str())
+    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok(enrolled == 1)
 }
 
 /// The role of an active member; `None` for anyone else.

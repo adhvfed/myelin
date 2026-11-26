@@ -150,6 +150,14 @@ fn account_error(failure: AccountError) -> EdgeResponse {
             &json!({ "error": { "code": "last_owner", "message": message } }),
         )),
         AccountError::NoSuchMember => error(&EdgeError::NotFound(message)),
+        AccountError::InvitationExists => no_store(EdgeResponse::json(
+            409,
+            &json!({ "error": { "code": "invitation_exists", "message": message } }),
+        )),
+        AccountError::PersonErased => no_store(EdgeResponse::json(
+            409,
+            &json!({ "error": { "code": "person_erased", "message": message } }),
+        )),
         AccountError::Unavailable(_) => error(&EdgeError::Unavailable(
             "accounts are temporarily unavailable".into(),
         )),
@@ -459,7 +467,11 @@ fn roster_json(roster: &RosterView) -> serde_json::Value {
             })
         })
         .collect();
-    let mut body = json!({ "role": roster.viewer.as_str(), "people": people });
+    let mut body = json!({
+        "role": roster.viewer.as_str(),
+        "owners": roster.owners,
+        "people": people,
+    });
     if let Some(invitations) = &roster.invitations {
         body["invitations"] = invitations
             .iter()

@@ -49,15 +49,20 @@ export async function reconcileAgentThreads(
   }
 }
 
-/** Runs `edge invite` or `edge reset-link` as the operator and returns the printed link. */
+/** Runs `edge invite` or `edge reset-link` as the operator and returns the printed link. An
+ * invitation grants `role`, or the organization's default when none is given. */
 export async function operatorLink(
   command: "invite" | "reset-link",
   email: string,
   tenant: string = requiredTenant(),
+  role?: string,
 ): Promise<string> {
   const result = await run(
     "cargo",
-    ["run", "--quiet", "-p", "myelin-edge", "--bin", "edge", "--", command, "--tenant", tenant, "--email", email],
+    [
+      "run", "--quiet", "-p", "myelin-edge", "--bin", "edge", "--", command, "--tenant", tenant, "--email", email,
+      ...(role ? ["--role", role] : []),
+    ],
     { timeout: 120_000, maxBuffer: 256 * 1024 },
   );
   const link = result.stdout.trim();
@@ -67,11 +72,16 @@ export async function operatorLink(
   return link;
 }
 
-/** Runs `edge role` as the operator: gives the person with `email` in `tenant` a role. */
-export async function operatorRole(tenant: string, email: string, role: string): Promise<void> {
+/** Runs `edge role` as the operator: gives the person named by email or principal id a role. */
+export async function operatorRole(
+  tenant: string,
+  person: { email: string } | { principal: string },
+  role: string,
+): Promise<void> {
+  const who = "email" in person ? ["--email", person.email] : ["--principal", person.principal];
   await run(
     "cargo",
-    ["run", "--quiet", "-p", "myelin-edge", "--bin", "edge", "--", "role", "--tenant", tenant, "--email", email, "--role", role],
+    ["run", "--quiet", "-p", "myelin-edge", "--bin", "edge", "--", "role", "--tenant", tenant, ...who, "--role", role],
     { timeout: 120_000, maxBuffer: 256 * 1024 },
   );
 }

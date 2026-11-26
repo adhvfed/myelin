@@ -65,9 +65,9 @@ describe("a person's account", () => {
     expect(config.body).toMatchObject({ password_login_enabled: true, mail_delivery_enabled: true });
     expect(config.body).not.toHaveProperty("token_login_enabled");
 
-    // The operator invites the organization's first person.
+    // The operator invites an owner into the organization.
     const adaEmail = uniqueEmail("ada");
-    const adaCode = codeOf(await operatorLink("invite", adaEmail.toUpperCase()));
+    const adaCode = codeOf(await operatorLink("invite", adaEmail.toUpperCase(), undefined, "owner"));
 
     const invitation = await systemClient.json(`/v1/auth/invitations/${adaCode}`, anonymous);
     expect(invitation.body).toMatchObject({ kind: "join", email: adaEmail });

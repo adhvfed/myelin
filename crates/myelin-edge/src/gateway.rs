@@ -1295,6 +1295,7 @@ impl Gateway {
         };
         match self.human_login.authenticate_with_assertion(&cred, None) {
             Ok((principal, assertion)) => {
+                self.enrol_signed_in_person(&principal);
                 let issuer = self.human_session_issuer.as_ref().ok_or_else(|| {
                     EdgeError::Unavailable(
                         "human login verified, but the session issuer is unavailable".into(),
@@ -1323,6 +1324,24 @@ impl Gateway {
                 ))
             }
             Err(_) => Err(EdgeError::Unauthorized("login failed".into())),
+        }
+    }
+
+    /// A person who signs in with SSO joins their organization as a member the first time. A
+    /// failure is logged, not fatal: it costs them a role, not their sign-in.
+    fn enrol_signed_in_person(&self, principal: &Principal) {
+        let (Some(accounts), PrincipalKind::Human) = (&self.accounts, &principal.kind) else {
+            return;
+        };
+        if let Err(error) = accounts.enrol_member(principal) {
+            eprintln!(
+                "{}",
+                json!({
+                    "event": "edge.accounts.sso_enrolment_failed",
+                    "principal_id": principal.principal_id.0,
+                    "error": error.to_string(),
+                })
+            );
         }
     }
 

@@ -436,6 +436,8 @@ services:
       --issues-project 20aee030-c7fa-4757-8243-700faf528690
       --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 --issues-prefix MYL --ttl-days 1)";
       test -n "$token";
+      cargo run --quiet -p myelin-edge --bin edge -- role
+      --tenant "$MYELIN_DEV_TENANT" --principal developer --role owner;
       export MYELIN_DEV_ACCESS_TOKEN="$token";
       exec pnpm --dir frontend --filter @myelin/web exec vinxi dev --host 127.0.0.1'
     environment:
@@ -605,7 +607,7 @@ scripts:
       export MYELIN_BROWSER_REVIEWER_EDGE_TOKEN="$browser_reviewer_token";
       invite_email="account-$(date +%s)-$$@myelin.test";
       invite_url="$(cargo run --quiet -p myelin-edge --bin edge -- invite
-      --tenant "$MYELIN_BROWSER_TENANT" --email "$invite_email")";
+      --tenant "$MYELIN_BROWSER_TENANT" --email "$invite_email" --role owner)";
       test -n "$invite_url";
       export MYELIN_BROWSER_INVITE_EMAIL="$invite_email" MYELIN_BROWSER_INVITE_URL="$invite_url";
       pnpm --dir frontend --filter @myelin/web exec playwright test

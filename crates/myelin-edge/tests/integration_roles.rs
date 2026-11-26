@@ -1,17 +1,27 @@
 #![cfg(feature = "integration")]
 
 //! Roles against the real database, where a black-box test cannot reach: two role changes racing
-//! for the last owner, and the migration that gives existing people their roles.
+//! for the last owner, the migration that gives existing people their roles, erasure (which no
+//! public endpoint performs), and SSO sign-in (which the system tests have no identity provider
+//! for).
 
 use myelin_config::{Mode, MyelinConfig};
+use myelin_edge::accounts::MemberInvitation;
 use myelin_edge::accounts::{Acceptance, Checkpoint};
-use myelin_edge::{account_migrations, AccountError, AccountKeys, AccountService, OrgRole};
-use myelin_identity::Principal;
-use myelin_identity_service::PrincipalStore;
-use myelin_storage::{
-    all_durable_migrations, identity_durable_migrations, DurableKmsBacking,
-    DurablePrincipalBacking, HotTables, PgBootstrap, SealKey,
+use myelin_edge::{
+    account_migrations, AccountError, AccountKeys, AccountService, AllowAll, EdgeRequest, Gateway,
+    OrgRole,
 };
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_identity_service::{
+    CapabilityAuthenticator, CellTokenAuthority, CredentialVerifier, HumanSsoAuthenticator,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, VerifiedAssertion,
+};
+use myelin_storage::{
+    all_durable_migrations, identity_durable_migrations, with_tenant_tx, DurableKmsBacking,
+    DurablePrincipalBacking, HotTables, PgBootstrap, SealKey, SubstrateProvider, TenantScope,
+};
+use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, Row};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -31,7 +41,17 @@ fn unique(prefix: &str) -> String {
     )
 }
 
+struct Cell {
+    provider: SubstrateProvider,
+    principals: PrincipalStore,
+    accounts: AccountService,
+}
+
 async fn accounts() -> AccountService {
+    cell().await.accounts
+}
+
+async fn cell() -> Cell {
     let config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
     let bootstrap = PgBootstrap::connect(config, 8).await.expect("connect");
     bootstrap.migrate_foundation().await.expect("foundation");
@@ -56,14 +76,19 @@ async fn accounts() -> AccountService {
         DurablePrincipalBacking::new(provider.clone()),
         tokio::runtime::Handle::current(),
     );
-    AccountService::new(
+    let accounts = AccountService::new(
         provider.db_pool().clone(),
-        principals,
+        principals.clone(),
         AccountKeys::derive(&seal),
         provider.config().region.clone(),
         Some("https://myelin.example".into()),
         tokio::runtime::Handle::current(),
-    )
+    );
+    Cell {
+        provider,
+        principals,
+        accounts,
+    }
 }
 
 async fn owner(accounts: &AccountService, tenant: &str, name: &str) -> Principal {
@@ -76,17 +101,58 @@ async fn owner(accounts: &AccountService, tenant: &str, name: &str) -> Principal
         )
         .await
         .unwrap();
-    let code = link.url.rsplit_once("/join/").unwrap().1.to_string();
+    accept(accounts, &link.url, name).unwrap()
+}
+
+fn accept(accounts: &AccountService, url: &str, name: &str) -> Result<Principal, AccountError> {
+    let code = url.rsplit_once("/join/").unwrap().1;
     accounts
         .accept(
-            &code,
+            code,
             Acceptance {
                 display_name: Some(name.into()),
                 password: "correct horse battery".into(),
             },
         )
-        .unwrap()
-        .principal
+        .map(|signed_in| signed_in.principal)
+}
+
+/// With mail off, an invitation's link comes back to the inviter.
+fn link_from(
+    accounts: &AccountService,
+    inviter: &Principal,
+    email: &str,
+) -> Result<String, AccountError> {
+    match accounts.invite_member(inviter, email, OrgRole::Member)? {
+        MemberInvitation::HandedOver(issued) => Ok(issued.url),
+        MemberInvitation::Emailed { .. } => panic!("mail is off"),
+    }
+}
+
+/// Records what an erasure records: a permanent principal-wide revocation, which disables them.
+async fn erase(provider: &SubstrateProvider, person: &Principal) {
+    let handle = person.principal_id.0.clone();
+    with_tenant_tx(
+        provider.db_pool(),
+        &person.tenant.0,
+        &person.region.0,
+        move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO revocation (tenant_id, region, kind, handle, revoked_at) \
+                     VALUES (current_setting('myelin.tenant_id'), current_setting('myelin.region'), \
+                             'principal', $1, '2026-11-26T00:00:00Z')",
+                )
+                .bind(&handle)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// A copy of `accounts` that stops inside its first role change, once both roles are read and
@@ -233,6 +299,12 @@ async fn the_roles_migration_makes_each_organizations_earliest_active_person_its
         .find(|migration| migration.id == "0012_principal")
         .expect("the principal table");
     schema.run(&principal.ddl).await;
+    let principal_rls = identity_durable_migrations()
+        .0
+        .into_iter()
+        .find(|migration| migration.id == "0013_principal_rls")
+        .expect("the principal table's row-level security");
+    schema.run(&principal_rls.ddl).await;
     let (before, roles): (Vec<_>, Vec<_>) = account_migrations()
         .0
         .into_iter()
@@ -332,4 +404,151 @@ async fn the_roles_migration_makes_each_organizations_earliest_active_person_its
         .all(|row| !row.get::<String, _>("id").is_empty()
             && row.get::<Option<Vec<u8>>, _>("roster_nonce").is_none()));
     schema.remove().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_erased_person_cannot_rejoin_and_an_erased_last_owner_leaves_no_owner() {
+    let cell = cell().await;
+    let accounts = &cell.accounts;
+    let tenant = unique("t-roles-erased");
+    let ada = owner(accounts, &tenant, "Ada").await;
+    let hopper = accept(
+        accounts,
+        &link_from(accounts, &ada, &format!("{}@example.com", unique("hopper"))).unwrap(),
+        "Hopper",
+    )
+    .unwrap();
+    let grace_email = format!("{}@example.com", unique("grace"));
+    let grace = accept(
+        accounts,
+        &link_from(accounts, &ada, &grace_email).unwrap(),
+        "Grace",
+    )
+    .unwrap();
+
+    // Removed, Grace may be invited back; erased before she accepts, she may not come back.
+    accounts.remove_member(&ada, &grace.principal_id.0).unwrap();
+    let back = link_from(accounts, &ada, &grace_email).unwrap();
+    erase(&cell.provider, &grace).await;
+    assert_eq!(
+        accept(accounts, &back, "Grace").unwrap_err(),
+        AccountError::PersonErased
+    );
+    assert_eq!(
+        link_from(accounts, &ada, &grace_email).unwrap_err(),
+        AccountError::AccountExists,
+        "an erased person's address is never invited again"
+    );
+
+    // Erasing the only owner is not blocked; the organization says it has none.
+    assert_eq!(accounts.roster(&hopper).unwrap().owners, 1);
+    erase(&cell.provider, &ada).await;
+    assert_eq!(accounts.roster(&hopper).unwrap().owners, 0);
+}
+
+/// Verifies any OIDC assertion as one fixed subject in one organization.
+struct FixedOidcSubject {
+    tenant: String,
+    region: String,
+}
+
+impl CredentialVerifier for FixedOidcSubject {
+    fn verify(
+        &self,
+        _credential: &myelin_identity::Credential,
+    ) -> myelin_identity::Result<VerifiedAssertion> {
+        Ok(VerifiedAssertion {
+            tenant: TenantId(self.tenant.clone()),
+            region: Region(self.region.clone()),
+            scheme: myelin_identity_service::scheme::OIDC.into(),
+            subject_key: "oidc-subject".into(),
+            expires_at_unix: None,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_signing_in_with_sso_becomes_a_member_once() {
+    let cell = cell().await;
+    let tenant = unique("t-roles-sso");
+    let region = cell.provider.config().region.clone();
+    let person = Principal::new(
+        TenantId(tenant.clone()),
+        Region(region.clone()),
+        PrincipalId(unique("sso-person")),
+        PrincipalKind::Human,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let scope = TenantScope::from_verified_token(&person, Region(region.clone()));
+    cell.principals
+        .put_principal(
+            &scope,
+            person.principal_id.clone(),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+            None,
+        )
+        .unwrap();
+    cell.principals
+        .link_credential(
+            &scope,
+            myelin_identity_service::scheme::OIDC,
+            "oidc-subject",
+            &person.principal_id,
+        )
+        .unwrap();
+    let authority = Arc::new(CellTokenAuthority::generate());
+    let gateway = Gateway::builder(
+        Arc::new(CapabilityAuthenticator::with_verifier(
+            cell.principals.clone(),
+            Arc::new(PasetoCapabilityVerifier::new(authority.trust_anchor())),
+            RevocationStore::new(),
+        )),
+        Arc::new(HumanSsoAuthenticator::with_verifier(
+            cell.principals.clone(),
+            Arc::new(FixedOidcSubject {
+                tenant: tenant.clone(),
+                region,
+            }),
+        )),
+        Arc::new(AllowAll),
+    )
+    .with_human_session_issuer(authority)
+    .with_accounts(cell.accounts.clone())
+    .build();
+    let sign_in = || {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "scheme": "oidc",
+            "material": "an id token",
+            "nonce": "A".repeat(43),
+        }))
+        .unwrap();
+        let gateway = &gateway;
+        tokio::task::block_in_place(|| {
+            gateway.handle(EdgeRequest::new("POST", "/v1/auth/login", "", vec![], body))
+        })
+    };
+
+    assert_eq!(cell.accounts.role_of(&person).unwrap(), None);
+    assert_eq!(sign_in().status(), 200);
+    assert_eq!(
+        cell.accounts.role_of(&person).unwrap(),
+        Some(OrgRole::Member)
+    );
+    // A later sign-in leaves the role they were given alone.
+    cell.accounts
+        .operator_set_role(
+            &tenant,
+            myelin_edge::OperatorTarget::Principal(&person.principal_id.0),
+            OrgRole::Admin,
+        )
+        .await
+        .unwrap();
+    assert_eq!(sign_in().status(), 200);
+    assert_eq!(
+        cell.accounts.role_of(&person).unwrap(),
+        Some(OrgRole::Admin)
+    );
 }

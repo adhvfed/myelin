@@ -132,6 +132,10 @@ pub enum AccountError {
     LastOwner,
     /// No active person in the organization has this id.
     NoSuchMember,
+    /// A pending invitation for the address grants a role the inviter could not grant.
+    InvitationExists,
+    /// The address belongs to a person who was erased, who cannot join again.
+    PersonErased,
     Unavailable(String),
 }
 
@@ -176,6 +180,11 @@ impl core::fmt::Display for AccountError {
             }
             Self::LastOwner => formatter.write_str("an organization must keep at least one owner"),
             Self::NoSuchMember => formatter.write_str("no such person in this organization"),
+            Self::InvitationExists => formatter.write_str(
+                "this address already has a pending invitation that only an owner can replace",
+            ),
+            Self::PersonErased => formatter
+                .write_str("this address belonged to a person who was erased and cannot rejoin"),
             Self::Unavailable(detail) => write!(formatter, "accounts are unavailable: {detail}"),
         }
     }
@@ -237,6 +246,15 @@ pub struct RosterView {
     pub viewer: OrgRole,
     pub people: Vec<MemberView>,
     pub invitations: Option<Vec<PendingInvitation>>,
+    /// Active owners; zero only when the last was erased or revoked outside the roster.
+    pub owners: i64,
+}
+
+/// Whom `edge role` names.
+#[derive(Clone, Copy, Debug)]
+pub enum OperatorTarget<'a> {
+    Email(&'a str),
+    Principal(&'a str),
 }
 
 /// A member's invitation: emailed to the invitee when mail is on, otherwise handed to the
@@ -823,6 +841,17 @@ impl AccountService {
             .ok_or_else(|| {
                 AccountError::Unavailable("a stored invitation does not match its link".into())
             })?;
+        // A member's link holds only while they could still send it; accepting checks again.
+        if let (Some(inviter), Some(role)) = (&invitation.invited_by, invitation.role) {
+            let still_may = self
+                .store
+                .role_of(&invitation.tenant, &invitation.region, inviter)
+                .await?
+                .is_some_and(|inviter| inviter.may_grant(role));
+            if !still_may {
+                return Err(AccountError::InvitationNotFound);
+            }
+        }
         Ok(LiveLink {
             code,
             invitation,
@@ -850,11 +879,26 @@ impl AccountService {
         let password = Password::new(acceptance.password)?;
         // The common conflict is answered before a hash or a key is made for it.
         let digest = live.invitation.email_digest;
-        if self
-            .block(async { Ok(self.store.account(&digest).await?) })?
-            .is_some()
-        {
-            return Err(AccountError::AccountExists);
+        let existing = self.block(async { Ok(self.store.account(&digest).await?) })?;
+        if let Some(account) = existing {
+            let invitation = &live.invitation;
+            if account.tenant != invitation.tenant || account.region != invitation.region {
+                return Err(AccountError::AccountExists);
+            }
+            // A removed person invited back keeps who they were and chooses a new password.
+            let password_phc = self.hashing(|| password.hash())?;
+            let outcome = self.block(async {
+                Ok(self
+                    .store
+                    .accept_rejoin(
+                        &live.code.digest(),
+                        invitation,
+                        &account.principal_id,
+                        password_phc,
+                    )
+                    .await?)
+            })?;
+            return self.signed_in_after(invitation, outcome);
         }
         let password_phc = self.hashing(|| password.hash())?;
         let scope = scope_for(&live.invitation.tenant, &live.invitation.region);
@@ -966,6 +1010,7 @@ impl AccountService {
             }
             AcceptOutcome::Gone => Err(AccountError::InvitationNotFound),
             AcceptOutcome::EmailTaken => Err(AccountError::AccountExists),
+            AcceptOutcome::Erased => Err(AccountError::PersonErased),
         }
     }
 
@@ -1345,7 +1390,28 @@ impl AccountService {
             IssueOutcome::AccountExists => Err(AccountError::AccountExists),
             IssueOutcome::NoSuchAccount => Err(AccountError::NoSuchAccount),
             IssueOutcome::NotAllowed => Err(AccountError::RoleRequired),
+            IssueOutcome::InvitationExists => Err(AccountError::InvitationExists),
         }
+    }
+
+    /// A person who signed in another way (SSO) becomes a member, if they have no role yet.
+    pub fn enrol_member(&self, person: &Principal) -> Result<(), AccountError> {
+        self.block(async {
+            Ok(self
+                .store
+                .enrol_member(&person.tenant.0, &person.region.0, &person.principal_id.0)
+                .await?)
+        })
+    }
+
+    /// The role an operator's join link grants unless they choose: owner for an organization's
+    /// first person, member after that.
+    pub async fn operator_default_role(&self, tenant: &str) -> Result<OrgRole, AccountError> {
+        Ok(if self.store.has_people(tenant, &self.region).await? {
+            OrgRole::Member
+        } else {
+            OrgRole::Owner
+        })
     }
 
     /// The person's role in their organization; `None` unless they are an active member.
@@ -1405,10 +1471,22 @@ impl AccountService {
                 })
                 .collect()
         });
+        if roster.owners == 0 {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "edge.accounts.organization_without_owner",
+                    "tenant": tenant,
+                    "region": region,
+                    "recovery": "edge role --tenant T --email E --role owner",
+                })
+            );
+        }
         Ok(RosterView {
             viewer: roster.viewer,
             people,
             invitations,
+            owners: roster.owners,
         })
     }
 
@@ -1459,22 +1537,25 @@ impl AccountService {
         roster_result(outcome, AccountError::InvitationNotFound)
     }
 
-    /// The operator gives the person with `email` in `tenant` a role, as an owner could. The
-    /// organization still keeps an owner: promote another before demoting the last.
+    /// The operator gives a person in `tenant` a role, as an owner could; an active person with
+    /// no role yet (one who signs in another way) gets one. The organization still keeps an
+    /// owner: promote another before demoting the last.
     pub async fn operator_set_role(
         &self,
         tenant: &str,
-        email: &str,
+        target: OperatorTarget<'_>,
         role: OrgRole,
     ) -> Result<(), AccountError> {
-        let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
-        let digest = self.digester.digest(&email);
-        let Some(principal_id) = self
-            .store
-            .principal_by_email(tenant, &self.region, &digest)
-            .await?
-        else {
-            return Err(AccountError::NoSuchAccount);
+        let principal_id = match target {
+            OperatorTarget::Principal(id) => id.to_string(),
+            OperatorTarget::Email(email) => {
+                let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
+                let digest = self.digester.digest(&email);
+                self.store
+                    .principal_by_email(tenant, &self.region, &digest)
+                    .await?
+                    .ok_or(AccountError::NoSuchAccount)?
+            }
         };
         let outcome = self
             .store

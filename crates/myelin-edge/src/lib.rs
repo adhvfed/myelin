@@ -60,7 +60,8 @@ mod workspace_ssh_http;
 
 pub use accounts::http::{invitation_handler, register_members};
 pub use accounts::{
-    account_migrations, AccountError, AccountKeys, AccountService, OrgRole, SignedIn,
+    account_migrations, AccountError, AccountKeys, AccountService, OperatorTarget, OrgRole,
+    SignedIn,
 };
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{
