@@ -1366,3 +1366,83 @@ async fn woken(wake: &myelin_storage::work_wake::WorkWake) -> bool {
         .await
         .is_ok()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trigger_wake_too_long_once_escaped_never_fails_the_write() {
+    use myelin_storage::work_wake::WORK_WAKE_CHANNEL;
+    use sqlx::postgres::PgListener;
+
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(app_config(), 4).await.unwrap();
+    // Each control byte escapes to `\u0001` in JSON: 9,000 bytes, past the 8,000-byte
+    // notification limit, while the raw identifier stays short.
+    let tenant = format!("{}{}", unique_tenant(), "\u{1}".repeat(1_500));
+    let human = serde_json::to_string(&PrincipalKind::Human).unwrap();
+    let controller = serde_json::to_string(&DataRole::Controller).unwrap();
+    let active = serde_json::to_string(&PrincipalStatus::Active).unwrap();
+    let suspended = serde_json::to_string(&PrincipalStatus::Suspended).unwrap();
+    let region = app.config().region.clone();
+    let scoped = (tenant.clone(), region.clone());
+    app.with_tenant_tx(&tenant, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO principal (tenant_id, region, principal_id, kind, data_role, status) \
+                 VALUES ($1, $2, 'founder', $3, $4, $5)",
+            )
+            .bind(&scoped.0)
+            .bind(&scoped.1)
+            .bind(&human)
+            .bind(&controller)
+            .bind(&active)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("seed a principal in a tenant with a long escaped identifier");
+
+    let mut listener = PgListener::connect_with(app.db_pool()).await.unwrap();
+    listener.listen(WORK_WAKE_CHANNEL).await.unwrap();
+    let schema: String = sqlx::query_scalar("SELECT current_schema()::text")
+        .fetch_one(app.db_pool())
+        .await
+        .unwrap();
+
+    let scoped = tenant.clone();
+    app.with_tenant_tx(&tenant, move |conn| {
+        Box::pin(async move {
+            sqlx::query("UPDATE principal SET status = $2 WHERE tenant_id = $1")
+                .bind(&scoped)
+                .bind(&suspended)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("the wake trigger never fails the write it observes");
+
+    let expected = serde_json::json!([schema, "all"]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut seen = false;
+    while let Ok(Ok(notification)) = tokio::time::timeout_at(deadline, listener.recv()).await {
+        let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+        if payload == expected {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the oversized wake falls back to waking everyone");
+    drop(listener);
+    clean_tenant(&app, &tenant).await;
+}

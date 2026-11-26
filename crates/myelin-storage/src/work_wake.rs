@@ -31,6 +31,10 @@ pub const WORK_WAKE_CHANNEL: &str = "myelin_work_wake";
 /// How often the listener proves its connection is alive, and how long that may take.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long connecting and subscribing may take together.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a loop reports a read that keeps failing.
+const FAILURE_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Wakes the agent-trigger loops of a tenant when a firing changes state, or when a binding or
 /// principal changes status (a queued firing waits for its binding, owner and agent to be
@@ -114,11 +118,69 @@ pub fn agent_trigger_work_wake_migrations() -> Migrations {
     ])
 }
 
-/// `interval` spread by ±20%, so loops started together do not re-check together.
+/// `interval` spread by ±20%, so loops started together do not re-check together. Intervals
+/// above a day are treated as a day.
 pub fn jittered(interval: Duration) -> Duration {
+    let interval = interval.min(Duration::from_secs(86_400));
     let random = RandomState::new().build_hasher().finish();
     let factor = 0.8 + 0.4 * (random as f64 / u64::MAX as f64);
     interval.mul_f64(factor)
+}
+
+/// Retry pacing and log throttling for an idle loop's deadline read that keeps failing: the
+/// retry delay doubles from `first` up to `max`, and failures are reported at most once a
+/// minute, with how many happened since the last report.
+#[derive(Debug)]
+pub struct FailingRead {
+    first: Duration,
+    max: Duration,
+    next: Duration,
+    unreported: u64,
+    last_report: Option<tokio::time::Instant>,
+}
+
+/// What a loop should do after a failed read.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadFailure {
+    /// How long to wait before reading again.
+    pub retry_after: Duration,
+    /// `Some(failures)` when this failure should be logged, counting it and every failure
+    /// since the last report.
+    pub report: Option<u64>,
+}
+
+impl FailingRead {
+    pub fn new(first: Duration, max: Duration) -> Self {
+        Self {
+            first,
+            max: max.max(first),
+            next: first,
+            unreported: 0,
+            last_report: None,
+        }
+    }
+
+    pub fn failed(&mut self) -> ReadFailure {
+        let retry_after = self.next;
+        self.next = self.next.saturating_mul(2).min(self.max);
+        self.unreported += 1;
+        let now = tokio::time::Instant::now();
+        let due = self
+            .last_report
+            .is_none_or(|last| now.duration_since(last) >= FAILURE_REPORT_INTERVAL);
+        let report = due.then(|| {
+            self.last_report = Some(now);
+            std::mem::take(&mut self.unreported)
+        });
+        ReadFailure {
+            retry_after,
+            report,
+        }
+    }
+
+    pub fn succeeded(&mut self) {
+        self.next = self.first;
+    }
 }
 
 /// One loop's wake-up. Wakes that arrive while the loop is busy are kept (at most one), so a
@@ -346,17 +408,24 @@ fn wake(loops: &Loops, tenant: &str) {
 /// Subscribes on its own one-connection pool, so listening never holds a slot of the pool
 /// the workers claim through.
 async fn subscribe(listen: &PgConnectOptions) -> Result<PgListener, sqlx::Error> {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .idle_timeout(None)
-        .max_lifetime(None)
-        .acquire_timeout(LIVENESS_TIMEOUT)
-        .connect_with(listen.clone())
-        .await?;
-    let mut listener = PgListener::connect_with(&pool).await?;
-    listener.ignore_pool_close_event(true);
-    listener.listen(WORK_WAKE_CHANNEL).await?;
-    Ok(listener)
+    let subscribing = async {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .acquire_timeout(LIVENESS_TIMEOUT)
+            .connect_with(listen.clone())
+            .await?;
+        let mut listener = PgListener::connect_with(&pool).await?;
+        listener.ignore_pool_close_event(true);
+        // A lost connection ends this listener; `run` subscribes afresh and wakes every loop.
+        listener.eager_reconnect(false);
+        listener.listen(WORK_WAKE_CHANNEL).await?;
+        Ok(listener)
+    };
+    tokio::time::timeout(SUBSCRIBE_TIMEOUT, subscribing)
+        .await
+        .unwrap_or(Err(sqlx::Error::PoolTimedOut))
 }
 
 fn decode(schema: &str, region: &str, payload: &str) -> Option<Wake> {
@@ -462,6 +531,41 @@ mod tests {
         assert!(woken(&acme_claims).await);
         assert!(woken(&acme_reconciliation).await);
         assert!(!woken(&acme_3).await);
+    }
+
+    #[test]
+    fn huge_intervals_jitter_without_overflowing() {
+        assert!(jittered(Duration::MAX) <= Duration::from_secs(86_400 * 6 / 5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_read_backs_off_and_reports_once_a_minute() {
+        let mut read = FailingRead::new(Duration::from_millis(250), Duration::from_secs(5));
+        let delays: Vec<_> = (0..6).map(|_| read.failed().retry_after).collect();
+        assert_eq!(
+            delays,
+            [250, 500, 1_000, 2_000, 4_000, 5_000].map(Duration::from_millis)
+        );
+
+        let mut read = FailingRead::new(Duration::from_millis(250), Duration::from_secs(5));
+        assert_eq!(
+            read.failed().report,
+            Some(1),
+            "the first failure is reported"
+        );
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            assert_eq!(read.failed().report, None, "then held back for a minute");
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            read.failed().report,
+            Some(11),
+            "with a count of what was held back"
+        );
+
+        read.succeeded();
+        assert_eq!(read.failed().retry_after, Duration::from_millis(250));
     }
 
     #[test]

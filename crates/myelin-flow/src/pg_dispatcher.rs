@@ -8,7 +8,7 @@ use crate::schema::{WfActivityAttemptRow, WfHistoryRow};
 use crate::{PgFlowExecutor, TimerStore, WfCtx};
 use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, Timestamp, Ulid};
 use myelin_refs::ArtifactRef;
-use myelin_storage::work_wake::{jittered, WorkWake};
+use myelin_storage::work_wake::{jittered, FailingRead, WorkWake};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -821,6 +821,7 @@ impl PgFlowWorker {
                 "runtime pacing and batch bound must be positive and bounded".into(),
             ));
         }
+        let mut deadline_reads = FailingRead::new(pacing.busy, pacing.max_idle);
         loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -832,7 +833,7 @@ impl PgFlowWorker {
             let pause = if batch.saturated {
                 pacing.busy
             } else {
-                self.idle_pause(pacing).await
+                self.idle_pause(pacing, &mut deadline_reads).await
             };
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -844,7 +845,7 @@ impl PgFlowWorker {
         }
     }
 
-    async fn idle_pause(&self, pacing: IdlePacing) -> Duration {
+    async fn idle_pause(&self, pacing: IdlePacing, reads: &mut FailingRead) -> Duration {
         if pacing.max_idle <= pacing.busy {
             return pacing.busy;
         }
@@ -855,13 +856,20 @@ impl PgFlowWorker {
             .partition_deadlines(self.scope.partition, &definitions)
             .await
         {
-            Ok(deadlines) => deadlines,
+            Ok(deadlines) => {
+                reads.succeeded();
+                deadlines
+            }
             Err(error) => {
-                eprintln!(
-                    "flow worker {} partition {}: deadline read failed; re-checking after {:?}: {error}",
-                    self.scope.tenant.0, self.scope.partition, pacing.busy,
-                );
-                return pacing.busy;
+                let failure = reads.failed();
+                if let Some(failures) = failure.report {
+                    eprintln!(
+                        "flow worker {} partition {}: {failures} deadline read(s) failed since \
+                         the last report; re-checking after {:?}: {error}",
+                        self.scope.tenant.0, self.scope.partition, failure.retry_after,
+                    );
+                }
+                return failure.retry_after;
             }
         };
         let now_ms = chrono::Utc::now().timestamp_millis();

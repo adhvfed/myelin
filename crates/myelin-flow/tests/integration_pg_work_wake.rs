@@ -68,11 +68,8 @@ impl Stack {
             .after_connect(move |conn, _| {
                 let pinned = pinned.clone();
                 Box::pin(async move {
-                    conn.execute(
-                        format!("SET search_path TO {pinned}, public; SET application_name TO '{pinned}'")
-                            .as_str(),
-                    )
-                    .await?;
+                    conn.execute(format!("SET search_path TO {pinned}, public").as_str())
+                        .await?;
                     Ok(())
                 })
             })
@@ -127,7 +124,11 @@ impl Stack {
     fn listen(&self) -> PgConnectOptions {
         (*self.pool.connect_options())
             .clone()
-            .application_name(&self.schema)
+            .application_name(&self.listener_name())
+    }
+
+    fn listener_name(&self) -> String {
+        format!("{}-wake", self.schema)
     }
 
     /// Runs one process: a listener and the given workers, each on its own partition wake.
@@ -162,10 +163,9 @@ impl Stack {
 
     async fn terminate_listener(&self) {
         let terminated: Vec<bool> = sqlx::query_scalar(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-              WHERE application_name = $1 AND query ILIKE 'LISTEN%'",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1",
         )
-        .bind(&self.schema)
+        .bind(self.listener_name())
         .fetch_all(&self.bare)
         .await
         .expect("terminate the listener connection");
@@ -673,9 +673,9 @@ async fn a_payload_too_long_once_escaped_wakes_everyone_and_never_fails_the_writ
     let mut listener = PgListener::connect_with(&stack.pool).await.unwrap();
     listener.listen(WORK_WAKE_CHANNEL).await.unwrap();
 
-    // 1,300 raw bytes pass any raw-length guard, but each escapes to `\u0001` in JSON:
-    // ~7.8kB, past what one notification carries.
-    let tenant = "\u{1}".repeat(1_300);
+    // 1,500 raw bytes pass a raw-length guard, but each escapes to `\u0001` in JSON: 9,000
+    // bytes, past PostgreSQL's 8,000-byte notification limit, so notifying it would raise.
+    let tenant = "\u{1}".repeat(1_500);
     sqlx::query(
         "INSERT INTO workflow_run \
            (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor, budget, \

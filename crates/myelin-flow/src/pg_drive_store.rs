@@ -405,7 +405,9 @@ impl PgFlowDriveStore {
     }
 
     /// When this partition next has work that no write will announce, counting only work its
-    /// claims can take: the earliest lease on a run of one of `definitions` that can expire,
+    /// claims can take: the earliest lease that can expire on a run of one of `definitions`
+    /// that is running, or waiting with an unconsumed signal it waits for (as
+    /// `claim_stranded_signal_wait` requires),
     /// and the earliest unfired timer whose run is not held by a live lease (that lease's
     /// release notifies, and its expiry is counted when it is one of `definitions`).
     pub async fn partition_deadlines(
@@ -434,7 +436,16 @@ impl PgFlowDriveStore {
                               AND run.partition = $3 AND run.state = 'waiting' \
                               AND run.lease_expires IS NOT NULL \
                               AND (run.wf_type, run.wf_version) IN \
-                                  (SELECT * FROM unnest($4::text[], $5::integer[])))\
+                                  (SELECT * FROM unnest($4::text[], $5::integer[])) \
+                              AND EXISTS (\
+                                SELECT 1 FROM wf_signal AS sig \
+                                JOIN wf_history AS h ON h.tenant_id = run.tenant_id \
+                                  AND h.region = run.region AND h.run_id = run.run_id \
+                                  AND h.kind = 'signal_waited' \
+                                WHERE sig.tenant_id = run.tenant_id AND sig.region = run.region \
+                                  AND sig.run_id = run.run_id AND sig.consumed_seq IS NULL \
+                                  AND h.result @> jsonb_build_array($6 || sig.signal_name, \
+                                                                    $7 || sig.idem_key)))\
                         ) - clock_timestamp())) * 1000)::bigint AS lease_ms, \
                        (SELECT ceil(EXTRACT(EPOCH FROM min(timer.fire_at)))::bigint \
                           FROM wf_timer AS timer \
@@ -452,6 +463,8 @@ impl PgFlowDriveStore {
                 .bind(partition)
                 .bind(&wf_types)
                 .bind(&wf_versions)
+                .bind(WAIT_EXPECTED_NAME_PREFIX)
+                .bind(WAIT_EXPECTED_IDEM_PREFIX)
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(|e| db("read partition deadlines", e))?;

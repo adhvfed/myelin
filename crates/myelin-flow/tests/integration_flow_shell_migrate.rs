@@ -63,8 +63,8 @@ async fn flow_shell_migration_set_applies_against_live_postgres() {
     assert_eq!(spec.name, SERVICE_NAME);
     assert_eq!(
         spec.migrations.0.len(),
-        15,
-        "six table creates, six online workflow control/drive/repair expands (incl. the concurrent-index validation), the work wake and its timer index"
+        16,
+        "six table creates, six online workflow control/drive/repair expands (incl. the concurrent-index validation), the work wake, its timer index and the scoped-index validation"
     );
 
     let schema = format!("flow_shell_probe_{}", std::process::id());

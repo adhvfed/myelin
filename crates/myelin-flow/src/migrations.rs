@@ -245,6 +245,43 @@ pub const WF_TIMER_SCOPED_DUE_INDEX_DDL: &str = "\
 CREATE INDEX CONCURRENTLY IF NOT EXISTS wf_timer_scoped_due \
 ON wf_timer (tenant_id, region, partition, fire_at) WHERE NOT fired";
 
+/// Refuses to continue over an invalid concurrent build of the scoped runnable and timer
+/// indexes (`CREATE INDEX CONCURRENTLY IF NOT EXISTS` skips an existing invalid index), the
+/// same guard flow_0012 gives `wf_waiting_repair`. A concurrent rebuild cannot run inside a
+/// migration's transaction, so the operator repairs it as the message says.
+pub const VALIDATE_SCOPED_DRIVE_INDEXES_DDL: &str = "\
+DO $myelin$
+DECLARE
+  required record;
+BEGIN
+  FOR required IN
+    SELECT * FROM (VALUES ('workflow_run', 'wf_runnable_scoped'),
+                          ('wf_timer', 'wf_timer_scoped_due')) AS wanted(table_name, index_name)
+  LOOP
+    IF NOT EXISTS (
+      SELECT 1
+        FROM pg_catalog.pg_index AS index_state
+        JOIN pg_catalog.pg_class AS index_relation
+          ON index_relation.oid = index_state.indexrelid
+        JOIN pg_catalog.pg_class AS table_relation
+          ON table_relation.oid = index_state.indrelid
+        JOIN pg_catalog.pg_namespace AS relation_namespace
+          ON relation_namespace.oid = table_relation.relnamespace
+       WHERE relation_namespace.nspname = current_schema()
+         AND table_relation.relname = required.table_name
+         AND table_relation.relkind = 'r'
+         AND index_relation.relnamespace = relation_namespace.oid
+         AND index_relation.relname = required.index_name
+         AND index_relation.relkind = 'i'
+         AND index_state.indisvalid
+         AND index_state.indisready
+    ) THEN
+      RAISE EXCEPTION '% on %.% is missing, invalid, or not ready; verify the index exists, then repair it with REINDEX INDEX CONCURRENTLY %.% before restarting', required.index_name, current_schema(), required.table_name, current_schema(), required.index_name;
+    END IF;
+  END LOOP;
+END
+$myelin$";
+
 const TABLE_DDLS: &[(&str, &str, &str, bool)] = &[
     (
         "flow_0001_workflow_run",
@@ -360,6 +397,12 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "wf_timer",
     ));
+    items.push(Migration::phased(
+        "flow_0016_validate_scoped_drive_indexes",
+        VALIDATE_SCOPED_DRIVE_INDEXES_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
     Migrations::of(items)
 }
 
@@ -377,9 +420,10 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            15,
+            16,
             "six-table data model, six online control/drive/repair expansions (incl. the \
-             concurrent-index validation), the commit-time work wake and its timer index"
+             concurrent-index validation), the commit-time work wake, its timer index and the \
+             scoped-index validation"
         );
         let mut runner = MigrationRunner::new();
         runner
@@ -403,6 +447,7 @@ mod tests {
                 "flow_0013_work_wake",
                 "flow_0014_work_wake_payload",
                 "flow_0015_wf_timer_scoped_due_index",
+                "flow_0016_validate_scoped_drive_indexes",
             ],
             "tables then online control expands, in order - 0 backward migration"
         );

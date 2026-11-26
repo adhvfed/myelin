@@ -16,7 +16,7 @@ use myelin_config::Mode;
 use myelin_events::{Actor, UlidMinter};
 use myelin_flow::{IdlePacing, PgFlowWorker, PgWorkerScope, PARTITION_COUNT};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
-use myelin_storage::work_wake::{jittered, WorkWake, WorkWakeHub};
+use myelin_storage::work_wake::{jittered, FailingRead, WorkWake, WorkWakeHub};
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, AgentTriggerClaimRequest,
     DurableAgentTriggerBacking, DurablePlacementBacking, HotTables, PgBootstrap, SubstrateProvider,
@@ -243,6 +243,7 @@ async fn run_trigger_handoffs(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut backoff = PollBackoff::new(Duration::from_millis(100), Duration::from_secs(5));
+    let mut expiry_reads = FailingRead::new(BUSY_POLL, MAX_IDLE);
     let mut pause = backoff.next_delay();
     let mut failing = false;
     loop {
@@ -275,13 +276,20 @@ async fn run_trigger_handoffs(
                 .next_claim_expiry_ms(&tenant.0, &claim_request)
                 .await
             {
-                Ok(expiry) => idle_pause(expiry),
+                Ok(expiry) => {
+                    expiry_reads.succeeded();
+                    idle_pause(expiry)
+                }
                 Err(error) => {
-                    eprintln!(
-                        "hosted-agent-worker: trigger claim expiry unavailable for tenant {}: {error}",
-                        tenant.0,
-                    );
-                    pause
+                    let failure = expiry_reads.failed();
+                    if let Some(failures) = failure.report {
+                        eprintln!(
+                            "hosted-agent-worker: {failures} trigger claim expiry read(s) failed \
+                             for tenant {} since the last report; re-checking after {:?}: {error}",
+                            tenant.0, failure.retry_after,
+                        );
+                    }
+                    failure.retry_after
                 }
             };
             continue;
