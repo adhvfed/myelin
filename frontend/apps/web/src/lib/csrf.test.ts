@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { refusesServerFunctionRead, requestMethodPolicy, sameOriginVerdict } from "./csrf";
+import {
+  refusesServerFunctionRead,
+  requestMethodPolicy,
+  routedPath,
+  sameOriginVerdict,
+} from "./csrf";
 
 const HOST = "app.myelin.dev";
 const ORIGIN = `https://${HOST}`;
@@ -95,31 +100,61 @@ describe("refusesServerFunctionRead", () => {
   const read = (overrides: Partial<Parameters<typeof refusesServerFunctionRead>[0]>) =>
     refusesServerFunctionRead({
       method: "GET",
-      pathname: "/_server/",
+      rawTarget: "/_server/?id=a&name=b",
       instance: "server-fn:3",
       fetchSite: "same-origin",
       ...overrides,
     });
+
+  // Every spelling h3 routes to the server-function handler.
+  const routedSpellings = [
+    "/_server?id=a&name=b",
+    "/_server/?id=a&name=b",
+    "/%5Fserver/?id=a&name=b",
+    "/%5fserver/?id=a&name=b",
+    "/_%73erver?id=a&name=b",
+    "/_serverx?id=a&name=b",
+    "/_server.json?id=a&name=b",
+    "/_server/x/?id=a&name=b",
+    "/_server/../?id=a&name=b",
+    "/_server%2F?id=a&name=b",
+    "/_server;x?id=a",
+  ];
+
+  it("decodes a path the way h3 does before routing it", () => {
+    expect(routedPath("/%5Fserver/?id=a")).toBe("/_server/");
+    expect(routedPath("/_%73erver")).toBe("/_server");
+    expect(routedPath("/_server%2Fx")).toBe("/_server%2Fx");
+    expect(routedPath("/bad%E0%A4%A")).toBe("/bad%E0%A4%A");
+  });
 
   it("lets the app's own query reads through", () => {
     expect(read({})).toBe(false);
     expect(read({ fetchSite: null })).toBe(false);
   });
 
-  it("refuses a read without SolidStart's header, as a cross-site link would make", () => {
-    for (const pathname of ["/_server", "/_server/", "/_server//"]) {
-      expect(read({ pathname, instance: null, fetchSite: "cross-site" })).toBe(true);
-      expect(read({ pathname, method: "head", instance: null, fetchSite: null })).toBe(true);
+  it("refuses every routed spelling without SolidStart's header, as a cross-site link sends", () => {
+    for (const rawTarget of routedSpellings) {
+      for (const method of ["GET", "head", "OPTIONS", "PUT"]) {
+        expect(read({ rawTarget, method, instance: null, fetchSite: "cross-site" }), rawTarget).toBe(
+          true,
+        );
+        expect(read({ rawTarget, method, instance: null, fetchSite: null }), rawTarget).toBe(true);
+      }
     }
   });
 
   it("refuses a read the browser says came from another site", () => {
-    expect(read({ fetchSite: "cross-site" })).toBe(true);
-    expect(read({ fetchSite: "same-site" })).toBe(true);
+    for (const rawTarget of routedSpellings) {
+      expect(read({ rawTarget, fetchSite: "cross-site" }), rawTarget).toBe(true);
+      expect(read({ rawTarget, fetchSite: "same-site" }), rawTarget).toBe(true);
+    }
   });
 
-  it("leaves POSTs (origin-checked) and other paths alone", () => {
+  it("leaves POSTs (origin-checked) and paths h3 routes elsewhere alone", () => {
     expect(read({ method: "POST", instance: null })).toBe(false);
-    expect(read({ pathname: "/profile", instance: null })).toBe(false);
+    for (const rawTarget of ["/profile", "/_Server/?id=a", "//_server/?id=a", "/api/_server"]) {
+      expect(read({ rawTarget, instance: null }), rawTarget).toBe(false);
+    }
   });
 });

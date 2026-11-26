@@ -336,15 +336,32 @@ test.describe("password and sessions", () => {
     await page.waitForURL("**/git/repos");
   });
 
+  for (const lost of ["malformed", "server_error"] as const) {
+    test(`a change whose answer is lost (${lost}) asks the person to sign in again`, async ({ page }) => {
+      await openProfileSignedIn(page);
+      await setEdgeConfig({ changePasswordAnswerLost: lost });
+      await changePassword(page, ADA.password, "a newer passphrase");
+      await page.waitForURL(/\/login\?signed_out=password_changed_maybe$/);
+      await expect(page.getByTestId("signed-out")).toHaveText(
+        "Your password may have changed. Sign in with your new password, or your old one if it didn't.",
+      );
+      await signIn(page, ADA.email, "a newer passphrase");
+      await page.waitForURL("**/git/repos");
+    });
+  }
+
   test("a cross-site link cannot run sign-out everywhere", async ({ page }) => {
     await openProfileSignedIn(page);
     await page.getByTestId("signout-everywhere").click();
     const action = await page.getByTestId("signout-everywhere-confirm").getAttribute("action");
     expect(action).toMatch(/\/_server\?id=/);
-    // A top-level GET carries the cookie, as a link from another site would. `/_server/` is the
-    // form SolidStart's handler serves reads at.
-    const response = await page.request.get(action!.replace("/_server?", "/_server/?"));
-    expect(response.status()).toBe(403);
+    // A top-level GET carries the cookie, as a link from another site would. h3 routes every one
+    // of these spellings to the server-function handler.
+    const query = action!.slice(action!.indexOf("?"));
+    for (const path of ["/_server/", "/%5Fserver/", "/_%73erver", "/_server/x", "/_serverx"]) {
+      const response = await page.request.get(`${path}${query}`, { maxRedirects: 0 });
+      expect(response.status(), path).toBe(403);
+    }
     expect(await signOuts()).toEqual([]);
     await page.reload();
     await expect(page.getByRole("heading", { level: 1, name: ADA.name })).toBeVisible();
@@ -363,31 +380,28 @@ test.describe("password and sessions", () => {
     await expect(page.getByTestId("signout-everywhere-error")).toHaveCount(0);
   });
 
-  test("without JavaScript no password ever reaches the flash cookie", async ({ browser }) => {
-    const context = await browser.newContext({ javaScriptEnabled: false });
-    const page = await context.newPage();
-    const flash = async () =>
-      (await context.cookies()).filter((cookie) => cookie.name === "flash").map((c) => c.value);
-
-    // Sign-in answers with a redirect, which SolidStart never flashes. (Accepting an invitation
-    // does too, and its page needs JavaScript to show the form at all.)
+  test("without JavaScript no password ever reaches the flash cookie", async ({ page, baseURL }) => {
+    // Sign-in answers a form post, as a browser without JavaScript sends it, with a redirect,
+    // which SolidStart never flashes. (Accepting an invitation does too.)
     await page.goto("/login");
-    await page.getByTestId("email-input").fill(ADA.email);
-    await page.getByTestId("password-input").fill("not the password");
-    await page.getByTestId("password-login").click();
-    await page.waitForURL(/error=credentials/);
-    expect(await flash()).toEqual([]);
+    await page.waitForLoadState("networkidle");
+    const action = await page.getByTestId("password-login-form").getAttribute("action");
+    const posted = await page.request.post(action!, {
+      form: { email: ADA.email, password: "not the password", return_to: "/git/repos" },
+      headers: { origin: baseURL! },
+      maxRedirects: 0,
+    });
+    expect(posted.status()).toBe(302);
+    expect(posted.headers()["set-cookie"] ?? "").not.toContain("flash=");
 
-    // The password form cannot be posted until the page is interactive.
-    await page.goto("/login");
-    await page.getByTestId("email-input").fill(ADA.email);
-    await page.getByTestId("password-input").fill(ADA.password);
-    await page.getByTestId("password-login").click();
+    // The password form cannot be posted until the page is interactive: every submit button the
+    // server renders for it, before any script runs, is disabled.
+    await signIn(page, ADA.email, ADA.password);
     await page.waitForURL("**/git/repos");
-    await page.goto("/profile");
-    await expect(page.getByRole("heading", { name: "Session security" })).toBeVisible();
-    await expect(page.locator('[data-testid="password-submit"]:not([disabled])')).toHaveCount(0);
-    await context.close();
+    const html = await (await page.request.get("/profile")).text();
+    const buttons = html.match(/<button[^>]*data-testid="password-submit"[^>]*>/g) ?? [];
+    expect(buttons.length, "the server renders the Password card").toBeGreaterThan(0);
+    for (const button of buttons) expect(button).toMatch(/\sdisabled(=|\s|>)/);
   });
 
   test("password errors point at the field they are about", async ({ page }) => {

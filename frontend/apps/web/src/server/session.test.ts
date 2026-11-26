@@ -20,7 +20,7 @@ vi.mock("./session-backend", () => ({
   sessionBackend: () => ({ kind: "memory" }),
 }));
 
-import { clearCurrentSession, issueSession, SESSION_COOKIE } from "./session";
+import { clearCurrentSession, clearRefusedSession, issueSession, SESSION_COOKIE } from "./session";
 
 const priorId = `sess_${"a".repeat(32)}`;
 const record = {
@@ -75,5 +75,43 @@ describe("request session lifecycle", () => {
       SESSION_COOKIE,
       expect.objectContaining({ httpOnly: true, path: "/", sameSite: "lax" }),
     );
+  });
+
+  it("clears the cookie of a refused session that is still the browser's", async () => {
+    store.delete.mockResolvedValueOnce(true);
+
+    await clearRefusedSession(priorId);
+
+    expect(store.delete).toHaveBeenCalledWith(priorId);
+    expect(http.deleteCookie).toHaveBeenCalledWith(
+      SESSION_COOKIE,
+      expect.objectContaining({ httpOnly: true, path: "/", sameSite: "lax" }),
+    );
+  });
+
+  it("leaves the cookie alone when the refused session was already replaced", async () => {
+    // A request that began before a password change rotated the session: its record is gone, and
+    // the browser holds the fresh session's cookie instead.
+    store.delete.mockResolvedValueOnce(false);
+
+    await clearRefusedSession(priorId);
+
+    expect(store.delete).toHaveBeenCalledWith(priorId);
+    expect(http.deleteCookie).not.toHaveBeenCalled();
+  });
+
+  it("still expires the cookie when the store cannot be reached", async () => {
+    store.delete.mockRejectedValueOnce(new Error("Valkey unavailable"));
+
+    await expect(clearRefusedSession(priorId)).rejects.toThrow("Valkey unavailable");
+
+    expect(http.deleteCookie).toHaveBeenCalled();
+  });
+
+  it("does nothing without a session id", async () => {
+    await clearRefusedSession(null);
+
+    expect(store.delete).not.toHaveBeenCalled();
+    expect(http.deleteCookie).not.toHaveBeenCalled();
   });
 });

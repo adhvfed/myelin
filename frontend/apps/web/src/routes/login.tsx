@@ -54,6 +54,9 @@ export default function Login() {
     if (params.signed_out === "password_changed") {
       return "Your password was changed. Sign in again.";
     }
+    if (params.signed_out === "password_changed_maybe") {
+      return "Your password may have changed. Sign in with your new password, or your old one if it didn't.";
+    }
     return "";
   };
   const returnTo = () => safeAuthReturnTo(params.return_to);

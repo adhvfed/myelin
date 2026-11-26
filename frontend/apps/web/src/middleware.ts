@@ -28,7 +28,10 @@ export default createMiddleware({
     if (
       refusesServerFunctionRead({
         method: event.request.method,
-        pathname: new URL(event.request.url).pathname,
+        rawTarget:
+          event.nativeEvent.node.req.originalUrl ??
+          event.nativeEvent.node.req.url ??
+          new URL(event.request.url).pathname,
         instance: event.request.headers.get("x-server-instance"),
         fetchSite: event.request.headers.get("sec-fetch-site"),
       })

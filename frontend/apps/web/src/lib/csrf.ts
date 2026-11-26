@@ -52,26 +52,45 @@ export function sameOriginVerdict(sig: OriginSignals): OriginVerdict {
   return "reject";
 }
 
-/** What a request to the server-function endpoint shows about where it came from. */
+/** What a request shows about whether it may reach a server function. */
 export interface ServerFunctionRead {
   method: string;
-  pathname: string;
+  /** The request target as sent, before any URL normalization (path and query). */
+  rawTarget: string;
   /** The `X-Server-Instance` header SolidStart's own client sends on every call. */
   instance: string | null;
   /** The browser's `Sec-Fetch-Site`, when it sends one. */
   fetchSite: string | null;
 }
 
+const SERVER_FUNCTION_MOUNT = "/_server";
+
+function decodeOnce(text: string): string {
+  try {
+    return decodeURIComponent(text);
+  } catch {
+    return text;
+  }
+}
+
+/** The path the way h3 routes it: percent-decoded once, except that an encoded slash stays
+ * encoded. h3 mounts the server-function handler on this path by plain prefix, with no segment
+ * boundary, so `/%5Fserver/`, `/_serverx`, and `/_server/x` all reach it. */
+export function routedPath(rawTarget: string): string {
+  const query = rawTarget.indexOf("?");
+  const path = query === -1 ? rawTarget : rawTarget.slice(0, query);
+  return decodeOnce(path.replace(/%25/g, "%2525").replace(/%2F/gi, "%252F"));
+}
+
 /**
- * SolidStart runs any server function, actions included, for `GET /_server?id=…&name=…`, and the
- * origin check above covers only unsafe methods. The app's own reads (router queries) are GETs
- * too, but always fetched with SolidStart's custom headers, which a cross-site link or form cannot
- * add. So a read there must carry `X-Server-Instance` and, when the browser says, be same-origin.
+ * SolidStart runs any server function, actions included, for a GET as well as a POST, and the
+ * origin check above covers only unsafe methods. The app's own reads (router queries) are GETs,
+ * but always fetched with SolidStart's custom headers, which a cross-site link or form cannot
+ * add. So anything but a POST that would reach the handler must carry `X-Server-Instance` and,
+ * when the browser says, be same-origin. POSTs keep the origin check.
  */
 export function refusesServerFunctionRead(read: ServerFunctionRead): boolean {
-  const method = read.method.toUpperCase();
-  if ((method !== "GET" && method !== "HEAD") || read.pathname.replace(/\/+$/, "") !== "/_server") {
-    return false;
-  }
+  if (read.method.toUpperCase() === "POST") return false;
+  if (!routedPath(read.rawTarget).startsWith(SERVER_FUNCTION_MOUNT)) return false;
   return !read.instance || (read.fetchSite !== null && read.fetchSite !== "same-origin");
 }

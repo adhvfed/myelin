@@ -374,6 +374,8 @@ export type PasswordChangeResult = { ok: true } | { ok: false; reason: AccountFa
 
 /** Where a browser goes when its password changed but its fresh session could not be installed. */
 const PASSWORD_CHANGED_DESTINATION = "/login?signed_out=password_changed";
+/** Where it goes when the edge's answer to a change was lost, so the change may or may not stand. */
+const PASSWORD_MAYBE_CHANGED_DESTINATION = "/login?signed_out=password_changed_maybe";
 
 /** Change the password while signed in. The edge ends every session the person held and answers
  * with a fresh one, which replaces this browser's. */
@@ -393,6 +395,11 @@ export const changePassword = action(
       const reason = accountFailure(error);
       // The gateway has already cleared the session the edge refused.
       if (reason === "signed_out") throw redirect(SIGNED_OUT_DESTINATION);
+      if (reason === "password_maybe_changed") {
+        // If the change was made, this browser's session ended with all the others.
+        await clearCurrentSession().catch(() => undefined);
+        throw redirect(PASSWORD_MAYBE_CHANGED_DESTINATION);
+      }
       return { ok: false, reason };
     }
     try {

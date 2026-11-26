@@ -99,6 +99,8 @@ const state = {
   // `whoamiFailsAfterPasswordChange` makes installing the fresh session fail after a change.
   changePasswordConflict: false,
   whoamiFailsAfterPasswordChange: false,
+  // After making a change, answer as a lost response would look: "malformed" or "server_error".
+  changePasswordAnswerLost: null,
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
@@ -466,6 +468,7 @@ function resetAccounts() {
   state.passwordChanges = 0;
   state.changePasswordConflict = false;
   state.whoamiFailsAfterPasswordChange = false;
+  state.changePasswordAnswerLost = null;
 }
 resetAccounts();
 
@@ -542,6 +545,10 @@ async function handleAccountRoute(req, res, method, path) {
     state.passwordChanges += 1;
     state.accessToken = `dev.access.rotated-${state.passwordChanges}`;
     if (state.whoamiFailsAfterPasswordChange) state.whoamiUnavailable = true;
+    if (state.changePasswordAnswerLost === "malformed") return send(res, 200, { access_token: 7 }), true;
+    if (state.changePasswordAnswerLost === "server_error") {
+      return send(res, 502, { error: { code: "bad_gateway", message: "upstream reset" } }), true;
+    }
     state.sentMail.push({ to: E2E_ACCOUNT.email, kind: "password_changed", url: `${WEB_ORIGIN}/login?help=password` });
     return send(res, 200, sessionGrant()), true;
   }
@@ -668,6 +675,9 @@ const server = createServer((req, res) => {
         if (typeof body.signOutUnavailable === "boolean") state.signOutUnavailable = body.signOutUnavailable;
         if (typeof body.changePasswordConflict === "boolean") {
           state.changePasswordConflict = body.changePasswordConflict;
+        }
+        if (body.changePasswordAnswerLost === null || ["malformed", "server_error"].includes(body.changePasswordAnswerLost)) {
+          state.changePasswordAnswerLost = body.changePasswordAnswerLost;
         }
         if (typeof body.whoamiFailsAfterPasswordChange === "boolean") {
           state.whoamiFailsAfterPasswordChange = body.whoamiFailsAfterPasswordChange;

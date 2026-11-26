@@ -26,6 +26,7 @@ export type AccountFailure =
   | "wrong_password" // the current password given to change it is not right
   | "password_mismatch" // the new password and its confirmation differ
   | "password_changed_elsewhere" // a reset or another change got there first
+  | "password_maybe_changed" // the edge may have committed the change; its answer was lost
   | "no_password" // the person signs in another way and has no password here
   | "signed_out" // the edge refused the session that asked
   | "unavailable";
@@ -213,7 +214,8 @@ export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedIn
 }
 
 /** Change the signed-in person's password. Every session they held ends, so the edge answers with
- * a fresh one for this browser. */
+ * a fresh one for this browser. Only a 4xx is a definite refusal; a lost or unreadable answer
+ * means the change may have been made (`password_maybe_changed`). */
 export async function edgeChangePassword(
   currentPassword: string,
   newPassword: string,
@@ -226,7 +228,7 @@ export async function edgeChangePassword(
     });
   } catch (error) {
     if (isUnauthorized(error)) throw new AccountError("signed_out");
-    if (error instanceof GatewayError) {
+    if (error instanceof GatewayError && error.status < 500) {
       if (error.status === 403 && error.code === "wrong_password") {
         throw new AccountError("wrong_password");
       }
@@ -238,9 +240,13 @@ export async function edgeChangePassword(
       if (error.status === 429) throw new AccountError("rate_limited");
       throw new AccountError("unavailable");
     }
-    throw error;
+    throw new AccountError("password_maybe_changed");
   }
-  return sessionGrant(json);
+  try {
+    return sessionGrant(json);
+  } catch {
+    throw new AccountError("password_maybe_changed");
+  }
 }
 
 /** How a sign-out request ended at the edge. A failure carries the edge's status, if it answered. */
@@ -249,8 +255,11 @@ export type SignOutOutcome =
   | { kind: "already_signed_out" }
   | { kind: "failed"; status?: number };
 
-/** Sign-out is on the way out of the app; it waits for the edge only briefly. */
+/** Signing out one session is on the way out of the app, so it waits for the edge only briefly.
+ * Signing out everywhere waits longer: giving up early would report a failure for a sign-out the
+ * edge may well have made. */
 const SIGN_OUT_TIMEOUT_MS = 3_000;
+const SIGN_OUT_EVERYWHERE_TIMEOUT_MS = 10_000;
 
 /** End `token`'s session at the edge, or (with `everywhere`) every session its person holds. It
  * goes straight to the edge, never through the refresh-and-retry lifecycle. */
@@ -271,7 +280,9 @@ export async function edgeSignOut(
         },
         body: "{}",
         redirect: "error",
-        signal: gatewayRequestSignal({ timeoutMs: SIGN_OUT_TIMEOUT_MS }),
+        signal: gatewayRequestSignal({
+          timeoutMs: everywhere ? SIGN_OUT_EVERYWHERE_TIMEOUT_MS : SIGN_OUT_TIMEOUT_MS,
+        }),
       },
     );
     await response.body?.cancel().catch(() => undefined);
