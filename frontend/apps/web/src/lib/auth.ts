@@ -227,11 +227,12 @@ export const loginWithPassword = action(async (formData: FormData) => {
   const returnTo = formData.get("return_to");
   let failure: AccountFailure | null = null;
   let retryAfterSecs: number | undefined;
-  const deviceToken = email ? deviceTokenForEmail(email) : undefined;
+  let deviceToken: string | undefined;
   if (!email || !password || email.length > 320 || password.length > 4_096) {
     failure = "credentials";
   } else {
     try {
+      deviceToken = deviceTokenForEmail(email);
       await signInWithGrant(await edgePasswordLogin(email, password, deviceToken));
     } catch (error) {
       failure = accountFailure(error);

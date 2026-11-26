@@ -59,8 +59,8 @@ const LOGIN_FAILURES_PER_DEVICE: Limit = Limit {
     window_secs: 15 * 60,
 };
 /// Emails telling a person that strangers' sign-ins to their account are being turned away: one
-/// per lock episode, which ends when the owner next signs in or accepts a reset, and never more
-/// than one a day.
+/// per lock episode. An episode lasts up to a day and ends early when the owner signs in,
+/// changes their password or accepts a reset.
 const LOCK_NOTICES_PER_EMAIL: Limit = Limit {
     name: "login.lock_notice",
     hits: 1,
