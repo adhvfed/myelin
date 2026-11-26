@@ -387,7 +387,7 @@ impl Cell {
     /// Lets the operator invite a first person and returns them, signed in.
     async fn person(&self, accounts: &AccountService, tenant: &str, email: &str) -> Principal {
         let link = accounts
-            .operator_join_link(tenant, email, None, OrgRole::Owner)
+            .operator_join_link(tenant, email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url;
@@ -1786,7 +1786,7 @@ async fn an_invitation_made_while_its_address_joins_sees_the_new_account() {
     let grace = format!("{}@example.com", unique("grace"));
     let join = code_in(
         &accounts
-            .operator_join_link(&tenant, &grace, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &grace, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,

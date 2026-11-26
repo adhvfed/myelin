@@ -86,6 +86,27 @@ export async function operatorRole(
   );
 }
 
+/** Runs `edge bootstrap` for `principal` in `tenant` and returns the operator token it mints. */
+export async function operatorBootstrap(tenant: string, principal: string, displayName: string): Promise<string> {
+  const issues = ["MYELIN_SYSTEM_TEST_ISSUES_PROJECT", "MYELIN_SYSTEM_TEST_ISSUES_TYPE", "MYELIN_SYSTEM_TEST_ISSUES_PREFIX"]
+    .map((name) => {
+      const value = process.env[name];
+      if (!value) throw new Error(`${name} is required`);
+      return value;
+    });
+  const result = await run(
+    "cargo",
+    [
+      "run", "--quiet", "-p", "myelin-edge", "--bin", "edge", "--", "bootstrap", "--tenant", tenant,
+      "--region", process.env.MYELIN_SYSTEM_TEST_REGION ?? "fr-par", "--principal", principal,
+      "--display-name", displayName, "--issues-project", issues[0]!, "--issues-type", issues[1]!,
+      "--issues-prefix", issues[2]!, "--ttl-days", "1",
+    ],
+    { timeout: 120_000, maxBuffer: 256 * 1024 },
+  );
+  return result.stdout.trim();
+}
+
 /** Runs an operator link command expected to fail, and returns its exit code and stderr. */
 export async function failedOperatorLink(
   command: "invite" | "reset-link",

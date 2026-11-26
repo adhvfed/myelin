@@ -205,7 +205,7 @@ impl Stack {
         let tenant = unique("t-sessions");
         let link = self
             .accounts
-            .operator_join_link(&tenant, email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, email, None, Some(OrgRole::Owner))
             .await
             .unwrap();
         let token = self.accept(

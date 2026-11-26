@@ -31,7 +31,7 @@ pub use store::account_migrations;
 pub(crate) use store::InvitationKind;
 use store::{
     AcceptOutcome, AccountRow, AccountStore, ChangeOutcome, Invitation, IssueOutcome, IssueRule,
-    LinkLetter, LinkMail, MemberChange, NewInvitation, Reservation, RosterOutcome, Slot,
+    LinkLetter, LinkMail, MemberChange, NewInvitation, Reservation, RosterOutcome, Slot, Standing,
 };
 
 pub const JOIN_INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -218,6 +218,8 @@ pub struct IssuedInvitation {
     pub url: String,
     pub email: String,
     pub expires_at_unix: i64,
+    /// The role a join link grants; `None` for a reset link.
+    pub role: Option<OrgRole>,
 }
 
 /// An active person, as the organization's roster shows them. A profile that can no longer be
@@ -842,12 +844,15 @@ impl AccountService {
                 AccountError::Unavailable("a stored invitation does not match its link".into())
             })?;
         // A member's link holds only while they could still send it; accepting checks again.
-        if let (Some(inviter), Some(role)) = (&invitation.invited_by, invitation.role) {
-            let still_may = self
-                .store
-                .role_of(&invitation.tenant, &invitation.region, inviter)
-                .await?
-                .is_some_and(|inviter| inviter.may_grant(role));
+        if invitation.member_sent {
+            let still_may = match (&invitation.invited_by, invitation.role) {
+                (Some(inviter), Some(role)) => self
+                    .store
+                    .role_of(&invitation.tenant, &invitation.region, inviter)
+                    .await?
+                    .is_some_and(|inviter| inviter.may_grant(role)),
+                _ => false,
+            };
             if !still_may {
                 return Err(AccountError::InvitationNotFound);
             }
@@ -877,29 +882,32 @@ impl AccountService {
     ) -> Result<SignedIn, AccountError> {
         let display_name = display_name(acceptance.display_name.as_deref())?;
         let password = Password::new(acceptance.password)?;
-        // The common conflict is answered before a hash or a key is made for it.
-        let digest = live.invitation.email_digest;
-        let existing = self.block(async { Ok(self.store.account(&digest).await?) })?;
-        if let Some(account) = existing {
-            let invitation = &live.invitation;
-            if account.tenant != invitation.tenant || account.region != invitation.region {
+        // The common conflicts are answered before a hash or a key is made for them. An address
+        // whose person was removed from this organization joins again as a new person: nothing
+        // tied to the old one (agents, delegations, tokens, grants) comes back with them.
+        let invitation = &live.invitation;
+        let digest = invitation.email_digest;
+        let replacing = match self.block(async { Ok(self.store.account(&digest).await?) })? {
+            None => None,
+            Some(account)
+                if account.tenant != invitation.tenant || account.region != invitation.region =>
+            {
                 return Err(AccountError::AccountExists);
             }
-            // A removed person invited back keeps who they were and chooses a new password.
-            let password_phc = self.hashing(|| password.hash())?;
-            let outcome = self.block(async {
-                Ok(self
-                    .store
-                    .accept_rejoin(
-                        &live.code.digest(),
-                        invitation,
-                        &account.principal_id,
-                        password_phc,
-                    )
-                    .await?)
-            })?;
-            return self.signed_in_after(invitation, outcome);
-        }
+            Some(account) => {
+                let standing = self.block(async {
+                    Ok(self
+                        .store
+                        .standing(&account.tenant, &account.region, &account.principal_id)
+                        .await?)
+                })?;
+                match standing {
+                    Standing::Removed => Some(account.principal_id),
+                    Standing::Erased => return Err(AccountError::PersonErased),
+                    Standing::Present => return Err(AccountError::AccountExists),
+                }
+            }
+        };
         let password_phc = self.hashing(|| password.hash())?;
         let scope = scope_for(&live.invitation.tenant, &live.invitation.region);
         let principal_id =
@@ -920,13 +928,22 @@ impl AccountService {
         let outcome = self.block(async {
             Ok(self
                 .store
-                .accept_join(&live.code.digest(), &live.invitation, row, password_phc)
+                .accept_join(
+                    &live.code.digest(),
+                    &live.invitation,
+                    row,
+                    password_phc,
+                    replacing,
+                )
                 .await?)
         });
         // A join the database refused rolled back, so nobody holds the new person's key. A
         // failed call may still have committed, so its key is kept rather than risk erasing a
         // stored profile.
-        if matches!(outcome, Ok(AcceptOutcome::Gone | AcceptOutcome::EmailTaken)) {
+        if matches!(
+            outcome,
+            Ok(AcceptOutcome::Gone | AcceptOutcome::EmailTaken | AcceptOutcome::Erased)
+        ) {
             self.discard_key(&scope, &principal_id);
         }
         self.signed_in_after(&live.invitation, outcome?)
@@ -1285,13 +1302,14 @@ impl AccountService {
     }
 
     /// The operator's join link, for the first person in an organization or anyone after. It
-    /// grants `role`: owner, unless the operator says otherwise.
+    /// grants `role`, or without one: owner for an organization with no people and no pending
+    /// owner's link yet, member otherwise. `IssuedInvitation::role` says which.
     pub async fn operator_join_link(
         &self,
         tenant: &str,
         email: &str,
         ttl_secs: Option<i64>,
-        role: OrgRole,
+        role: Option<OrgRole>,
     ) -> Result<IssuedInvitation, AccountError> {
         let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
         self.issue(
@@ -1367,7 +1385,9 @@ impl AccountService {
             region: region.to_string(),
             email_digest,
             email: code.seal_email(&email),
-            roster: rule.role().map(|_| self.roster.seal(&email, &email_digest)),
+            roster: rule
+                .is_join()
+                .then(|| self.roster.seal(&email, &email_digest)),
             ttl_secs: ttl_secs.clamp(60, MAX_INVITATION_TTL_SECS),
         };
         let url = format!("{origin}/join/{}", code.encoded());
@@ -1382,10 +1402,14 @@ impl AccountService {
             .issue(&code.digest(), rule, &link, mail.as_ref())
             .await?
         {
-            IssueOutcome::Issued { expires_at_unix } => Ok(IssuedInvitation {
+            IssueOutcome::Issued {
+                expires_at_unix,
+                role,
+            } => Ok(IssuedInvitation {
                 url,
                 email: email.as_str().to_string(),
                 expires_at_unix,
+                role,
             }),
             IssueOutcome::AccountExists => Err(AccountError::AccountExists),
             IssueOutcome::NoSuchAccount => Err(AccountError::NoSuchAccount),
@@ -1401,16 +1425,6 @@ impl AccountService {
                 .store
                 .enrol_member(&person.tenant.0, &person.region.0, &person.principal_id.0)
                 .await?)
-        })
-    }
-
-    /// The role an operator's join link grants unless they choose: owner for an organization's
-    /// first person, member after that.
-    pub async fn operator_default_role(&self, tenant: &str) -> Result<OrgRole, AccountError> {
-        Ok(if self.store.has_people(tenant, &self.region).await? {
-            OrgRole::Member
-        } else {
-            OrgRole::Owner
         })
     }
 

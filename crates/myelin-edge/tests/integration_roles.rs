@@ -97,7 +97,7 @@ async fn owner(accounts: &AccountService, tenant: &str, name: &str) -> Principal
             tenant,
             &format!("{}@example.com", unique(name)),
             None,
-            OrgRole::Owner,
+            Some(OrgRole::Owner),
         )
         .await
         .unwrap();
@@ -308,6 +308,7 @@ async fn the_roles_migration_makes_each_organizations_earliest_active_person_its
     let (before, roles): (Vec<_>, Vec<_>) = account_migrations()
         .0
         .into_iter()
+        .filter(|migration| migration.id.as_ref() <= "edge_0006_org_roles")
         .partition(|migration| migration.id != "edge_0006_org_roles");
     for migration in before {
         schema.run(&migration.ddl).await;
@@ -440,10 +441,146 @@ async fn an_erased_person_cannot_rejoin_and_an_erased_last_owner_leaves_no_owner
         "an erased person's address is never invited again"
     );
 
-    // Erasing the only owner is not blocked; the organization says it has none.
+    // Erasing the only owner is not blocked; the organization says it has none, and the links
+    // the owner sent die with them.
+    let pending = link_from(
+        accounts,
+        &ada,
+        &format!("{}@example.com", unique("pending")),
+    )
+    .unwrap();
     assert_eq!(accounts.roster(&hopper).unwrap().owners, 1);
     erase(&cell.provider, &ada).await;
     assert_eq!(accounts.roster(&hopper).unwrap().owners, 0);
+    assert_eq!(
+        accounts.invitation(code_of(&pending)).unwrap_err(),
+        AccountError::InvitationNotFound
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM auth_invitation WHERE tenant_id = $1 AND kind = 'join'",
+    )
+    .bind(&tenant)
+    .fetch_one(cell.provider.db_pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "every link Ada sent is gone with her");
+}
+
+fn code_of(url: &str) -> &str {
+    url.rsplit_once("/join/").unwrap().1
+}
+
+/// Sets a person's status directly, as a writer other than the roster (SCIM, an operator) would.
+async fn set_status(provider: &SubstrateProvider, person: &Principal, status: &'static str) {
+    let handle = person.principal_id.0.clone();
+    with_tenant_tx(
+        provider.db_pool(),
+        &person.tenant.0,
+        &person.region.0,
+        move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "UPDATE principal SET status = $2 \
+                      WHERE tenant_id = current_setting('myelin.tenant_id') AND principal_id = $1",
+                )
+                .bind(&handle)
+                .bind(format!("\"{status}\""))
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_invited_back_is_a_new_principal_and_the_removed_one_stays_disabled() {
+    let cell = cell().await;
+    let accounts = &cell.accounts;
+    let tenant = unique("t-roles-return");
+    let ada = owner(accounts, &tenant, "Ada").await;
+    let grace_email = format!("{}@example.com", unique("grace"));
+    let grace = accept(
+        accounts,
+        &link_from(accounts, &ada, &grace_email).unwrap(),
+        "Grace",
+    )
+    .unwrap();
+
+    accounts.remove_member(&ada, &grace.principal_id.0).unwrap();
+    let returned = accept(
+        accounts,
+        &link_from(accounts, &ada, &grace_email).unwrap(),
+        "Grace Again",
+    )
+    .unwrap();
+    assert_ne!(returned.principal_id, grace.principal_id);
+    let scope = TenantScope::from_verified_token(&grace, grace.region.clone());
+    let removed = cell
+        .principals
+        .get_principal(&scope, &grace.principal_id)
+        .unwrap()
+        .expect("the removed person is kept, with their history");
+    // Agents, triggers, delegations and linked tokens all require their person to be active.
+    assert_eq!(removed.status, PrincipalStatus::Disabled);
+    assert_eq!(accounts.role_of(&grace).unwrap(), None);
+    assert_eq!(accounts.role_of(&returned).unwrap(), Some(OrgRole::Member));
+    let profile = accounts.profile(&returned).unwrap().unwrap();
+    assert_eq!(profile.display_name, "Grace Again");
+    assert_eq!(profile.email, grace_email);
+    let signed_in = accounts
+        .login(&grace_email, "correct horse battery".into(), None)
+        .unwrap();
+    assert_eq!(signed_in.principal.principal_id, returned.principal_id);
+    assert_eq!(
+        link_from(accounts, &ada, &grace_email).unwrap_err(),
+        AccountError::AccountExists,
+        "once back, the address has an account again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_removal_lets_an_address_be_invited_back_and_old_member_links_are_dead() {
+    let cell = cell().await;
+    let accounts = &cell.accounts;
+    let tenant = unique("t-roles-disabled");
+    let ada = owner(accounts, &tenant, "Ada").await;
+    let grace_email = format!("{}@example.com", unique("grace"));
+    let grace = accept(
+        accounts,
+        &link_from(accounts, &ada, &grace_email).unwrap(),
+        "Grace",
+    )
+    .unwrap();
+
+    // Disabled some other way, Grace was not removed, so her address is still taken.
+    set_status(&cell.provider, &grace, "Disabled").await;
+    assert_eq!(
+        link_from(accounts, &ada, &grace_email).unwrap_err(),
+        AccountError::AccountExists
+    );
+
+    // A member's link stored before senders were recorded has no sender, and is dead.
+    let old = link_from(accounts, &ada, &format!("{}@example.com", unique("hopper"))).unwrap();
+    sqlx::query(
+        "UPDATE auth_invitation SET invited_by = NULL WHERE tenant_id = $1 AND kind = 'join'",
+    )
+    .bind(&tenant)
+    .execute(cell.provider.db_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        accounts.invitation(code_of(&old)).unwrap_err(),
+        AccountError::InvitationNotFound
+    );
+    assert_eq!(
+        accept(accounts, &old, "Hopper").unwrap_err(),
+        AccountError::InvitationNotFound
+    );
+    assert_eq!(accounts.roster(&ada).unwrap().invitations, Some(vec![]));
 }
 
 /// Verifies any OIDC assertion as one fixed subject in one organization.
@@ -532,6 +669,18 @@ async fn a_person_signing_in_with_sso_becomes_a_member_once() {
     };
 
     assert_eq!(cell.accounts.role_of(&person).unwrap(), None);
+    // Someone who signs in another way is a person: the operator's next link grants member.
+    let link = cell
+        .accounts
+        .operator_join_link(
+            &tenant,
+            &format!("{}@example.com", unique("next")),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(link.role, Some(OrgRole::Member));
     assert_eq!(sign_in().status(), 200);
     assert_eq!(
         cell.accounts.role_of(&person).unwrap(),

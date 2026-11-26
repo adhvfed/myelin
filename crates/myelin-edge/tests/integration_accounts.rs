@@ -144,7 +144,7 @@ impl Cell {
         let code = code_of(
             &self
                 .accounts
-                .operator_join_link(tenant, email, None, OrgRole::Owner)
+                .operator_join_link(tenant, email, None, Some(OrgRole::Owner))
                 .await
                 .unwrap()
                 .url,
@@ -215,7 +215,7 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
 
     let issued = cell
         .accounts
-        .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+        .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
         .await
         .expect("the operator invites the first person");
     assert!(issued.url.starts_with("https://myelin.example/join/"));
@@ -301,7 +301,7 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
 
     assert_eq!(
         cell.accounts
-            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap_err(),
         AccountError::AccountExists
@@ -362,7 +362,7 @@ async fn two_people_racing_for_one_link_produce_exactly_one_account() {
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -451,7 +451,7 @@ async fn only_the_newest_link_works_and_none_outlives_its_expiry() {
     let first = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -459,7 +459,7 @@ async fn only_the_newest_link_works_and_none_outlives_its_expiry() {
     let second = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, Some(3600), OrgRole::Owner)
+            .operator_join_link(&tenant, &email, Some(3600), Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -498,7 +498,7 @@ async fn sign_in_is_throttled_per_email_and_refused_to_inactive_or_removed_peopl
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -636,7 +636,7 @@ async fn junk_codes_never_throttle_real_links_and_write_nothing() {
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -685,7 +685,7 @@ async fn an_expired_link_is_refused_even_when_the_edge_clock_lags() {
     let join_code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &joiner, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &joiner, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -743,7 +743,7 @@ async fn links_are_made_only_for_an_https_or_loopback_origin() {
     let plain_http = cell.service(Some("http://myelin.example"));
     assert_eq!(
         plain_http
-            .operator_join_link(&tenant, &invitee, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &invitee, None, Some(OrgRole::Owner))
             .await
             .unwrap_err(),
         AccountError::LinksUnavailable
@@ -845,7 +845,7 @@ async fn a_member_invitation_racing_a_reset_link_never_removes_it() {
     let invitee_join = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &invitee, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &invitee, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -1192,7 +1192,7 @@ async fn a_new_link_replaces_only_the_same_kind_for_the_same_email_in_the_same_o
         async move {
             code_of(
                 &accounts
-                    .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+                    .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
                     .await
                     .unwrap()
                     .url,
@@ -1272,7 +1272,7 @@ async fn an_operators_new_reset_link_revokes_their_earlier_one_for_that_person_o
                 &tenant,
                 &format!("{}@example.com", unique("moore")),
                 None,
-                OrgRole::Owner,
+                Some(OrgRole::Owner),
             )
             .await
             .unwrap()
@@ -1323,7 +1323,7 @@ async fn a_join_that_loses_the_email_inside_its_transaction_rolls_back_and_keeps
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,
@@ -1331,7 +1331,7 @@ async fn a_join_that_loses_the_email_inside_its_transaction_rolls_back_and_keeps
     let rival_code = code_of(
         &cell
             .accounts
-            .operator_join_link(&rival_tenant, &email, None, OrgRole::Owner)
+            .operator_join_link(&rival_tenant, &email, None, Some(OrgRole::Owner))
             .await
             .unwrap()
             .url,

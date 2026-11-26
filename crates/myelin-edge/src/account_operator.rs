@@ -181,18 +181,11 @@ pub(crate) async fn run(
             _ => 1,
         });
     };
-    let role = match command.role {
-        Some(role) => role,
-        None => accounts
-            .operator_default_role(&command.tenant)
-            .await
-            .unwrap_or_else(|error| fail(error)),
-    };
     let email = || command.person.email();
     let issued = match kind {
         AccountCommand::Join => {
             accounts
-                .operator_join_link(&command.tenant, email(), command.ttl_secs, role)
+                .operator_join_link(&command.tenant, email(), command.ttl_secs, command.role)
                 .await
         }
         AccountCommand::Reset => {
@@ -201,6 +194,7 @@ pub(crate) async fn run(
                 .await
         }
         AccountCommand::Role => {
+            let role = command.role.expect("edge role requires --role");
             accounts
                 .operator_set_role(&command.tenant, command.person.target(), role)
                 .await
@@ -218,9 +212,9 @@ pub(crate) async fn run(
     println!("{}", issued.url);
     eprintln!(
         "edge {name}: {} link for tenant `{}` in region `{cell_region}`, valid until unix {}",
-        match kind {
-            AccountCommand::Join => format!("join (as {})", role.as_str()),
-            _ => "password reset".to_string(),
+        match issued.role {
+            Some(role) => format!("join (as {})", role.as_str()),
+            None => "password reset".to_string(),
         },
         command.tenant,
         issued.expires_at_unix

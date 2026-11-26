@@ -11,8 +11,9 @@ person's next click.
 edge invite --tenant T --email ada@example.com
 ```
 
-An organization's first person joins as owner. Once anyone is in it, an operator's invitation
-grants member unless it names a role with `--role owner|admin|member`.
+An operator's invitation without `--role owner|admin|member` grants owner while the organization
+has no active person (by any way of signing in) and no pending owner's invitation, and member
+after that. It prints the role it chose.
 
 ## Recovering an organization with no owner
 
@@ -34,6 +35,11 @@ promote another owner first.
 
 ## Removed people
 
-Removing someone disables them, ends every session they hold, and withdraws the invitations they
-sent. Their address can be invited again; accepting sets a new password and brings back the same
-person, whose old sessions stay ended. An erased person can never be invited back.
+Removing someone disables them for good, ends every session they hold, and is recorded as a
+removal. Their address can be invited again: accepting makes a new person with the name and
+password they choose, and moves the address's sign-in to them. The removed person stays disabled
+with their history, agents, tokens and grants, none of which the new person inherits. A person
+disabled any other way, or erased, keeps their address; it cannot be invited.
+
+Whenever a person stops being active (removed, erased or disabled), the invitations they sent stop
+working and their unsent mail is withdrawn.

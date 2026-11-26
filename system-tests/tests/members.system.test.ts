@@ -5,7 +5,7 @@ import { describe, expect, test } from "vitest";
 import { browserApprovedCliClient, systemClient, uniqueName } from "../src/context.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { linkIn, mailSoFar, mailTo } from "../src/mailpit.js";
-import { operatorLink, operatorRole } from "../src/operator.js";
+import { operatorBootstrap, operatorLink, operatorRole } from "../src/operator.js";
 
 // One organization of its own, so its owners are exactly the ones this journey makes.
 const tenant = `members-${randomUUID().slice(0, 8)}`;
@@ -207,18 +207,25 @@ describe("an organization's people", () => {
     expect(await pendingId(olivia, zoeEmail)).toBeUndefined();
     await systemClient.json(`/v1/auth/invitations/${zoeCode}`, { ...anonymous, expectedStatus: 404 });
 
+    // An operator token linked to Max works while Max does.
+    const maxOperatorToken = await operatorBootstrap(tenant, max.id, "Max Member");
+    const asMaxOperator = { token: maxOperatorToken, tokenScheme: "agent" } as const;
+    await systemClient.json("/v1/whoami", asMaxOperator);
+
     // An admin removes a member, whose session ends at once and who cannot sign in again.
     await remove(adam, max);
     await whoami(max.token, 401);
     await signIn(maxEmail, password, 401);
     expect(rolesIn(await members(olivia))).not.toHaveProperty(maxEmail);
 
-    // Invited back, the same person returns with a new password; old sessions stay ended.
+    // Invited back, Max returns as a new person with the name and password he chooses. Nothing
+    // that belonged to the removed person comes back: not his sessions, not his operator token.
     await invite(olivia, maxEmail);
     const returned = await join(await mailedCode(maxEmail, 2), "Max Again", maxEmail, "a brand new passphrase");
-    expect(returned.id).toBe(max.id);
-    expect(await whoami(returned.token)).toMatchObject({ role: "member", display_name: "Max Member" });
+    expect(returned.id).not.toBe(max.id);
+    expect(await whoami(returned.token)).toMatchObject({ role: "member", display_name: "Max Again", email: maxEmail });
     await whoami(max.token, 401);
+    await systemClient.json("/v1/whoami", { ...asMaxOperator, expectedStatus: 401 });
     await signIn(maxEmail, password, 401);
     await signIn(maxEmail, "a brand new passphrase");
 
@@ -265,6 +272,7 @@ describe("an organization's people", () => {
     expect(await whoami(adam.token)).toMatchObject({ role: "owner" });
     await setRole(adam, olivia, "admin");
     await systemClient.json(`/v1/auth/invitations/${ottoCode}`, { ...anonymous, expectedStatus: 404 });
+    expect(await pendingId(adam, ottoEmail)).toBeUndefined();
     await systemClient.json(`/v1/auth/invitations/${ottoCode}/accept`, {
       method: "POST",
       ...anonymous,
