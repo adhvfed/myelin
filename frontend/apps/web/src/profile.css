@@ -52,4 +52,5 @@
 .profile-remembered form { margin: 0; }
 .profile-remembered button { min-height: var(--control-h); padding-inline: var(--space-3); border: var(--hairline) solid var(--border-strong); border-radius: var(--radius-1); background: transparent; color: var(--text-primary); cursor: pointer; }
 .profile-signout-confirm button[type="button"] { min-height: var(--control-h); padding-inline: var(--space-3); border: var(--hairline) solid var(--border-strong); border-radius: var(--radius-1); background: transparent; color: var(--text-primary); cursor: pointer; }
+.profile-link { display: inline-flex; align-items: center; gap: var(--space-1); margin-block-start: var(--space-3); color: var(--accent); }
 @media (max-width: 760px) { .profile-screen { padding: 0; }.profile-hero { margin: 0 0 var(--space-3); padding: var(--space-4); }.profile-grid { grid-template-columns: 1fr; }.profile-theme-options { grid-template-columns: 1fr; } }

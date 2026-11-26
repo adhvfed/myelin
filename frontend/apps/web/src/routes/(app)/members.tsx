@@ -1,10 +1,12 @@
 import { ConfirmDialog, Icon, useToast } from "@myelin/design-system";
 import { Title } from "@solidjs/meta";
 import { createAsync, useAction, useSubmission } from "@solidjs/router";
-import { createSignal, For, Match, onMount, Show, Switch } from "solid-js";
+import { createEffect, createSignal, For, Match, onMount, Show, Switch } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 import { useAppViewer } from "~/components/AppShell";
 import { ProfileCard } from "~/components/ProfileCard";
 import { getAuthConfig } from "~/lib/auth";
+import type { Member, PendingInvitation, Roster } from "~/lib/member-roster";
 import { grantableRoles, mayActOn, ROLE_LABEL, roleChoices, type OrgRole } from "~/lib/member-rules";
 import {
   changeRole,
@@ -14,7 +16,7 @@ import {
   revokeInvitation,
   type InvitationResult,
 } from "~/lib/members";
-import type { Member, MemberResult, PendingInvitation, Roster } from "~/server/members-gateway";
+import type { MemberResult } from "~/server/members-gateway";
 
 const longDate = (unix: number) =>
   new Date(unix * 1_000).toLocaleDateString(undefined, { day: "numeric", month: "long", year: "numeric" });
@@ -23,6 +25,7 @@ const untilDate = (unix: number) =>
 
 const MEMBER_ERRORS: Record<Exclude<MemberResult, { ok: true }>["reason"], string> = {
   role_required: "Your role doesn't allow that.",
+  forbidden: "This session can't manage people. Sign out and sign in again.",
   last_owner: "An organization needs an owner. Make someone else an owner first.",
   not_found: "They're no longer here. The list has been refreshed.",
   unavailable: "That didn't work just now. Try again in a moment.",
@@ -30,47 +33,77 @@ const MEMBER_ERRORS: Record<Exclude<MemberResult, { ok: true }>["reason"], strin
 
 export default function Members() {
   const viewer = useAppViewer();
-  const roster = createAsync(() => getRoster());
+  const view = createAsync(() => getRoster());
+  // Each refresh is reconciled into one store, so rows, focus and half-typed forms survive it.
+  const [roster, setRoster] = createStore<{ current?: Roster }>({});
+  createEffect(() => {
+    const latest = view();
+    if (latest?.state === "ready") setRoster("current", reconcile(latest.roster, { key: "id" }));
+  });
   const [interactive, setInteractive] = createSignal(false);
   onMount(() => setInteractive(true));
   return <>
     <Title>Members · Myelin</Title>
     <div class="profile-screen">
-      <header class="profile-hero members-hero"><div class="profile-avatar" aria-hidden="true"><Icon name="team" size={30} /></div><div><p>Organization</p><h1>Members</h1><span><code>{viewer.tenant}</code></span></div></header>
+      <header class="profile-hero"><div class="profile-avatar" aria-hidden="true"><Icon name="team" size={30} /></div><div><p>Organization</p><h1>Members</h1><span><code>{viewer.tenant}</code></span></div></header>
       <Switch>
-        <Match when={roster()?.state === "not_member"}>
+        <Match when={view()?.state === "not_member"}>
           <p class="members-note" data-testid="members-not-member">Only members of this organization can see its people.</p>
         </Match>
-        <Match when={roster()?.state === "unavailable"}>
+        <Match when={view()?.state === "forbidden"}>
+          <p role="alert" class="members-note" data-testid="members-forbidden">This session can't see the organization's people. Sign out and sign in again.</p>
+        </Match>
+        <Match when={view()?.state === "unavailable"}>
           <p role="alert" class="members-note" data-testid="members-unavailable">The members list couldn't be loaded. Try again in a moment.</p>
         </Match>
-        <Match when={roster()?.state === "ready" ? (roster() as { roster: Roster }).roster : undefined} keyed>
-          {(ready) => <RosterView roster={ready} viewerId={viewer.principalId} interactive={interactive()} />}
+        <Match when={view()?.state === "ready" && roster.current}>
+          <RosterView roster={roster.current!} viewerId={viewer.principalId} interactive={interactive()} />
         </Match>
       </Switch>
     </div>
   </>;
 }
 
-function RosterView(props: { roster: Roster; viewerId: string; interactive: boolean }) {
-  const manages = () => props.roster.role !== "member";
-  return (
-    <div class="members-grid">
-      <Show
-        when={manages()}
-        fallback={<p class="members-note" data-testid="invite-owners-only">Owners and admins invite people. Ask one of them to invite a teammate.</p>}
-      >
-        <InviteCard role={props.roster.role} />
-      </Show>
-      <PeopleCard roster={props.roster} viewerId={props.viewerId} interactive={props.interactive} />
-      <Show when={props.roster.invitations}>
-        {(invitations) => <InvitationsCard invitations={invitations()} interactive={props.interactive} />}
-      </Show>
-    </div>
-  );
+/** A pending confirmation. It stays set while the dialog closes, so the dialog's words don't
+ * change under the closing animation. */
+interface Confirmation {
+  title: string;
+  description: string;
+  confirmLabel: string;
+  destructive: boolean;
+  run: () => Promise<boolean>;
 }
 
-/** Shows a member action's failure as a toast; success is visible in the refreshed list. */
+/** One confirm dialog for a card, and a guard so a double click acts once. */
+function useConfirmation() {
+  const [pending, setPending] = createSignal<Confirmation | null>(null);
+  const [open, setOpen] = createSignal(false);
+  const [busy, setBusy] = createSignal(false);
+  const ask = (confirmation: Confirmation) => {
+    setPending(confirmation);
+    setOpen(true);
+  };
+  const dialog = () => (
+    <ConfirmDialog
+      open={open()}
+      variant={pending()?.destructive ? "destructive" : "confirm"}
+      title={pending()?.title ?? ""}
+      description={pending()?.description ?? ""}
+      confirmLabel={pending()?.confirmLabel}
+      onCancel={() => setOpen(false)}
+      onConfirm={() => {
+        const confirmation = pending();
+        setOpen(false);
+        if (!confirmation || busy()) return;
+        setBusy(true);
+        void confirmation.run().finally(() => setBusy(false));
+      }}
+    />
+  );
+  return { ask, busy, dialog };
+}
+
+/** Runs a member action and reports a failure as a toast; success shows in the refreshed list. */
 function useMemberAction(run: (form: FormData) => Promise<MemberResult>, done: string) {
   const toast = useToast();
   return async (fields: Record<string, string>) => {
@@ -84,62 +117,127 @@ function useMemberAction(run: (form: FormData) => Promise<MemberResult>, done: s
   };
 }
 
+function RosterView(props: { roster: Roster; viewerId: string; interactive: boolean }) {
+  return (
+    <div class="members-grid">
+      <Show when={props.roster.owners === 0}>
+        <p role="status" class="members-note members-warning" data-testid="members-no-owner">
+          This organization has no owner. Ask the operator to run <code>edge role</code>.
+        </p>
+      </Show>
+      <Show
+        when={props.roster.role !== "member"}
+        fallback={<p class="members-note" data-testid="invite-owners-only">Owners and admins invite people. Ask one of them to invite a teammate.</p>}
+      >
+        <InviteCard role={props.roster.role} />
+      </Show>
+      <PeopleCard roster={props.roster} viewerId={props.viewerId} interactive={props.interactive} />
+      <Show when={props.roster.invitations}>
+        {(invitations) => <InvitationsCard invitations={invitations()} interactive={props.interactive} />}
+      </Show>
+    </div>
+  );
+}
+
+const nameOf = (member: Member) => member.displayName || member.email || "Unnamed person";
+
 function PeopleCard(props: { roster: Roster; viewerId: string; interactive: boolean }) {
   const setRole = useMemberAction(useAction(changeRole), "Role changed");
   const remove = useMemberAction(useAction(removeMember), "Removed from the organization");
-  const [removing, setRemoving] = createSignal<Member | null>(null);
-  const [stepping, setStepping] = createSignal<{ member: Member; role: OrgRole } | null>(null);
-  const choose = (member: Member, role: OrgRole, select: HTMLSelectElement) => {
-    // Changing your own role takes powers away from you, so it is confirmed first.
-    if (member.id === props.viewerId) {
-      select.value = member.role;
-      setStepping({ member, role });
-      return;
-    }
-    void setRole({ id: member.id, role }).then((ok) => { if (!ok) select.value = member.role; });
+  const confirmation = useConfirmation();
+  let list: HTMLUListElement | undefined;
+  const soleOwner = (member: Member) =>
+    member.id === props.viewerId && member.role === "owner" && props.roster.owners <= 1;
+
+  const confirmRole = (member: Member, role: OrgRole) => {
+    const self = member.id === props.viewerId;
+    confirmation.ask({
+      title: self ? `Make yourself ${ROLE_LABEL[role].toLowerCase()}?` : `Make ${nameOf(member)} ${ROLE_LABEL[role].toLowerCase()}?`,
+      description: self
+        ? "You'll lose what your current role lets you do, and only an owner can give it back."
+        : `${nameOf(member)} becomes ${ROLE_LABEL[role].toLowerCase()} from their next click.`,
+      confirmLabel: "Change role",
+      destructive: false,
+      run: () => setRole({ id: member.id, role }),
+    });
   };
+  const confirmRemove = (member: Member) => {
+    confirmation.ask({
+      title: member.id === props.viewerId ? "Remove yourself?" : `Remove ${nameOf(member)}?`,
+      description: member.id === props.viewerId
+        ? "You'll be signed out everywhere and won't be able to sign in to this organization again."
+        : "They'll be signed out everywhere at once and won't be able to sign in to this organization again.",
+      confirmLabel: "Remove",
+      destructive: true,
+      run: async () => {
+        const ok = await remove({ id: member.id });
+        if (ok) list?.focus();
+        return ok;
+      },
+    });
+  };
+
   return (
     <ProfileCard
       icon="team"
       title="People"
       copy="Owners manage everyone. Admins invite and manage members. Members see who's here."
     >
-      <ul class="members-list" data-testid="members-people">
+      <ul class="members-list" data-testid="members-people" ref={list} tabIndex={-1} aria-label="People">
         <For each={props.roster.people}>
           {(member) => {
-            const isSelf = member.id === props.viewerId;
-            const choices = roleChoices(props.roster.role, member.role, isSelf);
-            const label = member.displayName || member.email || "Unnamed person";
+            const isSelf = () => member.id === props.viewerId;
+            const choices = () => roleChoices(props.roster.role, member.role, isSelf());
+            const [chosen, setChosen] = createSignal<OrgRole>(member.role);
+            createEffect(() => setChosen(member.role));
+            const hintId = `sole-owner-${member.id}`;
             return (
               <li data-testid="member-row" data-member-email={member.email}>
                 <div class="members-who">
-                  <strong>{label}{isSelf ? " (you)" : ""}</strong>
-                  <span>{member.email}</span>
+                  <strong title={nameOf(member)}>{nameOf(member)}{isSelf() ? " (you)" : ""}</strong>
+                  <span title={member.email}>{member.email}</span>
+                  <Show when={soleOwner(member)}>
+                    <span id={hintId} class="members-hint" data-testid="sole-owner-hint">You're the only owner. Make someone else an owner before you step down.</span>
+                  </Show>
                 </div>
                 <span class="members-meta">Joined {longDate(member.joinedAt)}</span>
                 <Show
-                  when={choices.length > 1}
+                  when={choices().length > 1}
                   fallback={<span class="members-role" data-testid="member-role-text">{ROLE_LABEL[member.role]}</span>}
                 >
-                  <select
-                    class="members-role-select"
-                    aria-label={`Role for ${label}`}
-                    data-testid="member-role"
-                    disabled={!props.interactive}
-                    value={member.role}
-                    onChange={(event) => choose(member, event.currentTarget.value as OrgRole, event.currentTarget)}
-                  >
-                    <For each={choices}>{(role) => <option value={role}>{ROLE_LABEL[role]}</option>}</For>
-                  </select>
+                  <div class="members-role-control">
+                    <select
+                      aria-label={`Role for ${nameOf(member)}`}
+                      aria-describedby={soleOwner(member) ? hintId : undefined}
+                      data-testid="member-role"
+                      disabled={!props.interactive || soleOwner(member)}
+                      value={chosen()}
+                      onChange={(event) => setChosen(event.currentTarget.value as OrgRole)}
+                    >
+                      <For each={choices()}>{(role) => <option value={role}>{ROLE_LABEL[role]}</option>}</For>
+                    </select>
+                    <Show when={chosen() !== member.role}>
+                      <button
+                        type="button"
+                        class="members-save"
+                        data-testid="member-role-save"
+                        disabled={confirmation.busy()}
+                        onClick={() => confirmRole(member, chosen())}
+                      >
+                        Save
+                      </button>
+                    </Show>
+                  </div>
                 </Show>
-                <Show when={mayActOn(props.roster.role, member.role, isSelf)}>
+                <Show when={mayActOn(props.roster.role, member.role, isSelf())}>
                   <button
                     type="button"
-                    class="members-danger"
-                    disabled={!props.interactive}
+                    class="profile-signout"
+                    disabled={!props.interactive || confirmation.busy() || soleOwner(member)}
+                    aria-describedby={soleOwner(member) ? hintId : undefined}
                     data-testid="member-remove"
-                    aria-label={`Remove ${label}`}
-                    onClick={() => setRemoving(member)}
+                    aria-label={`Remove ${nameOf(member)}`}
+                    onClick={() => confirmRemove(member)}
                   >
                     Remove
                   </button>
@@ -149,88 +247,65 @@ function PeopleCard(props: { roster: Roster; viewerId: string; interactive: bool
           }}
         </For>
       </ul>
-      <ConfirmDialog
-        open={removing() !== null}
-        variant="destructive"
-        title={`Remove ${removing()?.displayName || removing()?.email || "this person"}?`}
-        description={removing()?.id === props.viewerId
-          ? "You'll be signed out everywhere and won't be able to sign in to this organization again."
-          : "They'll be signed out everywhere at once and won't be able to sign in to this organization again."}
-        confirmLabel="Remove"
-        onCancel={() => setRemoving(null)}
-        onConfirm={() => {
-          const member = removing();
-          setRemoving(null);
-          if (member) void remove({ id: member.id });
-        }}
-      />
-      <ConfirmDialog
-        open={stepping() !== null}
-        title={`Make yourself ${stepping() ? ROLE_LABEL[stepping()!.role].toLowerCase() : ""}?`}
-        description="You'll lose what your current role lets you do, and only an owner can give it back."
-        confirmLabel="Change my role"
-        onCancel={() => setStepping(null)}
-        onConfirm={() => {
-          const change = stepping();
-          setStepping(null);
-          if (change) void setRole({ id: change.member.id, role: change.role });
-        }}
-      />
+      {confirmation.dialog()}
     </ProfileCard>
   );
 }
 
 function InvitationsCard(props: { invitations: PendingInvitation[]; interactive: boolean }) {
   const revoke = useMemberAction(useAction(revokeInvitation), "Invitation revoked");
-  const [revoking, setRevoking] = createSignal<PendingInvitation | null>(null);
-  const address = (invitation: PendingInvitation | null) => invitation?.email ?? "an earlier invitation";
+  const confirmation = useConfirmation();
+  let region: HTMLDivElement | undefined;
+  const confirmRevoke = (invitation: PendingInvitation) => {
+    confirmation.ask({
+      title: invitation.email ? `Revoke the invitation for ${invitation.email}?` : "Revoke this invitation?",
+      description: "Its link stops working at once, and its email stops if it hasn't gone out. You can invite them again later.",
+      confirmLabel: "Revoke",
+      destructive: true,
+      run: async () => {
+        const ok = await revoke({ id: invitation.id });
+        if (ok) region?.focus();
+        return ok;
+      },
+    });
+  };
   return (
     <ProfileCard
       icon="inbox"
       title="Pending invitations"
       copy="Links sent but not yet used. Revoking one stops its link working, and stops its email if it hasn't gone out."
     >
-      <Show
-        when={props.invitations.length > 0}
-        fallback={<p class="members-empty" data-testid="invitations-empty">No invitations are waiting.</p>}
-      >
-        <ul class="members-list" data-testid="members-invitations">
-          <For each={props.invitations}>
-            {(invitation) => (
-              <li data-testid="invitation-row" data-invitation-email={invitation.email ?? ""}>
-                <div class="members-who">
-                  <strong>{invitation.email ?? "Address not recorded"}</strong>
-                  <span>Joins as {ROLE_LABEL[invitation.role].toLowerCase()}</span>
-                </div>
-                <span class="members-meta">Until {untilDate(invitation.expiresAt)}</span>
-                <button
-                  type="button"
-                  class="members-danger"
-                  disabled={!props.interactive}
-                  data-testid="invitation-revoke"
-                  aria-label={`Revoke the invitation for ${address(invitation)}`}
-                  onClick={() => setRevoking(invitation)}
-                >
-                  Revoke
-                </button>
-              </li>
-            )}
-          </For>
-        </ul>
-      </Show>
-      <ConfirmDialog
-        open={revoking() !== null}
-        variant="destructive"
-        title={`Revoke the invitation for ${address(revoking())}?`}
-        description="Its link stops working at once. You can invite them again later."
-        confirmLabel="Revoke"
-        onCancel={() => setRevoking(null)}
-        onConfirm={() => {
-          const invitation = revoking();
-          setRevoking(null);
-          if (invitation) void revoke({ id: invitation.id });
-        }}
-      />
+      <div ref={region} tabIndex={-1} aria-label="Pending invitations" class="members-region">
+        <Show
+          when={props.invitations.length > 0}
+          fallback={<p class="members-empty" data-testid="invitations-empty">No invitations are waiting.</p>}
+        >
+          <ul class="members-list" data-testid="members-invitations">
+            <For each={props.invitations}>
+              {(invitation) => (
+                <li class="members-invitation" data-testid="invitation-row" data-invitation-email={invitation.email ?? ""}>
+                  <div class="members-who">
+                    <strong title={invitation.email ?? undefined}>{invitation.email ?? "Address not recorded"}</strong>
+                    <span>Joins as {ROLE_LABEL[invitation.role].toLowerCase()}</span>
+                  </div>
+                  <span class="members-meta">Until {untilDate(invitation.expiresAt)}</span>
+                  <button
+                    type="button"
+                    class="profile-signout"
+                    disabled={!props.interactive || confirmation.busy()}
+                    data-testid="invitation-revoke"
+                    aria-label={invitation.email ? `Revoke the invitation for ${invitation.email}` : "Revoke this invitation"}
+                    onClick={() => confirmRevoke(invitation)}
+                  >
+                    Revoke
+                  </button>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+      </div>
+      {confirmation.dialog()}
     </ProfileCard>
   );
 }
@@ -238,6 +313,8 @@ function InvitationsCard(props: { invitations: PendingInvitation[]; interactive:
 const INVITE_ERRORS: Record<string, string> = {
   account_exists: "Someone with that email already has an account here.",
   invalid_email: "That doesn't look like an email address.",
+  invalid_role: "Choose owner, admin or member.",
+  invitation_exists: "That address already has an invitation only an owner can replace. Ask an owner, or revoke it first.",
   rate_limited: "Too many invitations just now. Wait a minute, then try again.",
   role_required: "Your role doesn't allow inviting someone as that.",
 };
@@ -294,7 +371,7 @@ function InviteCard(props: { role: OrgRole }) {
               </select>
             </label>
           </Show>
-          <button type="submit" data-testid="invite-submit" aria-busy={inviting.pending ? "true" : undefined}>
+          <button type="submit" data-testid="invite-submit" disabled={inviting.pending} aria-busy={inviting.pending ? "true" : undefined}>
             {inviting.pending ? (emailed() ? "Sending…" : "Creating…") : emailed() ? "Send invitation" : "Create link"}
           </button>
         </div>

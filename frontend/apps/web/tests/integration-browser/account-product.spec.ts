@@ -114,8 +114,18 @@ test("an invited person creates an account, invites a teammate by email, and res
   await page.waitForLoadState("networkidle");
   const graceRow = page.locator(`[data-testid="member-row"][data-member-email="${teammate}"]`);
   await expect(graceRow).toContainText("Grace Hopper");
+  // Choosing a role does nothing until it is saved and confirmed.
   await graceRow.getByTestId("member-role").selectOption("admin");
+  await page.getByTestId("invite-email").fill("half typed");
+  await graceRow.getByTestId("member-role-save").click();
+  const roleDialog = page.getByRole("alertdialog");
+  await expect(roleDialog).toContainText("Make Grace Hopper admin?");
+  await roleDialog.getByRole("button", { name: "Change role" }).click();
   await expect(page.getByText("Role changed")).toBeVisible();
+  await expect(graceRow.getByTestId("member-role-save")).toHaveCount(0);
+  // The refreshed list kept the half-typed invitation.
+  await expect(page.getByTestId("invite-email")).toHaveValue("half typed");
+  await page.getByTestId("invite-email").fill("");
   await teammatePage.goto("/profile");
   await expect(teammatePage.getByTestId("profile-role")).toHaveText("Admin");
   await teammatePage.goto("/members");
@@ -148,6 +158,7 @@ test("an invited person creates an account, invites a teammate by email, and res
   await page.getByRole("alertdialog").getByRole("button", { name: "Remove" }).click();
   await expect(page.getByText("Removed from the organization")).toBeVisible();
   await expect(graceRow).toHaveCount(0);
+  await expect(page.getByTestId("members-people")).toBeFocused();
   await teammatePage.goto("/profile");
   await teammatePage.waitForURL(/\/login\?signed_out=session$/);
   await other.close();

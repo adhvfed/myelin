@@ -17,6 +17,8 @@ function errorCopy(code: string): string {
       return "Enter the name your teammates should see.";
     case "account_exists":
       return "An account with this email already exists. Sign in instead.";
+    case "person_erased":
+      return "This address belonged to an account that was erased, so it can't join again.";
     case "rate_limited":
       return "Too many attempts. Wait a minute, then try again.";
     case "link_invalid":

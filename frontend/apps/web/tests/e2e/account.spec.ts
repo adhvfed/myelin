@@ -241,23 +241,6 @@ test.describe("invitation links", () => {
     await page.waitForURL("**/login");
   });
 
-  test("an owner invites a teammate by email; the invitee opens the emailed link", async ({ page }) => {
-    await signIn(page, ADA.email, ADA.password);
-    await page.waitForURL("**/git/repos");
-    await page.goto("/members");
-    await page.waitForLoadState("networkidle");
-
-    await page.getByTestId("invite-email").fill("linus@acme.dev");
-    await page.getByTestId("invite-submit").click();
-    await expect(page.getByTestId("invite-sent")).toContainText("We're emailing an invitation to linus@acme.dev");
-    await expect(page.getByTestId("invite-url")).toHaveCount(0);
-
-    const [link] = await mailTo("linus@acme.dev");
-    await page.context().clearCookies();
-    await page.goto(new URL(link!).pathname);
-    await expect(page.getByTestId("join-email")).toHaveValue("linus@acme.dev");
-  });
-
   test("one address can be invited only a few times an hour", async ({ page }) => {
     await signIn(page, ADA.email, ADA.password);
     await page.waitForURL("**/git/repos");

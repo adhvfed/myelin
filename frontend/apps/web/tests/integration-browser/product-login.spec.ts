@@ -70,6 +70,14 @@ test("durable product data is available and mutable after browser login", async 
   await expect(page.getByText("fr-par", { exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.cookie)).not.toContain("myelin_session");
 
+  // The development login owns its development organization, so it can invite people.
+  await page.goto("/members");
+  await page.waitForLoadState("networkidle");
+  await expect(page.getByTestId("invite-email")).toBeVisible();
+  await expect(page.getByTestId("invite-role")).toBeVisible();
+  await page.goto("/git/repos");
+  await expect(page.getByRole("heading", { name: "Repositories" })).toBeVisible();
+
   await page.getByRole("button", { name: "New repository" }).click();
   const createDialog = page.getByRole("dialog", { name: "New repository" });
   await createDialog.getByLabel("Name or namespace/name").fill(slug);

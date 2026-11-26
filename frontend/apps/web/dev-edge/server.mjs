@@ -1750,23 +1750,16 @@ const server = createServer((req, res) => {
     return;
   }
 
-  // A signed-in person's organization: in this contract a password session is its only owner and
-  // the development login is not a member.
+  // Just enough of the members page for the invite specs: a password session is the only owner.
+  // The page's own behaviour is covered against the real stack.
   if (method === "GET" && path === "/v1/members") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     if (!state.signedInEmail) {
       return send(res, 403, { error: { code: "role_required", message: "not a member" } });
     }
-    const invitations = [...state.invitations]
-      .filter(([, invitation]) => invitation.kind === "join")
-      .map(([id, invitation]) => ({
-        id,
-        email: invitation.email,
-        role: invitation.role ?? "member",
-        expires_at: Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60,
-      }));
     return send(res, 200, {
       role: "owner",
+      owners: 1,
       people: [{
         id: DEV_PRINCIPAL.principalId,
         display_name: state.signedInDisplayName ?? DEV_PRINCIPAL.displayName,
@@ -1774,7 +1767,6 @@ const server = createServer((req, res) => {
         role: "owner",
         joined_at: 1_764_000_000,
       }],
-      invitations,
     });
   }
 

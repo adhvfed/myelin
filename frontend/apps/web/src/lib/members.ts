@@ -13,13 +13,15 @@ import {
   MemberError,
   memberResult,
 } from "../server/members-gateway";
-import type { MemberResult, Roster } from "../server/members-gateway";
+import type { MemberResult } from "../server/members-gateway";
+import type { Roster } from "./member-roster";
 import { loginAfter } from "./auth-return";
 import { orgRole, type OrgRole } from "./member-rules";
 
 export type RosterView =
   | { state: "ready"; roster: Roster }
   | { state: "not_member" }
+  | { state: "forbidden" }
   | { state: "unavailable" };
 
 export const getRoster = query(async (): Promise<RosterView> => {
@@ -29,6 +31,7 @@ export const getRoster = query(async (): Promise<RosterView> => {
   } catch (error) {
     if (isUnauthorized(error)) throw redirect(loginAfter(error));
     if (error instanceof MemberError && error.reason === "role_required") return { state: "not_member" };
+    if (error instanceof MemberError && error.reason === "forbidden") return { state: "forbidden" };
     return { state: "unavailable" };
   }
 }, "roster");
@@ -43,7 +46,8 @@ export const createInvitation = action(async (formData: FormData): Promise<Invit
   "use server";
   const email = String(formData.get("email") ?? "").trim();
   const role = orgRole(formData.get("role") ?? "member");
-  if (!email || email.length > 320 || !email.includes("@") || !role) {
+  if (!role) return { ok: false, reason: "invalid_role" };
+  if (!email || email.length > 320 || !email.includes("@")) {
     return { ok: false, reason: "invalid_email" };
   }
   try {

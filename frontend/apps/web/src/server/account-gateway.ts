@@ -32,6 +32,9 @@ export type AccountFailure =
   | "no_password" // the person signs in another way and has no password here
   | "signed_out" // the edge refused the session that asked
   | "role_required" // the person's role does not allow inviting this way
+  | "invalid_role" // the invitation named a role that does not exist
+  | "person_erased" // the address belonged to an erased person, who cannot rejoin
+  | "invitation_exists" // a pending invitation grants a role only an owner may replace
   | "unavailable";
 
 export class AccountError extends Error {
@@ -184,6 +187,9 @@ export async function edgeAcceptInvitation(
   if (status === 200) return sessionGrant(json);
   if (status === 404) throw new AccountError("link_invalid");
   if (status === 422 || status === 400) throw new AccountError("weak_password");
+  if (status === 409 && record(record(json)?.error)?.code === "person_erased") {
+    throw new AccountError("person_erased");
+  }
   if (status === 409) throw new AccountError("account_exists");
   if (status === 429) throw new AccountError("rate_limited");
   throw new AccountError("unavailable");
@@ -210,6 +216,9 @@ export async function edgeCreateInvitation(
     if (error instanceof GatewayError) {
       if (error.status === 403 && error.code === "role_required") {
         throw new AccountError("role_required");
+      }
+      if (error.status === 409 && error.code === "invitation_exists") {
+        throw new AccountError("invitation_exists");
       }
       if (error.status === 409) throw new AccountError("account_exists");
       if (error.status === 400 || error.status === 422) throw new AccountError("invalid_email");
