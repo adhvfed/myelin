@@ -4,6 +4,34 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-26 — Permission checks read only what they can reach; the inbox reads a page at once
+
+Every permission check loaded all of its tenant's relationship tuples and rebuilt a lookup map.
+The inbox made one such check per distinct item subject, so a 6k-item inbox in a tenant with
+5.6k tuples took 1.4–2.9 s for its first page and 16 s to walk.
+
+- A check now starts at the objects it asks about and follows only usersets, hop by hop, in one
+  repeatable-read transaction. It keeps every userset and only the asking subject's own grants,
+  so its cost follows the graph it walks, not the tenant. Expansions and `list_objects` read the
+  same way. Two online indexes serve the two halves of each hop. A revoked grant is gone on the
+  next check, as before.
+- Tuples are stored under their object key, so a reference spelling and a bare key are one
+  tuple. Removing by a reference spelling also removes a tuple stored under it.
+- The inbox decides a whole page from one batch: one issue lookup, one CI-run lookup, one pull
+  request lookup, and one relationship snapshot for every permission question. All of it is
+  asked with `Strong` consistency; CI and review items used to go through the bounded-stale
+  Git gate.
+- Pages after the first start at their cursor (a row comparison on the attention index) instead
+  of re-reading every row ranked above them.
+- `GET /v1/notif/inbox?subject=<ref>` and `myelin inbox list --subject <ref>` show the
+  notifications about one artifact. System tests read inboxes this way instead of walking them,
+  and the inbox-scale test seeds a person created for its run instead of the shared reviewer.
+
+Proof: `integration_check_subgraph_durable` shows a revoked inherited grant denying on the next
+check, a check reading 2 of 603 tuples, and reference-spelled writes and removals.
+`integration_notif_pg_inbox` walks tied ranks and a subject filter and rejects a cursor replayed
+on another subject. The three system tests that timed out at 30 s pass in 1.7–6.6 s in the full suite.
+
 ## 2026-11-09 — Agents edit their own pull requests' text
 
 An agent that opened a pull request could not update what it said its change did, even as the

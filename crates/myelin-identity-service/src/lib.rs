@@ -1002,7 +1002,32 @@ impl StoreBackedCheck {
         at: &Consistency,
         caveat: Option<&CaveatContext>,
     ) -> myelin_identity::Result<Vec<Decision>> {
-        if objects.is_empty() {
+        let questions = objects
+            .iter()
+            .map(|object| (permission.clone(), object.clone()))
+            .collect::<Vec<_>>();
+        self.check_questions(subject, &questions, at, caveat)
+    }
+
+    /// Answers several permission questions for one subject from one relationship snapshot:
+    /// a page of mixed artifacts costs the same few reads as a single check.
+    pub fn check_each(
+        &self,
+        subject: &Principal,
+        questions: &[(Permission, ArtifactRef)],
+        at: &Consistency,
+    ) -> myelin_identity::Result<Vec<Decision>> {
+        self.check_questions(subject, questions, at, None)
+    }
+
+    fn check_questions(
+        &self,
+        subject: &Principal,
+        questions: &[(Permission, ArtifactRef)],
+        at: &Consistency,
+        caveat: Option<&CaveatContext>,
+    ) -> myelin_identity::Result<Vec<Decision>> {
+        if questions.is_empty() {
             return Ok(Vec::new());
         }
         let scope =
@@ -1013,14 +1038,19 @@ impl StoreBackedCheck {
             &revoke_target,
             &myelin_events::Timestamp(String::new()),
         ) {
-            return Ok(vec![Decision::Deny; objects.len()]);
+            return Ok(vec![Decision::Deny; questions.len()]);
         }
 
-        let snapshot = self.engine.snapshot(&scope, &at.at_least)?;
+        let snapshot = self.engine.subject_snapshot(
+            &scope,
+            &at.at_least,
+            subject,
+            questions.iter().map(|(_, object)| object.0.clone()),
+        )?;
         let namespace = self.namespace.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(objects
+        Ok(questions
             .iter()
-            .map(|object| {
+            .map(|(permission, object)| {
                 let granted = namespace.permits_snapshot(
                     &snapshot,
                     subject,

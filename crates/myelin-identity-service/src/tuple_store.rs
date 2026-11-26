@@ -8,7 +8,11 @@ use myelin_events::{
 use myelin_events::{EmitContextBase, OutboxStore, OutboxTransaction, OutboxTx};
 use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
-use myelin_storage::{TenantQuery, TenantScope, TenantTable};
+#[cfg(any(test, feature = "test-support"))]
+use myelin_storage::tuple_subgraph::{tuple_object_key, SubgraphFrontier};
+use myelin_storage::{
+    SubgraphEdge, SubgraphRoots, SubgraphSubjects, TenantQuery, TenantScope, TenantTable,
+};
 use myelin_tenancy::{Region, TenantId};
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
@@ -111,6 +115,12 @@ struct RelationshipLifetime {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TupleSnapshot {
     pub(crate) tuples: Vec<StoredTuple>,
+    pub(crate) zookie: Zookie,
+}
+
+/// The tuples one question can reach, as of `zookie`.
+pub(crate) struct TupleGraph {
+    pub(crate) edges: Vec<SubgraphEdge>,
     pub(crate) zookie: Zookie,
 }
 
@@ -331,6 +341,65 @@ impl TupleStore {
                 Ok(TupleSnapshot {
                     tuples,
                     zookie: Self::zookie_of(snapshot.revision),
+                })
+            }
+        }
+    }
+
+    /// Reads the tuples a question about `roots` can reach (see `myelin_storage::tuple_subgraph`).
+    pub(crate) fn subgraph_in(
+        &self,
+        scope: &TenantScope,
+        roots: SubgraphRoots,
+        subjects: SubgraphSubjects,
+        max_hops: usize,
+    ) -> Result<TupleGraph, TupleReadError> {
+        #[cfg(test)]
+        if let Some(error) = &self.read_failure {
+            return Err(error.clone());
+        }
+
+        let _q = TenantQuery::for_table(scope.clone(), TenantTable::new(S3_TABLE));
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            TupleBackend::Memory(inner_arc) => {
+                let inner = Self::mem_lock(inner_arc);
+                let now = chrono::Utc::now();
+                let live = inner
+                    .partitions
+                    .get(&Self::part_key(scope))
+                    .map(|p| {
+                        p.values()
+                            .filter(|tuple| tuple_is_live_at(tuple, &now))
+                            .map(|tuple| SubgraphEdge {
+                                object: tuple.tuple.object.0.clone(),
+                                relation: tuple.tuple.relation.0.clone(),
+                                subject: tuple.tuple.subject.0.clone(),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let zookie = self.current_zookie();
+                drop(inner);
+                Ok(TupleGraph {
+                    edges: memory_subgraph(live, &roots, &subjects, max_hops),
+                    zookie,
+                })
+            }
+            TupleBackend::Pg(pg) => {
+                let graph = pg
+                    .block(pg.backing.subgraph_in(
+                        &scope.tenant().0,
+                        &scope.region().0,
+                        roots,
+                        subjects,
+                        max_hops,
+                    ))
+                    .map_err(|error| TupleReadError(error.to_string()))?;
+                self.revision.fetch_max(graph.revision, Ordering::SeqCst);
+                Ok(TupleGraph {
+                    edges: graph.edges,
+                    zookie: Self::zookie_of(graph.revision),
                 })
             }
         }
@@ -705,6 +774,74 @@ impl TupleDeltaObject for RelationTuple {
     fn tuple_object(&self) -> &str {
         &self.object.0
     }
+}
+
+/// The in-memory twin of the durable subgraph read: the same walk over the same live tuples.
+/// Stored objects are matched by key, as the durable store keys them on write.
+#[cfg(any(test, feature = "test-support"))]
+fn memory_subgraph(
+    live: Vec<SubgraphEdge>,
+    roots: &SubgraphRoots,
+    subjects: &SubgraphSubjects,
+    max_hops: usize,
+) -> Vec<SubgraphEdge> {
+    let keeps = |edge: &SubgraphEdge| match subjects {
+        SubgraphSubjects::All => true,
+        SubgraphSubjects::Only(subject) => {
+            edge.subject == *subject
+                || myelin_storage::tuple_subgraph::userset_object(&edge.subject).is_some()
+        }
+    };
+    let mut by_object: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, edge) in live.iter().enumerate() {
+        let key = tuple_object_key(&edge.object);
+        if key != edge.object {
+            by_object
+                .entry(edge.object.clone())
+                .or_default()
+                .push(index);
+        }
+        by_object.entry(key).or_default().push(index);
+    }
+    let mut taken = vec![false; live.len()];
+    let mut frontier = SubgraphFrontier::default();
+    let mut hop: Vec<usize> = Vec::new();
+    match roots {
+        SubgraphRoots::Objects(objects) => {
+            for object in objects {
+                frontier.push(object);
+            }
+        }
+        SubgraphRoots::ObjectType(object_type) => {
+            let prefix = format!("{object_type}:");
+            for (index, edge) in live.iter().enumerate() {
+                let key = tuple_object_key(&edge.object);
+                if (key.starts_with(&prefix) || key == *object_type) && keeps(edge) {
+                    frontier.mark_read(&edge.object);
+                    taken[index] = true;
+                    hop.push(index);
+                }
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for _ in 0..=max_hops {
+        frontier.push_usersets(hop.iter().map(|index| live[*index].subject.as_str()));
+        edges.extend(hop.drain(..).map(|index| live[index].clone()));
+        let objects = frontier.take();
+        if objects.is_empty() {
+            break;
+        }
+        for object in objects {
+            for index in by_object.get(&object).into_iter().flatten() {
+                if !taken[*index] && keeps(&live[*index]) {
+                    taken[*index] = true;
+                    hop.push(*index);
+                }
+            }
+        }
+    }
+    edges
 }
 
 #[cfg(any(test, feature = "test-support"))]

@@ -647,6 +647,10 @@ impl DurableTupleBacking {
         DurableTupleBacking { provider }
     }
 
+    pub(crate) fn provider(&self) -> &SubstrateProvider {
+        &self.provider
+    }
+
     pub async fn apply_deltas_co_commit<F>(
         &self,
         tenant: &str,
@@ -696,6 +700,24 @@ impl DurableTupleBacking {
                 "relationship write requires at least one delta".into(),
             ));
         }
+        // Tuples are stored under their object key, which is what reads look them up by. A
+        // removal also deletes the spelling it names, in case a tuple was stored under it.
+        let spelled_removals = deltas
+            .iter()
+            .filter(|delta| {
+                delta.op == TupleEdgeOp::Remove
+                    && crate::tuple_subgraph::tuple_object_key(&delta.object) != delta.object
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let deltas: Vec<DurableTupleDelta> = deltas
+            .iter()
+            .map(|delta| DurableTupleDelta {
+                object: crate::tuple_subgraph::tuple_object_key(&delta.object),
+                ..delta.clone()
+            })
+            .collect();
+        let deltas = deltas.as_slice();
         sqlx::query(
             "INSERT INTO rebac_revision (tenant_id, region, revision) \
              VALUES ($1, $2, 0) ON CONFLICT DO NOTHING",
@@ -778,6 +800,17 @@ impl DurableTupleBacking {
                     .await?
                 }
             }
+        }
+        for delta in &spelled_removals {
+            PgStore::delete_tuple_on_conn(
+                conn,
+                tenant,
+                region,
+                &delta.object,
+                &delta.relation,
+                &delta.subject,
+            )
+            .await?;
         }
         for object in &objects {
             sqlx::query(
@@ -885,7 +918,7 @@ impl DurableTupleBacking {
     ) -> Result<u64, ProviderError> {
         let tenant_owned = tenant.to_string();
         let region_owned = region.to_string();
-        let object_owned = object.to_string();
+        let object_owned = crate::tuple_subgraph::tuple_object_key(object);
         self.provider
             .with_tenant_tx(tenant, move |conn| {
                 Box::pin(async move {

@@ -11,7 +11,7 @@ import {
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { awaitAutomationFiring } from "../src/journeys/automations.js";
-import { findInboxItemMatching } from "../src/journeys/inbox.js";
+import { findInboxItem } from "../src/journeys/inbox.js";
 import { announceIssueChange, awaitActiveIssue } from "../src/journeys/issues.js";
 import { integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
@@ -106,9 +106,10 @@ describe("human-governed agent merges", () => {
       changeKind: "merge_request",
     });
     const awaitUnreadApproval = (description: string) => eventually<JsonRecord>(async () => {
-      return findInboxItemMatching(
+      return findInboxItem(
         founder,
-        (item) => item.subject === pullRequestRef && item.state === "unread" &&
+        pullRequestRef,
+        (item) => item.state === "unread" &&
           item.action !== null && typeof item.action === "object" &&
           record(item.action, "agent approval action").kind === "agent_effect_approval",
       );
@@ -171,8 +172,9 @@ describe("human-governed agent merges", () => {
     });
     await eventually(async () => {
       const response = await founder.json(`${project.path}/prs/${pullRequestNumber}`);
-      const done = await findInboxItemMatching(
+      const done = await findInboxItem(
         founder,
+        string(rejectedNotice.subject, "approval notice subject"),
         (item) => item.id === rejectedNotice.id && item.state === "done",
       );
       return response.body.pr_state === "open" && done ? true : undefined;
@@ -219,8 +221,9 @@ describe("human-governed agent merges", () => {
     );
     expect(lateApproval.body).toMatchObject({ error: { code: "conflict" } });
     await eventually(async () => {
-      const done = await findInboxItemMatching(
+      const done = await findInboxItem(
         founder,
+        string(stoppedNotice.subject, "approval notice subject"),
         (item) => item.id === stoppedNotice.id && item.state === "done",
       );
       return done === undefined ? undefined : true;
@@ -280,8 +283,9 @@ describe("human-governed agent merges", () => {
       "A human approved this exact agent effect.\n",
     );
     const completedNotice = await eventually<JsonRecord>(async () => {
-      return findInboxItemMatching(
+      return findInboxItem(
         founder,
+        string(approvalNotice.subject, "approval notice subject"),
         (item) => item.id === approvalNotice.id && item.state === "done",
       );
     }, { description: "the decided agent effect to leave the active inbox" });
@@ -385,9 +389,10 @@ describe("human-governed agent merges", () => {
     expect((await founder.json(
       `${protectedRepository.path}/prs/${pullRequestNumber}`,
     )).body).toMatchObject({ pr_state: "open" });
-    expect(await findInboxItemMatching(
+    expect(await findInboxItem(
       founder,
-      (item) => item.subject === pullRequestRef && item.state !== "done",
+      pullRequestRef,
+      (item) => item.state !== "done",
     )).toBeUndefined();
 
     const runId = string(firing.run_id, "repository-bound run id");

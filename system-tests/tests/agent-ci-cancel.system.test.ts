@@ -17,7 +17,7 @@ import {
   closeAgentRun,
 } from "../src/journeys/agents.js";
 import { ciRunsMatching } from "../src/journeys/ci-runs.js";
-import { findInboxItemMatching } from "../src/journeys/inbox.js";
+import { findInboxItem } from "../src/journeys/inbox.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
@@ -83,9 +83,10 @@ describe("human-governed agent CI cancellation", () => {
       );
 
       const approvalNotice = await eventually<JsonRecord>(async () => {
-        return findInboxItemMatching(
+        return findInboxItem(
           founder,
-          (item) => item.subject === runRef && item.state === "unread" &&
+          runRef,
+          (item) => item.state === "unread" &&
             item.action !== null && typeof item.action === "object" &&
             record(item.action, "CI cancellation approval action").gate_id === gateId,
         );

@@ -8,13 +8,13 @@
 //      no matter how much older material the inbox holds;
 //   2. a single page read stays within a per-page budget.
 //
-// The seed lands in the REVIEWER's inbox so the primary principal's inbox -
-// which the other notification journeys walk - stays lean, and the seed is
-// retired (signal-resolved -> done) afterwards so this test never becomes the
-// debris it guards against.
+// The seed lands in the inbox of a person created for this run, so no shared
+// test principal accumulates it across runs and every run measures the same
+// deliberately sized inbox.
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { reviewerClient, uniqueName } from "../src/context.js";
+import { SystemTestClient } from "../src/client.js";
+import { uniqueName } from "../src/context.js";
 import { ExternalEventBus } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
@@ -26,6 +26,8 @@ import {
   seedInbox,
 } from "../src/journeys/inbox.js";
 import { systemTestConfig } from "../src/config.js";
+import { operatorBootstrap } from "../src/operator.js";
+import { findPaged } from "../src/paging.js";
 
 const SEED_COUNT = 250;
 const STALE_APPROVAL_COUNT = 30;
@@ -39,18 +41,19 @@ describe.sequential("notification inbox at scale", () => {
   // an artifact its viewer cannot see). So the seed mentions PRs of a real
   // repository OWNED BY THE RECIPIENT - a mention about someone else's
   // repository is (correctly) invisible to a reviewer without a pull grant.
+  const recipient = uniqueName("inbox-scale");
   const repoSlug = uniqueName("inbox-scale");
   const staleApprovalRepoSlug = uniqueName("inbox-stale-approvals");
   const seedPrefix = `myelin://${systemTestConfig.tenant}/git/pr/${repoSlug}`;
   const seed = {
     actor: systemTestConfig.principal,
-    recipient: systemTestConfig.reviewerPrincipal,
+    recipient,
     subjectPrefix: seedPrefix,
     count: SEED_COUNT,
   };
   const staleApprovals = {
     actor: systemTestConfig.principal,
-    recipient: systemTestConfig.reviewerPrincipal,
+    recipient,
     subjectPrefix:
       `myelin://${systemTestConfig.tenant}/git/pr/${staleApprovalRepoSlug}`,
     count: STALE_APPROVAL_COUNT,
@@ -58,28 +61,30 @@ describe.sequential("notification inbox at scale", () => {
   };
   const freshMention = {
     actor: systemTestConfig.principal,
-    recipient: systemTestConfig.reviewerPrincipal,
+    recipient,
     dedupKey: `fresh-${repoSlug}`,
     subject: `${seedPrefix}:${SEED_COUNT + 1}`,
   };
   let bus: ExternalEventBus;
+  let recipientClient: SystemTestClient;
 
   beforeAll(async () => {
-    await new GitProject(repoSlug, reviewerClient).create();
-    await new GitProject(staleApprovalRepoSlug, reviewerClient).create();
+    recipientClient = new SystemTestClient({
+      ...systemTestConfig,
+      token: await operatorBootstrap(systemTestConfig.tenant, recipient, "Inbox Scale"),
+      principal: recipient,
+    });
+    await new GitProject(repoSlug, recipientClient).create();
+    await new GitProject(staleApprovalRepoSlug, recipientClient).create();
     bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
-    await seedInbox(bus, reviewerClient, seed);
-    await seedInbox(bus, reviewerClient, staleApprovals);
-    await retireSeededInbox(bus, reviewerClient, staleApprovals);
+    await seedInbox(bus, recipientClient, seed);
+    await seedInbox(bus, recipientClient, staleApprovals);
+    await retireSeededInbox(bus, recipientClient, staleApprovals);
   }, 360_000);
 
   afterAll(async () => {
-    if (bus !== undefined) {
-      await retireSeededInbox(bus, reviewerClient, seed);
-      await bus.publish(notificationSignalEnvelope({ ...freshMention, state: "Resolved" }));
-      await bus.close();
-    }
-  }, 360_000);
+    await bus?.close();
+  });
 
   test("surfaces fresh work ahead of completed high-priority approvals", async () => {
     const subject = freshMention.subject;
@@ -87,7 +92,7 @@ describe.sequential("notification inbox at scale", () => {
     await bus.publish(notificationSignalEnvelope(freshMention));
 
     const firstPageItem = await eventually(async () => {
-      const page = await readInboxPage(reviewerClient, null, 25);
+      const page = await readInboxPage(recipientClient, null, 25);
       return page.items.find((item) => item.subject === subject);
     }, {
       description:
@@ -102,7 +107,7 @@ describe.sequential("notification inbox at scale", () => {
 
   test("keeps a single page read within its latency budget", async () => {
     const startedAt = Date.now();
-    const page = await readInboxPage(reviewerClient, null, 100);
+    const page = await readInboxPage(recipientClient, null, 100);
     const elapsedMs = Date.now() - startedAt;
     expect(page.items.length).toBeGreaterThan(0);
     expect(
@@ -114,7 +119,14 @@ describe.sequential("notification inbox at scale", () => {
 
   test("still finds a mid-seed item without losing it behind the scale", async () => {
     const midSubject = `${seedPrefix}:${Math.floor(SEED_COUNT / 2)}`;
-    const found = await findInboxItem(reviewerClient, midSubject);
-    expect(found).toMatchObject({ subject: midSubject });
+    const walked = await findPaged(
+      recipientClient,
+      "/v1/notif/inbox?view=all",
+      (item) => item.subject === midSubject,
+    );
+    expect(walked, "a cursor walk reaches the middle of the seed").toMatchObject({
+      subject: midSubject,
+    });
+    expect(await findInboxItem(recipientClient, midSubject)).toEqual(walked);
   });
 });

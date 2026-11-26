@@ -1,14 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use myelin_events::ArtifactRef;
-use myelin_identity::{
-    Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
-};
+use myelin_git::live_check::perm;
+use myelin_identity::{Consistency, ConsistencyMode, Decision, Permission, Principal, Zookie};
 use myelin_identity_service::StoreBackedCheck;
 use myelin_notif::cli::CliView;
-use myelin_notif::list_inbox::subsystem_of;
+use myelin_notif::list_inbox::{subsystem_of, InboxFilter};
 use myelin_notif::pg_inbox::{
     DurableInboxItem, InboxReadRequest, InboxReadScope, PgInboxError, PgInboxStore,
 };
@@ -25,11 +24,13 @@ use crate::ci_http::DurableCiApi;
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
-use crate::request::EdgeResponse;
+use crate::repo_authz_live::repo_object_ref;
+use crate::request::{decode_form_query_component, EdgeResponse};
 use crate::runtime::drive_result_on_runtime;
 
 const DEFAULT_INBOX_LIMIT: u16 = 50;
 const MAX_INBOX_MUTATION_BYTES: usize = 1_024;
+const MAX_INBOX_SUBJECT_BYTES: usize = 512;
 
 #[derive(Clone)]
 struct DurableNotifHttpApi {
@@ -48,120 +49,282 @@ impl DurableNotifHttpApi {
         drive_result_on_runtime(&self.runtime, future, PgInboxError::Database)
     }
 
-    fn can_read_subject(
+    /// Whether the recipient may still read each item's subject. A page costs a fixed number of
+    /// reads however many items it holds: one per kind of fact the items depend on, and one
+    /// relationship snapshot that answers every permission question at once.
+    fn readable(
         &self,
         principal: &Principal,
-        row: &DurableInboxItem,
-        cache: &mut SubjectReadCache,
-    ) -> Result<bool, PgInboxError> {
-        let subsystem = subsystem_of(&row.item.subject);
-        if subsystem == myelin_notif::list_inbox::Subsystem::Ci {
-            let Some(run_id) = ci_run_id(&row.item.subject, principal.tenant.as_str()) else {
-                return Ok(false);
-            };
-            let access = SubjectAccess::CiRun {
-                run_id: run_id.clone(),
-            };
-            if let Some(allowed) = cache.decisions.get(&access) {
-                return Ok(*allowed);
-            }
-            let allowed = self
-                .ci
-                .may_view_run(principal, &run_id)
-                .map_err(|_| PgInboxError::Database)?;
-            cache.decisions.insert(access, allowed);
-            return Ok(allowed);
-        }
-        let issue_object = if subsystem == myelin_notif::list_inbox::Subsystem::Issue {
-            self.issue_authorization_object(principal, &row.item.subject, cache)?
-        } else {
-            None
+        rows: &[DurableInboxItem],
+    ) -> Result<Vec<bool>, PgInboxError> {
+        let needs = rows
+            .iter()
+            .map(|row| read_need(principal, row))
+            .collect::<Vec<_>>();
+        let facts = PageFacts {
+            issues: self.issue_objects(principal, &needs)?,
+            run_repositories: self.run_repositories(principal, &needs)?,
+            reviewing: self.reviewing(principal, &needs),
         };
-        Ok(can_read_subject_cached(
-            &self.identity,
-            Some(&self.git),
-            principal,
-            row,
-            issue_object,
-            cache,
-        ))
+        Ok(decide(&self.identity, principal, &needs, &facts))
     }
 
-    fn issue_authorization_object(
+    fn issue_objects(
         &self,
         principal: &Principal,
-        subject: &ArtifactRef,
-        cache: &mut SubjectReadCache,
-    ) -> Result<Option<ArtifactRef>, PgInboxError> {
-        if let Some(cached) = cache.issue_objects.get(&subject.0) {
-            return Ok(cached.clone());
+        needs: &[ReadNeed],
+    ) -> Result<HashMap<String, ArtifactRef>, PgInboxError> {
+        let keys = needs
+            .iter()
+            .filter_map(|need| match need {
+                ReadNeed::Issue(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(HashMap::new());
         }
-        let Some(key) = myelin_refs::object_key(subject) else {
-            return Ok(None);
-        };
-        if key.tenant.as_deref() != Some(principal.tenant.as_str())
-            || key.subsystem.as_deref() != Some("issue")
-            || key.object_type.as_deref() != Some("issue")
-        {
-            return Ok(None);
-        }
+        // References name an issue by key; Issues events name it by id.
+        let ids = keys
+            .iter()
+            .filter_map(|key| {
+                Uuid::parse_str(key)
+                    .ok()
+                    .filter(|id| id.to_string() == *key)
+            })
+            .collect::<Vec<_>>();
         let tenant = principal.tenant.0.clone();
         let region = principal.region.0.clone();
-        // References name an issue by key; Issues events name it by id.
-        let issue_key = key.id;
-        let issue_uuid = Uuid::parse_str(&issue_key)
-            .ok()
-            .filter(|id| id.to_string() == issue_key);
         let query_tenant = tenant.clone();
         let query_region = region.clone();
-        let issue_id = self.drive(with_tenant_tx_error(
+        let query_keys = keys.clone();
+        let rows = self.drive(with_tenant_tx_error(
             self.store.pool(),
             &tenant,
             &region,
             move |conn| {
                 Box::pin(async move {
-                    sqlx::query_scalar::<_, Uuid>(
-                        "SELECT id FROM issue \
+                    sqlx::query_as::<_, (Uuid, String)>(
+                        "SELECT id, key FROM issue \
                          WHERE tenant_id = $1 AND region = $2 \
-                           AND (key = $3 OR id = $4) AND deleted_at IS NULL",
+                           AND (key = ANY($3) OR id = ANY($4)) AND deleted_at IS NULL",
                     )
                     .bind(&query_tenant)
                     .bind(&query_region)
-                    .bind(&issue_key)
-                    .bind(issue_uuid)
-                    .fetch_optional(&mut *conn)
+                    .bind(&query_keys)
+                    .bind(&ids)
+                    .fetch_all(&mut *conn)
                     .await
                     .map_err(|_| PgInboxError::Database)
                 })
             },
         ))?;
-        let object = issue_id.map(|id| ArtifactRef(format!("issue:{id}")));
-        cache
-            .issue_objects
-            .insert(subject.0.clone(), object.clone());
-        Ok(object)
+        let mut objects = HashMap::new();
+        for (id, _) in &rows {
+            objects.insert(id.to_string(), ArtifactRef(format!("issue:{id}")));
+        }
+        for (id, key) in rows {
+            objects.insert(key, ArtifactRef(format!("issue:{id}")));
+        }
+        Ok(objects)
+    }
+
+    fn run_repositories(
+        &self,
+        principal: &Principal,
+        needs: &[ReadNeed],
+    ) -> Result<HashMap<String, String>, PgInboxError> {
+        let run_ids = needs
+            .iter()
+            .filter_map(|need| match need {
+                ReadNeed::CiRun(run_id) => Some(run_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if run_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.ci
+            .run_repositories(principal, &run_ids)
+            .map_err(|_| PgInboxError::Database)
+    }
+
+    /// A pull request that cannot be read stays hidden, so a failed read hides it too.
+    fn reviewing(&self, principal: &Principal, needs: &[ReadNeed]) -> BTreeSet<(String, u64)> {
+        let coordinates = needs
+            .iter()
+            .filter_map(|need| match need {
+                ReadNeed::Review {
+                    repository, number, ..
+                } => Some((repository.clone(), *number)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.git
+            .pull_requests_reviewed_by(principal, &coordinates)
+            .unwrap_or_default()
     }
 }
 
-#[derive(Default)]
-struct SubjectReadCache {
-    issue_objects: HashMap<String, Option<ArtifactRef>>,
-    decisions: HashMap<SubjectAccess, bool>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum SubjectAccess {
-    Permission {
-        permission: &'static str,
-        object: String,
-    },
-    PullRequestReview {
+/// What showing one inbox item to its recipient takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ReadNeed {
+    Never,
+    /// A permission on an object the subject names directly.
+    Permission(&'static str, ArtifactRef),
+    /// `view` on the issue a key or id names.
+    Issue(String),
+    /// `pull` on the repository a CI run was built from.
+    CiRun(String),
+    /// A requested reviewer reads the pull request through push access or the review
+    /// relationship recorded on it, and otherwise through `pull` on its repository.
+    Review {
         repository: String,
         number: u64,
+        otherwise: Option<ArtifactRef>,
     },
-    CiRun {
-        run_id: String,
-    },
+}
+
+/// The facts a page's needs depend on, each read once for the whole page.
+#[derive(Default)]
+struct PageFacts {
+    /// Issue key or id to its authorization object.
+    issues: HashMap<String, ArtifactRef>,
+    /// CI run id to the repository it was built from.
+    run_repositories: HashMap<String, String>,
+    /// Pull requests that record a review relationship with the recipient.
+    reviewing: BTreeSet<(String, u64)>,
+}
+
+fn read_need(principal: &Principal, row: &DurableInboxItem) -> ReadNeed {
+    let subject = &row.item.subject;
+    let tenant = principal.tenant.as_str();
+    match subsystem_of(subject) {
+        myelin_notif::list_inbox::Subsystem::Issue => issue_key(subject, tenant)
+            .map(ReadNeed::Issue)
+            .unwrap_or(ReadNeed::Never),
+        myelin_notif::list_inbox::Subsystem::Chat => chat_subject_access(subject, tenant)
+            .map(|(permission, object)| ReadNeed::Permission(permission, object))
+            .unwrap_or(ReadNeed::Never),
+        myelin_notif::list_inbox::Subsystem::Knowledge => {
+            ReadNeed::Permission("read", subject.clone())
+        }
+        myelin_notif::list_inbox::Subsystem::Ci => ci_run_id(subject, tenant)
+            .map(ReadNeed::CiRun)
+            .unwrap_or(ReadNeed::Never),
+        myelin_notif::list_inbox::Subsystem::Git => {
+            let repository = git_repo_subject(subject, tenant);
+            match git_pr_coordinate(subject, tenant) {
+                Some((pr_repository, number))
+                    if row.item.reason == myelin_notif::Reason::ReviewRequested
+                        && row.item.recipient == principal.principal_id.0 =>
+                {
+                    ReadNeed::Review {
+                        repository: pr_repository,
+                        number,
+                        otherwise: repository,
+                    }
+                }
+                _ => repository
+                    .map(|repository| ReadNeed::Permission("pull", repository))
+                    .unwrap_or(ReadNeed::Never),
+            }
+        }
+        myelin_notif::list_inbox::Subsystem::Unknown => ReadNeed::Never,
+    }
+}
+
+fn issue_key(subject: &ArtifactRef, expected_tenant: &str) -> Option<String> {
+    let key = myelin_refs::object_key(subject)?;
+    (key.tenant.as_deref() == Some(expected_tenant)
+        && key.subsystem.as_deref() == Some("issue")
+        && key.object_type.as_deref() == Some("issue"))
+    .then_some(key.id)
+}
+
+/// Answers every need from one batch of permission questions, asked with `Strong` consistency so
+/// a revoked grant hides its items on the very next read.
+fn decide(
+    identity: &StoreBackedCheck,
+    principal: &Principal,
+    needs: &[ReadNeed],
+    facts: &PageFacts,
+) -> Vec<bool> {
+    let mut questions = PermissionQuestions::default();
+    let plans = needs
+        .iter()
+        .map(|need| match need {
+            ReadNeed::Never => Vec::new(),
+            ReadNeed::Permission(permission, object) => {
+                vec![questions.ask(permission, object.clone())]
+            }
+            ReadNeed::Issue(key) => facts
+                .issues
+                .get(key)
+                .map(|object| vec![questions.ask("view", object.clone())])
+                .unwrap_or_default(),
+            ReadNeed::CiRun(run_id) => facts
+                .run_repositories
+                .get(run_id)
+                .map(|slug| vec![questions.ask(perm::PULL, repo_object_ref(slug))])
+                .unwrap_or_default(),
+            ReadNeed::Review {
+                repository,
+                otherwise,
+                ..
+            } => std::iter::once(questions.ask(perm::PUSH, repo_object_ref(repository)))
+                .chain(
+                    otherwise
+                        .iter()
+                        .map(|object| questions.ask("pull", object.clone())),
+                )
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let decisions = identity
+        .check_each(
+            principal,
+            &questions.asked,
+            &Consistency {
+                at_least: Zookie(String::new()),
+                mode: ConsistencyMode::Strong,
+            },
+        )
+        .unwrap_or_default();
+    let allowed = |index: &usize| decisions.get(*index) == Some(&Decision::Allow);
+    needs
+        .iter()
+        .zip(plans)
+        .map(|(need, plan)| {
+            plan.iter().any(allowed)
+                || matches!(need, ReadNeed::Review { repository, number, .. }
+                    if facts.reviewing.contains(&(repository.clone(), *number)))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct PermissionQuestions {
+    asked: Vec<(Permission, ArtifactRef)>,
+    index: HashMap<(&'static str, String), usize>,
+}
+
+impl PermissionQuestions {
+    fn ask(&mut self, permission: &'static str, object: ArtifactRef) -> usize {
+        *self
+            .index
+            .entry((permission, object.0.clone()))
+            .or_insert_with(|| {
+                self.asked.push((Permission(permission.into()), object));
+                self.asked.len() - 1
+            })
+    }
 }
 
 struct InboxListHandler {
@@ -213,12 +376,11 @@ impl Handler for InboxGetHandler {
                     .get(&inbox_scope(ctx.principal), inbox_item_param(ctx)?),
             )
             .map_err(map_inbox_error)?;
-        let mut cache = SubjectReadCache::default();
-        if !self
+        let readable = self
             .api
-            .can_read_subject(ctx.principal, &row, &mut cache)
-            .map_err(map_inbox_error)?
-        {
+            .readable(ctx.principal, std::slice::from_ref(&row))
+            .map_err(map_inbox_error)?;
+        if readable != [true] {
             return Err(EdgeError::NotFound("notification not found".into()));
         }
         Ok(
@@ -355,7 +517,10 @@ impl Handler for InboxListHandler {
         let query = parse_inbox_query(&ctx.request.query)?;
         let request = InboxReadRequest {
             scope: inbox_scope(ctx.principal),
-            filter: query.view.filter(),
+            filter: InboxFilter {
+                subject: query.subject,
+                ..query.view.filter()
+            },
             limit: query.limit,
             cursor: query.cursor,
         };
@@ -363,17 +528,17 @@ impl Handler for InboxListHandler {
             .api
             .drive(self.api.store.list(&request))
             .map_err(map_inbox_error)?;
-        let mut items = Vec::with_capacity(page.items.len());
-        let mut cache = SubjectReadCache::default();
-        for row in &page.items {
-            if self
-                .api
-                .can_read_subject(ctx.principal, row, &mut cache)
-                .map_err(map_inbox_error)?
-            {
-                items.push(inbox_item_json(row));
-            }
-        }
+        let readable = self
+            .api
+            .readable(ctx.principal, &page.items)
+            .map_err(map_inbox_error)?;
+        let items = page
+            .items
+            .iter()
+            .zip(readable)
+            .filter(|(_, readable)| *readable)
+            .map(|(row, _)| inbox_item_json(row))
+            .collect::<Vec<_>>();
         Ok(EdgeResponse::json(
             200,
             &page_envelope(json!(items), page.next_cursor, usize::from(query.limit)),
@@ -387,12 +552,15 @@ struct InboxQuery {
     view: CliView,
     limit: u16,
     cursor: Option<String>,
+    /// Only notifications about this artifact.
+    subject: Option<String>,
 }
 
 fn parse_inbox_query(query: &str) -> Result<InboxQuery, EdgeError> {
     let mut view = None;
     let mut limit = None;
     let mut cursor = None;
+    let mut subject = None;
     if !query.is_empty() {
         for pair in query.split('&') {
             let (name, value) = pair.split_once('=').ok_or_else(|| {
@@ -435,6 +603,22 @@ fn parse_inbox_query(query: &str) -> Result<InboxQuery, EdgeError> {
                     }
                     cursor = Some(value.to_string());
                 }
+                "subject" => {
+                    if subject.is_some() {
+                        return Err(duplicate("subject"));
+                    }
+                    let decoded = decode_form_query_component(value, "notification inbox")?;
+                    if decoded.is_empty()
+                        || decoded.len() > MAX_INBOX_SUBJECT_BYTES
+                        || decoded.chars().any(char::is_control)
+                    {
+                        return Err(EdgeError::BadRequest(
+                            "notification inbox subject must be a non-empty artifact reference"
+                                .into(),
+                        ));
+                    }
+                    subject = Some(decoded);
+                }
                 "" => {
                     return Err(EdgeError::BadRequest(
                         "empty notification inbox query parameter".into(),
@@ -452,6 +636,7 @@ fn parse_inbox_query(query: &str) -> Result<InboxQuery, EdgeError> {
         view: view.unwrap_or(CliView::All),
         limit: limit.unwrap_or(DEFAULT_INBOX_LIMIT),
         cursor,
+        subject,
     })
 }
 
@@ -525,103 +710,6 @@ fn inbox_item_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
         ));
     }
     Ok(value)
-}
-
-#[cfg(test)]
-fn can_read_subject(
-    identity: &StoreBackedCheck,
-    git: Option<&DurableGitBackend>,
-    principal: &Principal,
-    row: &DurableInboxItem,
-    issue_object: Option<ArtifactRef>,
-) -> bool {
-    can_read_subject_cached(
-        identity,
-        git,
-        principal,
-        row,
-        issue_object,
-        &mut SubjectReadCache::default(),
-    )
-}
-
-fn can_read_subject_cached(
-    identity: &StoreBackedCheck,
-    git: Option<&DurableGitBackend>,
-    principal: &Principal,
-    row: &DurableInboxItem,
-    issue_object: Option<ArtifactRef>,
-    cache: &mut SubjectReadCache,
-) -> bool {
-    let (permission, object) = match subsystem_of(&row.item.subject) {
-        myelin_notif::list_inbox::Subsystem::Issue => {
-            let Some(object) = issue_object else {
-                return false;
-            };
-            ("view", object)
-        }
-        myelin_notif::list_inbox::Subsystem::Chat => {
-            let Some(access) = chat_subject_access(&row.item.subject, &principal.tenant.0) else {
-                return false;
-            };
-            access
-        }
-        myelin_notif::list_inbox::Subsystem::Knowledge => ("read", row.item.subject.clone()),
-        // Durable notification reads authorize CI subjects through the source repository before
-        // reaching this identity-only helper. Fail closed in isolated unit callers.
-        myelin_notif::list_inbox::Subsystem::Ci => return false,
-        myelin_notif::list_inbox::Subsystem::Git => {
-            if row.item.reason == myelin_notif::Reason::ReviewRequested
-                && row.item.recipient == principal.principal_id.0
-            {
-                if let (Some(git), Some((repo, number))) = (
-                    git,
-                    git_pr_coordinate(&row.item.subject, &principal.tenant.0),
-                ) {
-                    let access = SubjectAccess::PullRequestReview {
-                        repository: repo.clone(),
-                        number,
-                    };
-                    let allowed = *cache.decisions.entry(access).or_insert_with(|| {
-                        git.authorize_pr_review(
-                            &principal.tenant.0,
-                            &principal.region.0,
-                            &repo,
-                            number,
-                            principal,
-                        )
-                    });
-                    if allowed {
-                        return true;
-                    }
-                }
-            }
-            let Some(repo) = git_repo_subject(&row.item.subject, &principal.tenant.0) else {
-                return false;
-            };
-            ("pull", repo)
-        }
-        myelin_notif::list_inbox::Subsystem::Unknown => return false,
-    };
-    let access = SubjectAccess::Permission {
-        permission,
-        object: object.0.clone(),
-    };
-    *cache.decisions.entry(access).or_insert_with(|| {
-        matches!(
-            identity.check(
-                principal,
-                &Permission(permission.into()),
-                &object,
-                &Consistency {
-                    at_least: Zookie(String::new()),
-                    mode: ConsistencyMode::Strong,
-                },
-                None,
-            ),
-            Ok(Decision::Allow)
-        )
-    })
 }
 
 fn chat_subject_access(
@@ -801,7 +889,8 @@ mod tests {
             InboxQuery {
                 view: CliView::All,
                 limit: 50,
-                cursor: None
+                cursor: None,
+                subject: None,
             }
         );
         assert_eq!(
@@ -810,7 +899,16 @@ mod tests {
                 view: CliView::ReviewRequests,
                 limit: 25,
                 cursor: Some("ni1_abc".into()),
+                subject: None,
             }
+        );
+        assert_eq!(
+            parse_inbox_query("subject=myelin%3A%2F%2Facme%2Fgit%2Fpr%2Fcore%3A42")
+                .unwrap()
+                .subject
+                .as_deref(),
+            Some("myelin://acme/git/pr/core:42"),
+            "a subject narrows the inbox to one artifact"
         );
         for query in [
             "limit=0",
@@ -823,6 +921,10 @@ mod tests {
             "region=eu-west",
             "limit=1&limit=2",
             "bare",
+            "subject=",
+            "subject=%ZZ",
+            "subject=a&subject=b",
+            "subject=a%0Ab",
         ] {
             assert_eq!(
                 parse_inbox_query(query).unwrap_err().status(),
@@ -1034,7 +1136,15 @@ mod tests {
             dek_ref: "kms://acme/notif/inbox".into(),
             priority: 70,
         };
-        assert!(!can_read_subject(&identity, None, &principal, &row, None));
+        let readable = |row: &DurableInboxItem| {
+            decide(
+                &identity,
+                &principal,
+                &[read_need(&principal, row)],
+                &PageFacts::default(),
+            ) == [true]
+        };
+        assert!(!readable(&row));
 
         let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
         tuples
@@ -1052,6 +1162,43 @@ mod tests {
                 Timestamp("2026-07-22T12:00:00Z".into()),
             )
             .unwrap();
-        assert!(can_read_subject(&identity, None, &principal, &row, None));
+        assert!(readable(&row));
+
+        tuples
+            .write_tuples(
+                &scope,
+                &principal,
+                &[TupleDelta::Remove(RelationTuple {
+                    object: ObjectId("repo:core".into()),
+                    relation: RelName("reader".into()),
+                    subject: principal.principal_id.clone(),
+                    caveat: None,
+                })],
+                None,
+                None,
+                Timestamp("2026-07-22T12:00:01Z".into()),
+            )
+            .unwrap();
+        assert!(
+            !readable(&row),
+            "a revoked grant hides the item on the next read"
+        );
+
+        let reviewing = PageFacts {
+            reviewing: [("core".to_string(), 42)].into(),
+            ..PageFacts::default()
+        };
+        let mut other = row.clone();
+        other.item.subject = ArtifactRef("myelin://acme/git/pr/core:43".into());
+        let page = [row.clone(), other];
+        let needs = page
+            .iter()
+            .map(|row| read_need(&principal, row))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decide(&identity, &principal, &needs, &reviewing),
+            [true, false],
+            "a recorded review relationship admits exactly its own pull request"
+        );
     }
 }

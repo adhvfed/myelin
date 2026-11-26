@@ -182,25 +182,27 @@ export async function markInboxViewRead(
   return integer(response.body.updated, "number of notifications marked read");
 }
 
-/// Bounded search for one subject across the recipient's whole inbox.
+/// The recipient's notification about `subject` that matches `predicate`, read
+/// the way a client asks for "notifications about this": the inbox filtered to
+/// one artifact, in every attention band (including `done`). The read never
+/// walks the rest of the inbox, so it costs the same however much the
+/// recipient has accumulated.
 export async function findInboxItem(
   client: SystemTestClient,
   subject: string,
+  predicate: (item: JsonRecord) => boolean = () => true,
 ): Promise<JsonRecord | undefined> {
-  return findInboxItemMatching(client, (item) => item.subject === subject);
-}
-
-/// Bounded search for one item across the recipient's whole inbox. Prefer
-/// this to a first-page read whenever an item may have moved to a lower
-/// attention band such as `done`.
-export async function findInboxItemMatching(
-  client: SystemTestClient,
-  predicate: (item: JsonRecord) => boolean,
-): Promise<JsonRecord | undefined> {
+  const search = new URLSearchParams({ view: "all", subject });
   return findPaged(
     client,
-    "/v1/notif/inbox?view=all",
-    predicate,
+    `/v1/notif/inbox?${search.toString()}`,
+    (item) => {
+      if (item.subject !== subject) {
+        throw new TypeError(`the inbox filtered to ${subject} returned ${String(item.subject)}`);
+      }
+      return predicate(item);
+    },
+    { maxPages: 5 },
   );
 }
 
@@ -265,8 +267,6 @@ export async function seedInbox(
 
 /// Retires a seeded inbox the way the product retires signals: a Resolved
 /// signal per seeded dedup key flips every derived inbox item to `done`.
-/// Scale tests MUST call this so their seeds do not become the accumulated
-/// debris the scale test exists to guard against.
 export async function retireSeededInbox(
   bus: ExternalEventBus,
   client: SystemTestClient,

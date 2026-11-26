@@ -56,6 +56,7 @@ pub mod reserve_settle_durable;
 pub mod restore_verify_durable;
 pub mod s3blob;
 pub mod tenant_tx;
+pub mod tuple_subgraph;
 pub mod valkey;
 pub mod work_wake;
 
@@ -313,6 +314,9 @@ pub use restore_verify_durable::{
 pub use tenant_tx::{
     connect_pool_with_reset, with_tenant_repeatable_read_tx, with_tenant_tx, with_tenant_tx_error,
     TxScope, TypedTxScope,
+};
+pub use tuple_subgraph::{
+    rebac_tuple_subgraph_migrations, SubgraphEdge, SubgraphRoots, SubgraphSubjects, TupleSubgraph,
 };
 
 pub use cell_root_durable::{

@@ -673,6 +673,11 @@ fn validate_request(request: &InboxReadRequest) -> Result<(), PgInboxError> {
     if !(1..=MAX_PAGE_SIZE).contains(&request.limit) {
         return Err(PgInboxError::InvalidLimit);
     }
+    if let Some(subject) = &request.filter.subject {
+        if !valid_item_id(subject) {
+            return Err(PgInboxError::InvalidInput);
+        }
+    }
     validate_scope(&request.scope)
 }
 
@@ -801,7 +806,13 @@ fn canonical_filter(filter: &InboxFilter) -> String {
         || "*".into(),
         |values| sorted(values.iter().map(|value| reason_token(*value))).join(","),
     );
-    format!("subsystems={subsystems};reasons={reasons}")
+    match &filter.subject {
+        None => format!("subsystems={subsystems};reasons={reasons}"),
+        Some(subject) => format!(
+            "subsystems={subsystems};reasons={reasons};subject={}:{subject}",
+            subject.len()
+        ),
+    }
 }
 
 fn subsystem_cursor_token(value: Subsystem) -> &'static str {
@@ -892,29 +903,20 @@ fn build_list_query<'a>(
     query.push(" AND state <> 'snoozed'");
     push_filter(&mut query, &request.filter);
     if let Some(cursor) = cursor {
+        // The row comparison is an index condition on the attention keyset index, so a page
+        // deep in a large inbox starts where the cursor points instead of re-reading every row
+        // ranked above it. Ties on the three descending keys fall back to item id ascending.
         query.push(" AND (");
         push_attention_expression(&mut query);
-        query.push(" < ");
-        query.push_bind(i16::from(cursor.attention));
-        query.push(" OR (");
-        push_attention_expression(&mut query);
-        query.push(" = ");
-        query.push_bind(i16::from(cursor.attention));
-        query.push(" AND ");
+        query.push(", ");
         push_priority_expression(&mut query);
-        query.push(" < ");
-        query.push_bind(i16::from(cursor.priority));
-        query.push(") OR (");
-        push_attention_expression(&mut query);
-        query.push(" = ");
+        query.push(", occurred_at) <= (");
         query.push_bind(i16::from(cursor.attention));
-        query.push(" AND ");
-        push_priority_expression(&mut query);
-        query.push(" = ");
+        query.push(", ");
         query.push_bind(i16::from(cursor.priority));
-        query.push(" AND occurred_at < ");
+        query.push(", ");
         query.push_bind(cursor.occurred_at);
-        query.push(") OR (");
+        query.push(") AND NOT (");
         push_attention_expression(&mut query);
         query.push(" = ");
         query.push_bind(i16::from(cursor.attention));
@@ -924,9 +926,9 @@ fn build_list_query<'a>(
         query.push_bind(i16::from(cursor.priority));
         query.push(" AND occurred_at = ");
         query.push_bind(cursor.occurred_at);
-        query.push(" AND item_id > ");
+        query.push(" AND item_id <= ");
         query.push_bind(&cursor.item_id);
-        query.push("))");
+        query.push(")");
     }
     query.push(" ORDER BY ");
     push_attention_expression(&mut query);
@@ -977,6 +979,10 @@ fn push_priority_expression(query: &mut QueryBuilder<'_, Postgres>) {
 }
 
 fn push_filter(query: &mut QueryBuilder<'_, Postgres>, filter: &InboxFilter) {
+    if let Some(subject) = &filter.subject {
+        query.push(" AND subject = ");
+        query.push_bind(subject.clone());
+    }
     if let Some(reasons) = &filter.reasons {
         let values = reasons
             .iter()
@@ -1352,10 +1358,12 @@ mod tests {
         let a = InboxFilter {
             subsystems: Some([Subsystem::Git, Subsystem::Issue].into_iter().collect()),
             reasons: Some([Reason::Mentioned, Reason::Assigned].into_iter().collect()),
+            subject: None,
         };
         let b = InboxFilter {
             subsystems: Some([Subsystem::Issue, Subsystem::Git].into_iter().collect()),
             reasons: Some([Reason::Assigned, Reason::Mentioned].into_iter().collect()),
+            subject: None,
         };
         assert_eq!(canonical_filter(&a), canonical_filter(&b));
         assert_eq!(cursor_scope(&request(10, a)), cursor_scope(&request(10, b)));

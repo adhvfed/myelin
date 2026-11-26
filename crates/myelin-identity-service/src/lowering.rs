@@ -182,7 +182,12 @@ pub fn fall_back_to_check(
     at: &Consistency,
 ) -> myelin_identity::Result<Vec<ObjectId>> {
     let _ = ty;
-    let snapshot = engine.snapshot(scope, &at.at_least)?;
+    let snapshot = engine.subject_snapshot(
+        scope,
+        &at.at_least,
+        subject,
+        candidates.iter().map(|candidate| candidate.0.clone()),
+    )?;
     Ok(candidates
         .iter()
         .filter(|obj| {

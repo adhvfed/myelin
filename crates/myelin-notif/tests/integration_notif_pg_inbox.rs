@@ -457,6 +457,7 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
     let mention_filter = InboxFilter {
         subsystems: None,
         reasons: Some(HashSet::from([Reason::Mentioned])),
+        subject: None,
     };
     let mentioned = store
         .list(&InboxReadRequest {
@@ -858,4 +859,154 @@ async fn durable_router_co_commits_dedup_inbox_and_outbox() {
         .execute(&admin)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn cursor_walks_and_subject_reads_return_exactly_the_ranked_rows() {
+    let config = MyelinConfig::dev();
+    let app = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&config.database_url)
+        .await
+        .expect("connect to dev Postgres as the RLS-bound app role (is the stack up?)");
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&config.database_migration_url)
+        .await
+        .expect("connect to dev Postgres as the migration role");
+    {
+        let _setup = DATABASE_SETUP.lock().await;
+        PgMigrator::apply_validated(
+            &admin,
+            &myelin_notif::migrations::migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("apply the notification schema and online indexes");
+        sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON notif_inbox_item TO myelin_app")
+            .execute(&admin)
+            .await
+            .expect("grant the runtime role access to the migrated inbox table");
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let tenant = TenantId(format!("notif-walk-{}-{nonce}", std::process::id()));
+    let region = Region("fr-par".into());
+    let recipient = "psn:walker";
+    let store = PgInboxStore::new(app.clone());
+
+    // Three priority bands, two timestamps, and runs of identical rank that only the item id
+    // orders: every tie the keyset has to break.
+    let reasons = [Reason::Sla, Reason::Mentioned, Reason::Fyi];
+    let times = ["2026-07-22T12:00:00Z", "2026-07-22T11:00:00Z"];
+    let mut expected = Vec::new();
+    for n in 0..60 {
+        let reason = reasons[n % 3];
+        let occurred_at = times[(n / 3) % 2];
+        let item_id = format!("walk-{n:03}");
+        let mut row = upsert(
+            &tenant,
+            &region,
+            &item_id,
+            recipient,
+            reason,
+            Class::Direct,
+            &format!("dedup-{item_id}"),
+        );
+        row.occurred_at = occurred_at.into();
+        if n % 10 == 0 {
+            let subject = ArtifactRef(format!("myelin://{}/git/pr/core:1", tenant.0));
+            row.item.subject = subject.clone();
+            row.subject_root = subject.clone();
+            row.template_args = vec![subject];
+        }
+        store.upsert(&row).await.expect("seed one ranked row");
+        let priority = match reason {
+            Reason::Sla => 90,
+            Reason::Mentioned => 70,
+            _ => 15,
+        };
+        expected.push((priority, occurred_at, item_id, row.item.subject.0.clone()));
+    }
+    expected.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(a.1)).then(a.2.cmp(&b.2)));
+
+    let scope = InboxReadScope {
+        tenant: tenant.clone(),
+        region: region.clone(),
+        recipient: recipient.into(),
+    };
+    let walk = |filter: InboxFilter| {
+        let store = &store;
+        let scope = scope.clone();
+        async move {
+            let mut seen = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = store
+                    .list(&InboxReadRequest {
+                        scope: scope.clone(),
+                        filter: filter.clone(),
+                        limit: 7,
+                        cursor,
+                    })
+                    .await
+                    .expect("read one inbox page");
+                seen.extend(page.items.into_iter().map(|row| row.item.item_id));
+                match page.next_cursor {
+                    Some(next) => cursor = Some(next),
+                    None => return seen,
+                }
+            }
+        }
+    };
+
+    assert_eq!(
+        walk(InboxFilter::all()).await,
+        expected.iter().map(|row| row.2.clone()).collect::<Vec<_>>(),
+        "a cursor walk returns every row once, in rank order"
+    );
+
+    let subject = format!("myelin://{}/git/pr/core:1", tenant.0);
+    let about = InboxFilter {
+        subject: Some(subject.clone()),
+        ..InboxFilter::all()
+    };
+    assert_eq!(
+        walk(about.clone()).await,
+        expected
+            .iter()
+            .filter(|row| row.3 == subject)
+            .map(|row| row.2.clone())
+            .collect::<Vec<_>>(),
+        "a subject read returns exactly that artifact's notifications, in rank order"
+    );
+
+    let first = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: about,
+            limit: 2,
+            cursor: None,
+        })
+        .await
+        .expect("read the first subject page");
+    let replayed = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter {
+                subject: Some(format!("myelin://{}/git/pr/core:2", tenant.0)),
+                ..InboxFilter::all()
+            },
+            limit: 2,
+            cursor: first.next_cursor,
+        })
+        .await;
+    assert_eq!(
+        replayed.unwrap_err(),
+        PgInboxError::CursorScopeMismatch,
+        "a cursor from one subject cannot continue another"
+    );
+    delete_probe_rows(&admin, &tenant, &region).await;
 }

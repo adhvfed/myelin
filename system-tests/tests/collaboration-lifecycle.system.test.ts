@@ -13,7 +13,7 @@ import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.j
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { awaitTheOnlyCiRun } from "../src/journeys/ci-runs.js";
-import { findInboxItemMatching } from "../src/journeys/inbox.js";
+import { findInboxItem } from "../src/journeys/inbox.js";
 import {
   awaitActiveIssue,
   expectOpaqueIssueAuthor,
@@ -592,8 +592,9 @@ command = ["true"]
     expect(awaiting).toMatchObject({ event_id: eventId, run_id: null, approval: null });
 
     const approvalNotice = await eventually<JsonRecord>(async () => {
-      return findInboxItemMatching(
+      return findInboxItem(
         founder,
+        issueSubject,
         (item) => item.action !== null && typeof item.action === "object" &&
           record(item.action, "inbox action").event_id === eventId,
       );
@@ -618,8 +619,9 @@ command = ["true"]
     expect(array(history.body.items, "filtered issue automation history")).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ event_id: ignoredEventId })]),
     );
-    expect(await findInboxItemMatching(
+    expect(await findInboxItem(
       founder,
+      issueSubject,
       (item) => item.action !== null && typeof item.action === "object" &&
         record(item.action, "filtered inbox action").event_id === ignoredEventId,
     )).toBeUndefined();
@@ -641,8 +643,9 @@ command = ["true"]
       },
     });
     const completedNotice = await eventually<JsonRecord>(async () => {
-      return findInboxItemMatching(
+      return findInboxItem(
         founder,
+        issueSubject,
         (item) => item.id === approvalNoticeId && item.state === "done",
       );
     }, { description: "the decided automation approval to leave the active inbox" });

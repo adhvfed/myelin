@@ -7,7 +7,9 @@ use crate::cache::{Cache, CacheError};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::pg_migrator::PgMigrator;
-use crate::tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
+use crate::tenant_tx::{
+    connect_pool_with_reset, with_tenant_repeatable_read_tx, with_tenant_tx, TxScope,
+};
 
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
 
@@ -272,6 +274,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_thread_durable::agent_thread_environment_state_migrations(),
         crate::identity_durable::human_session_migrations(),
         crate::work_wake::agent_trigger_work_wake_migrations(),
+        crate::tuple_subgraph::rebac_tuple_subgraph_migrations(),
     ]
 }
 
@@ -837,6 +840,19 @@ impl SubstrateProvider {
     {
         let r = with_tenant_tx(&self.pool, tenant, &self.config.region, op).await?;
         Ok(r)
+    }
+
+    /// A read-only transaction whose every statement sees the same committed snapshot.
+    pub async fn with_tenant_read_snapshot_tx<R, F>(
+        &self,
+        tenant: &str,
+        op: F,
+    ) -> Result<R, ProviderError>
+    where
+        F: for<'c> FnOnce(&'c mut sqlx::PgConnection) -> TxScope<'c, R> + Send,
+        R: Send,
+    {
+        Ok(with_tenant_repeatable_read_tx(&self.pool, tenant, &self.config.region, op).await?)
     }
 
     pub fn cache(&self, rt: tokio::runtime::Handle) -> Result<Box<dyn Cache>, CacheError> {

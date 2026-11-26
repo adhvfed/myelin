@@ -171,9 +171,11 @@ impl ListObjects {
             });
         }
 
-        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+        let current = self
+            .engine
+            .subject_snapshot(scope, &at.at_least, subject, [])?;
         let projection_floor = if at.mode == ConsistencyMode::Strong && at.at_least.0.is_empty() {
-            snapshot.zookie().clone()
+            current.zookie().clone()
         } else {
             at.at_least.clone()
         };
@@ -192,6 +194,9 @@ impl ListObjects {
         );
 
         if crate::lowering::is_fall_back(&verdict) {
+            let snapshot = self
+                .engine
+                .subject_type_snapshot(scope, &at.at_least, subject, ty)?;
             let reachable = self.reachable_set(
                 &snapshot,
                 subject,
@@ -204,12 +209,19 @@ impl ListObjects {
                 zookie: snapshot.zookie().clone(),
             })
         } else {
+            let candidates = self.candidate_objects(scope, subject, ty);
+            let snapshot = self.engine.subject_snapshot(
+                scope,
+                &at.at_least,
+                subject,
+                candidates.iter().cloned(),
+            )?;
+            // The candidates are complete only up to the floor they were checked against.
             let zookie = if at.mode == ConsistencyMode::Strong && at.at_least.0.is_empty() {
-                snapshot.zookie().clone()
+                current.zookie().clone()
             } else {
                 zookie
             };
-            let candidates = self.candidate_objects(scope, subject, ty);
             Ok(self.result_from_indexed_candidates(
                 &snapshot, subject, permission, ty, candidates, zookie,
             ))

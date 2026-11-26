@@ -444,6 +444,7 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             let mut view = None;
             let mut limit = None;
             let mut cursor = None;
+            let mut subject = None;
             let mut index = 0;
             while index < rest.len() {
                 let flag = rest[index];
@@ -454,7 +455,8 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
                     "--view" if view.is_none() => view = Some(*value),
                     "--limit" if limit.is_none() => limit = Some(*value),
                     "--cursor" if cursor.is_none() => cursor = Some(*value),
-                    "--view" | "--limit" | "--cursor" => {
+                    "--subject" if subject.is_none() => subject = Some(*value),
+                    "--view" | "--limit" | "--cursor" | "--subject" => {
                         return Err(CliError::Usage(format!(
                             "duplicate notif list flag `{flag}`"
                         )))
@@ -488,6 +490,14 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
                     ));
                 }
                 query.push("cursor", value);
+            }
+            if let Some(value) = subject {
+                if value.is_empty() || value.len() > 512 {
+                    return Err(CliError::Usage(
+                        "--subject must name one artifact reference".into(),
+                    ));
+                }
+                query.push("subject", value);
             }
             Ok(EdgeCall {
                 method: HttpMethod::Get,
@@ -822,6 +832,13 @@ mod tests {
             2
         );
         assert_eq!(notif_dispatch(&["list", "--view"]).unwrap_err().code(), 2);
+        assert_eq!(
+            notif_dispatch(&["list", "--subject", "myelin://acme/git/pr/core:42"])
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("view=all&subject=myelin%3A%2F%2Facme%2Fgit%2Fpr%2Fcore%3A42")
+        );
         assert_eq!(notif_dispatch(&["nope"]).unwrap_err().code(), 2);
         let show = notif_dispatch(&["show", "item/1"]).unwrap();
         assert_eq!(show.method, HttpMethod::Get);

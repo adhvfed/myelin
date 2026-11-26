@@ -37,6 +37,8 @@ pub fn subsystem_of(subject: &ArtifactRef) -> Subsystem {
 pub struct InboxFilter {
     pub subsystems: Option<HashSet<Subsystem>>,
     pub reasons: Option<HashSet<Reason>>,
+    /// Only notifications about this exact artifact.
+    pub subject: Option<String>,
 }
 
 impl InboxFilter {
@@ -60,6 +62,7 @@ impl InboxFilter {
                 .into_iter()
                 .collect(),
             ),
+            subject: None,
         }
     }
 
@@ -76,6 +79,7 @@ impl InboxFilter {
                 .into_iter()
                 .collect(),
             ),
+            subject: None,
         }
     }
 
@@ -83,6 +87,7 @@ impl InboxFilter {
         InboxFilter {
             subsystems: Some([Subsystem::Git].into_iter().collect()),
             reasons: Some([Reason::ReviewRequested].into_iter().collect()),
+            subject: None,
         }
     }
 
@@ -94,6 +99,11 @@ impl InboxFilter {
         }
         if let Some(reasons) = &self.reasons {
             if !reasons.contains(&item.reason) {
+                return false;
+            }
+        }
+        if let Some(subject) = &self.subject {
+            if item.subject.0 != *subject {
                 return false;
             }
         }

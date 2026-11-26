@@ -84,6 +84,39 @@ pub fn inbox_attention_keyset_index_ddl() -> String {
     )
 }
 
+pub const INBOX_SUBJECT_INDEX_MIGRATION_ID: &str = "notif_0013_inbox_recipient_subject";
+/// Serves "notifications about this artifact" without walking the recipient's whole inbox.
+pub const INBOX_SUBJECT_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+notif_inbox_recipient_subject ON notif_inbox_item (tenant_id, region, recipient, subject)";
+
+pub const VALIDATE_INBOX_SUBJECT_INDEX_MIGRATION_ID: &str =
+    "notif_0014_validate_inbox_recipient_subject";
+pub const VALIDATE_INBOX_SUBJECT_INDEX_DDL: &str = "\
+DO $myelin$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_index AS index_state
+      JOIN pg_catalog.pg_class AS index_relation
+        ON index_relation.oid = index_state.indexrelid
+      JOIN pg_catalog.pg_class AS table_relation
+        ON table_relation.oid = index_state.indrelid
+      JOIN pg_catalog.pg_namespace AS relation_namespace
+        ON relation_namespace.oid = table_relation.relnamespace
+     WHERE relation_namespace.nspname = current_schema()
+       AND table_relation.relname = 'notif_inbox_item'
+       AND table_relation.relkind = 'r'
+       AND index_relation.relnamespace = relation_namespace.oid
+       AND index_relation.relname = 'notif_inbox_recipient_subject'
+       AND index_relation.relkind = 'i'
+       AND index_state.indisvalid
+       AND index_state.indisready
+  ) THEN
+    RAISE EXCEPTION 'notif_inbox_recipient_subject on %.notif_inbox_item is missing, invalid, or not ready; verify the index exists, then repair it with REINDEX INDEX CONCURRENTLY %.notif_inbox_recipient_subject before restarting', current_schema(), current_schema();
+  END IF;
+END
+$myelin$";
+
 pub const NOTIF_PREF_DDL: &str = "\
 CREATE TABLE notif_pref (\
   tenant_id text NOT NULL, \
@@ -252,6 +285,18 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "notif_inbox_item",
     ));
+    migrations.push(Migration::phased(
+        INBOX_SUBJECT_INDEX_MIGRATION_ID,
+        INBOX_SUBJECT_INDEX_DDL,
+        MigrationPhase::Expand,
+        "notif_inbox_item",
+    ));
+    migrations.push(Migration::phased(
+        VALIDATE_INBOX_SUBJECT_INDEX_MIGRATION_ID,
+        VALIDATE_INBOX_SUBJECT_INDEX_DDL,
+        MigrationPhase::Expand,
+        "notif_inbox_item",
+    ));
     Migrations::of(migrations)
 }
 
@@ -269,8 +314,8 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            12,
-            "nine tables plus three additive inbox keyset indexes"
+            14,
+            "nine tables, three additive inbox keyset indexes, and the validated subject index"
         );
         let mut runner = MigrationRunner::new();
         runner
@@ -291,8 +336,10 @@ mod tests {
                 "notif_0010_inbox_recipient_keyset",
                 "notif_0011_inbox_recipient_recency_keyset",
                 "notif_0012_inbox_recipient_attention_keyset",
+                "notif_0013_inbox_recipient_subject",
+                "notif_0014_validate_inbox_recipient_subject",
             ],
-            "9 tables + 3 online indexes, in order - 0 backward migration"
+            "9 tables + 4 online indexes + 1 validation, in order - 0 backward migration"
         );
     }
 

@@ -639,8 +639,10 @@ impl CiRunStore {
         {
             return Err(CiRunStoreError::RetryRunNotFound);
         }
-        if !matches!(actor.kind, PrincipalKind::Agent { .. } | PrincipalKind::Human)
-            || actor.status != PrincipalStatus::Active
+        if !matches!(
+            actor.kind,
+            PrincipalKind::Agent { .. } | PrincipalKind::Human
+        ) || actor.status != PrincipalStatus::Active
             || actor.tenant.0.is_empty()
             || actor.region.0.is_empty()
         {
@@ -684,6 +686,43 @@ impl CiRunStore {
         .map_err(CiRunStoreError::from)?;
 
         Ok(row.map(ci_run_record_from_row))
+    }
+
+    /// The repository each named run was built from. Runs that do not exist, or were built
+    /// without a repository, are left out.
+    pub async fn ci_run_repositories(
+        &self,
+        tenant_id: &str,
+        region: &str,
+        run_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String)>, CiRunStoreError> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tenant_id_owned = tenant_id.to_string();
+        let region_owned = region.to_string();
+        let run_ids = run_ids.to_vec();
+        let rows = with_tenant_tx(&self.pool, tenant_id, region, move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "SELECT run_id, repo_ref FROM ci_run \
+                     WHERE tenant_id = $1 AND region = $2 AND run_id = ANY($3) \
+                       AND repo_ref IS NOT NULL",
+                )
+                .bind(&tenant_id_owned)
+                .bind(&region_owned)
+                .bind(&run_ids)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(|e| PgError::Query(e.to_string()))
+            })
+        })
+        .await
+        .map_err(CiRunStoreError::from)?;
+        Ok(rows
+            .iter()
+            .map(|row| (row.get("run_id"), row.get("repo_ref")))
+            .collect())
     }
 
     pub(crate) async fn lock_for_token_mint_on_conn(

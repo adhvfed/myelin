@@ -30,7 +30,9 @@ impl Expand {
         permission: &Permission,
         at: &Consistency,
     ) -> myelin_identity::Result<SubjectTree> {
-        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+        let snapshot = self
+            .engine
+            .expansion_snapshot(scope, &at.at_least, &object.0)?;
         let mut members: BTreeSet<String> = BTreeSet::new();
         self.expand_into(
             scope,
@@ -59,7 +61,9 @@ impl Expand {
         permission: &Permission,
         at: &Consistency,
     ) -> myelin_identity::Result<RewriteTrace> {
-        let snapshot = self.engine.snapshot(scope, &at.at_least)?;
+        let snapshot = self
+            .engine
+            .expansion_snapshot(scope, &at.at_least, &object.0)?;
         let mut steps: Vec<String> = Vec::new();
         steps.push(format!(
             "expand {}#{} for subject {} @ {}",

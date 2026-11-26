@@ -19,7 +19,8 @@ use myelin_identity::Principal;
 use myelin_storage::{BlobStore, ContentHash, DurableCostLedger, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use sqlx::types::Uuid;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -217,14 +218,32 @@ impl DurableCiApi {
         Ok(())
     }
 
-    pub(crate) fn may_view_run(
+    /// The repository slug each run was built from, read in one query. Runs that are unknown,
+    /// non-canonical, or built without a repository are absent. Makes no access decision.
+    pub(crate) fn run_repositories(
         &self,
         principal: &Principal,
-        run_id: &str,
-    ) -> Result<bool, EdgeError> {
-        Ok(self
-            .run_source(principal, run_id)?
-            .is_some_and(|run| self.git.may_view_ci_repo(principal, &run.repo_slug)))
+        run_ids: &[String],
+    ) -> Result<HashMap<String, String>, EdgeError> {
+        let ids = run_ids
+            .iter()
+            .filter(|run_id| canonical_uuid(run_id))
+            .filter_map(|run_id| Uuid::parse_str(run_id).ok())
+            .collect::<Vec<_>>();
+        let tenant = principal.tenant.as_str();
+        let rows = self
+            .drive_run(
+                self.runs
+                    .ci_run_repositories(tenant, principal.region.as_str(), &ids),
+            )
+            .map_err(map_run_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(run_id, repo_ref)| {
+                let slug = repo_slug_from_ref(tenant, &repo_ref)?.to_owned();
+                Some((run_id.to_string(), slug))
+            })
+            .collect())
     }
 
     /// `None` covers a non-canonical id, an unknown run, and a run without a repository.

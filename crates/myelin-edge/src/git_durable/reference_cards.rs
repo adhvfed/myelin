@@ -307,6 +307,31 @@ impl DurableGitBackend {
         })
     }
 
+    /// The pull requests among `coordinates` that record a review relationship with `principal`
+    /// (a requested or past reviewer), read in one query.
+    pub(crate) fn pull_requests_reviewed_by(
+        &self,
+        principal: &Principal,
+        coordinates: &[(String, u64)],
+    ) -> Result<BTreeSet<(String, u64)>, DurableError> {
+        // A number no pull request can have would fail the whole batch read.
+        let coordinates = coordinates
+            .iter()
+            .filter(|(_, number)| i64::try_from(*number).is_ok())
+            .cloned()
+            .collect::<Vec<_>>();
+        if coordinates.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let viewer = Self::pseudonym(principal.tenant.as_str(), principal);
+        Ok(self
+            .reference_card_pr_records(principal, &coordinates)?
+            .into_iter()
+            .filter(|(_, record)| record.has_review_relationship_with(&viewer))
+            .map(|(coordinate, _)| coordinate)
+            .collect())
+    }
+
     fn reference_card_pr_records(
         &self,
         principal: &Principal,

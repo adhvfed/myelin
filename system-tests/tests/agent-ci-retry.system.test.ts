@@ -17,7 +17,7 @@ import {
   closeAgentRun,
 } from "../src/journeys/agents.js";
 import { ciRunsMatching } from "../src/journeys/ci-runs.js";
-import { findInboxItemMatching } from "../src/journeys/inbox.js";
+import { findInboxItem } from "../src/journeys/inbox.js";
 import { record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
@@ -75,9 +75,10 @@ describe("human-governed agent CI retries", () => {
       );
 
       const approvalNotice = await eventually<JsonRecord>(async () => {
-        return findInboxItemMatching(
+        return findInboxItem(
           founder,
-          (item) => item.subject === originalRunRef && item.state === "unread" &&
+          originalRunRef,
+          (item) => item.state === "unread" &&
             item.action !== null && typeof item.action === "object" &&
             record(item.action, "CI retry approval action").gate_id === gateId,
         );

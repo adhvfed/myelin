@@ -4,7 +4,8 @@ use myelin_identity::{
     PrincipalStatus, RelName, Zookie,
 };
 use myelin_query::{CmpOp, EvalContext, EvalError, Expr, Predicate, QueryAst};
-use myelin_storage::TenantScope;
+use myelin_storage::tuple_subgraph::tuple_object_key;
+use myelin_storage::{SubgraphRoots, SubgraphSubjects, TenantScope};
 use myelin_tenancy::ArtifactRef;
 use std::collections::HashMap;
 
@@ -31,46 +32,112 @@ impl CheckEngine {
         at: &Consistency,
         caveat: Option<&CaveatContext>,
     ) -> Decision {
-        let Ok(snapshot) = self.snapshot(scope, &at.at_least) else {
+        let Ok(snapshot) = self.subject_snapshot(scope, &at.at_least, subject, [object.0.clone()])
+        else {
             return Decision::Deny;
         };
         snapshot.check(subject, permission, object, caveat)
     }
 
-    pub(crate) fn snapshot(
+    /// What `subject`'s checks on `objects` can consult: usersets reachable from the objects and
+    /// the tuples naming the subject, at one consistent revision. Direct grants to anyone else
+    /// are never read, so the cost follows the graph a check walks, not the tenant's size.
+    pub(crate) fn subject_snapshot(
         &self,
         scope: &TenantScope,
         at_least: &Zookie,
+        subject: &Principal,
+        objects: impl IntoIterator<Item = String>,
     ) -> myelin_identity::Result<CheckSnapshot> {
-        let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
-        let snapshot = self.tuples.snapshot_in(scope).map_err(|_| {
-            AuthzError::Unavailable("relationship tuple snapshot unavailable".into())
-        })?;
-        if !at_least.0.is_empty() && snapshot.zookie.0 < at_least.0 {
+        self.read(
+            scope,
+            at_least,
+            SubgraphRoots::Objects(objects.into_iter().collect()),
+            Some(subject),
+        )
+    }
+
+    /// What `subject`'s checks on every object of one type can consult.
+    pub(crate) fn subject_type_snapshot(
+        &self,
+        scope: &TenantScope,
+        at_least: &Zookie,
+        subject: &Principal,
+        object_type: &ObjectType,
+    ) -> myelin_identity::Result<CheckSnapshot> {
+        self.read(
+            scope,
+            at_least,
+            SubgraphRoots::ObjectType(object_type.0.clone()),
+            Some(subject),
+        )
+    }
+
+    /// Every tuple an expansion of `object` can reach, whoever it names.
+    pub(crate) fn expansion_snapshot(
+        &self,
+        scope: &TenantScope,
+        at_least: &Zookie,
+        object: &str,
+    ) -> myelin_identity::Result<CheckSnapshot> {
+        self.read(
+            scope,
+            at_least,
+            SubgraphRoots::Objects(vec![object.to_string()]),
+            None,
+        )
+    }
+
+    fn read(
+        &self,
+        scope: &TenantScope,
+        at_least: &Zookie,
+        roots: SubgraphRoots,
+        subject: Option<&Principal>,
+    ) -> myelin_identity::Result<CheckSnapshot> {
+        let subjects = match subject {
+            Some(subject) => SubgraphSubjects::Only(subject.principal_id.0.clone()),
+            None => SubgraphSubjects::All,
+        };
+        let graph = self
+            .tuples
+            .subgraph_in(scope, roots, subjects, SUBGRAPH_MAX_HOPS)
+            .map_err(|_| {
+                AuthzError::Unavailable("relationship tuple snapshot unavailable".into())
+            })?;
+        if !at_least.0.is_empty() && graph.zookie.0 < at_least.0 {
             return Err(AuthzError::Unavailable(format!(
                 "relationship tuple snapshot is at {}, behind the required {}",
-                snapshot.zookie.0, at_least.0
+                graph.zookie.0, at_least.0
             )));
         }
-        for st in snapshot.tuples {
-            let stored_key = myelin_refs::object_key(&ArtifactRef(st.tuple.object.0.clone()))
-                .map(|k| k.tuple_key())
-                .unwrap_or_else(|| st.tuple.object.0.clone());
-            by_object.entry(stored_key).or_default().push(SnapTuple {
-                relation: st.tuple.relation.0,
-                subject: st.tuple.subject.0,
-            });
+        let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
+        for edge in graph.edges {
+            by_object
+                .entry(tuple_object_key(&edge.object))
+                .or_default()
+                .push(SnapTuple {
+                    relation: edge.relation,
+                    subject: edge.subject,
+                });
         }
         Ok(CheckSnapshot {
             by_object,
-            zookie: snapshot.zookie,
+            zookie: graph.zookie,
+            subject: subject.map(|subject| subject.principal_id.0.clone()),
         })
     }
 }
 
+/// Userset hops a check can take: relation rewrites nest up to `MAX_RULE_DEPTH`, and each
+/// direct check beneath them follows up to `MAX_REWRITE_DEPTH` usersets.
+pub(crate) const SUBGRAPH_MAX_HOPS: usize = MAX_REWRITE_DEPTH + crate::namespace::MAX_RULE_DEPTH;
+
 pub(crate) struct CheckSnapshot {
     by_object: HashMap<String, Vec<SnapTuple>>,
     zookie: Zookie,
+    /// Set when the snapshot holds only this subject's direct grants (plus every userset).
+    subject: Option<String>,
 }
 
 impl CheckSnapshot {
@@ -86,6 +153,13 @@ impl CheckSnapshot {
         caveat: Option<&CaveatContext>,
     ) -> Decision {
         if subject.status != PrincipalStatus::Active {
+            return Decision::Deny;
+        }
+        if self
+            .subject
+            .as_ref()
+            .is_some_and(|scoped| *scoped != subject.principal_id.0)
+        {
             return Decision::Deny;
         }
         if permission.0.trim().is_empty() {
@@ -115,6 +189,7 @@ impl CheckSnapshot {
         }
     }
 
+    /// On a subject snapshot this is the usersets plus that subject, never other people.
     pub(crate) fn direct_subjects(&self, object: &ArtifactRef, relation: &RelName) -> Vec<String> {
         let object_id = match object_id_of(object) {
             Some(id) => id,
@@ -510,7 +585,7 @@ mod tests {
         let future = Zookie("zk-00000000000000000002".into());
         assert!(
             matches!(
-                eng.snapshot(&s, &future),
+                eng.subject_snapshot(&s, &future, &subject("p:alice"), ["repo:core".to_string()]),
                 Err(myelin_identity::AuthzError::Unavailable(_))
             ),
             "a store behind the requested lower bound reports unavailability instead of evaluating stale relationships"
@@ -593,7 +668,12 @@ mod tests {
         );
 
         let view = eng
-            .snapshot(&s, &Zookie(String::new()))
+            .subject_snapshot(
+                &s,
+                &Zookie(String::new()),
+                &subject("p:alice"),
+                ["top".to_string()],
+            )
             .expect("relationship snapshot");
         let mut memo: HashMap<MemoKey, bool> = HashMap::new();
         let granted = view.has_relation("p:alice", "m", "top", 0, &mut memo);

@@ -367,7 +367,9 @@ impl NamespaceEngine {
         object: &ArtifactRef,
         at: &myelin_identity::Consistency,
     ) -> bool {
-        let Ok(snapshot) = engine.snapshot(scope, &at.at_least) else {
+        let Ok(snapshot) =
+            engine.subject_snapshot(scope, &at.at_least, subject, [object.0.clone()])
+        else {
             return false;
         };
         self.permits_snapshot(&snapshot, subject, object_type, permission, object)
