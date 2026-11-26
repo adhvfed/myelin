@@ -77,7 +77,7 @@ describe("a pull request's life: draft, ready, closed, reopened", () => {
     const view = () => myelin("repo", "pr", "view", slug, n);
     const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${number}`;
     const reviewRequest = (state: string) => eventually(async () => {
-      const inbox = await reviewerClient.json("/v1/notif/inbox?view=review-requests&limit=100");
+      const inbox = await reviewerClient.json(`/v1/notif/inbox?view=review-requests&limit=100&subject=${encodeURIComponent(subject)}`);
       const item = array(inbox.body.items, "review request inbox items")
         .map((value) => record(value, "review request inbox item"))
         .find((value) => value.subject === subject);

@@ -300,7 +300,7 @@ describe.sequential("Git engineering lifecycle", () => {
     const base = `${project.path}/prs/${pullRequestNumber}`;
     const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
     const reviewRequest = await eventually(async () => {
-      const inbox = await reviewerClient.json("/v1/notif/inbox?view=review-requests&limit=100");
+      const inbox = await reviewerClient.json(`/v1/notif/inbox?view=review-requests&limit=100&subject=${encodeURIComponent(subject)}`);
       return array(inbox.body.items, "review request inbox items")
         .map((item) => record(item, "review request inbox item"))
         .find((item) => item.subject === subject);
@@ -575,7 +575,7 @@ describe.sequential("Git engineering lifecycle", () => {
 
     const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
     const completedRequest = await eventually(async () => {
-      const inbox = await reviewerClient.json("/v1/notif/inbox?view=review-requests&limit=100");
+      const inbox = await reviewerClient.json(`/v1/notif/inbox?view=review-requests&limit=100&subject=${encodeURIComponent(subject)}`);
       const item = array(inbox.body.items, "review request inbox items")
         .map((value) => record(value, "review request inbox item"))
         .find((value) => value.subject === subject);
