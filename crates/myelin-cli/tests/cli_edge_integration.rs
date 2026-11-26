@@ -372,15 +372,16 @@ async fn a_logout_that_cannot_reach_the_edge_says_until_when_the_session_lives()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_logout_of_a_session_the_edge_already_ended_says_so() {
+async fn a_logout_the_edge_refuses_says_so_without_claiming_the_session_ended() {
     let (gateway, token) = person_with_session();
     let addr = spawn(gateway).await;
     let edge = format!("http://{addr}");
     run_logout(&edge, &token, now() + 3_600, false);
     let printed = run_logout(&edge, &token, now() + 3_600, false);
     assert!(
-        printed.contains("The server had already ended this session, or it had expired."),
+        printed.contains(
+            "The server refused the sign-out; if the session was still valid, it stays valid until"
+        ),
         "{printed}"
     );
-    assert!(!printed.contains("may stay valid"), "{printed}");
 }

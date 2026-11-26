@@ -1,7 +1,8 @@
 #![cfg(feature = "integration")]
 
 //! The human-session migrations on a fresh schema: people erased before 0183 are disabled by
-//! 0185, and only a permanent principal-wide revocation disables anyone.
+//! 0185, only a permanent principal-wide revocation disables anyone, and (0186) nothing enables
+//! an erased person again.
 
 use std::str::FromStr;
 
@@ -10,6 +11,7 @@ mod common;
 use myelin_storage::migration::Migrations;
 use myelin_storage::{
     all_durable_migrations, foundation_migrations, human_session_migrations, PgMigrator,
+    ERASED_PRINCIPAL_STAYS_DISABLED,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -136,6 +138,87 @@ async fn people_erased_before_0183_are_disabled_and_only_permanent_revocations_d
         .unwrap();
     revoke(&pool, "untouched", None).await;
     assert_eq!(state(&pool, "untouched").await.0, "\"Disabled\"");
+
+    pool.close().await;
+    sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+        .execute(&bootstrap)
+        .await
+        .expect("drop the fresh schema");
+}
+
+async fn set_status(pool: &PgPool, id: &str, status: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE principal SET status = $1 WHERE principal_id = $2")
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_erased_person_can_never_be_enabled_again() {
+    let schema = format!("erasure_sticks_{}", uniq());
+    let admin_url = common::admin_database_config().database_url;
+    let bootstrap = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("connect to the admin Postgres backend");
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&bootstrap)
+        .await
+        .expect("create a fresh schema");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            PgConnectOptions::from_str(&admin_url)
+                .expect("admin DSN")
+                .options([("search_path", format!("\"{schema}\",public").as_str())]),
+        )
+        .await
+        .expect("a pool pinned to the fresh schema");
+    PgMigrator::apply(&pool, &foundation_migrations())
+        .await
+        .expect("foundation");
+    PgMigrator::apply(&pool, &all_durable_migrations())
+        .await
+        .expect("every durable migration");
+
+    person(&pool, "erased").await;
+    revoke(&pool, "erased", None).await;
+    assert_eq!(state(&pool, "erased").await.0, "\"Disabled\"");
+    for status in ["\"Active\"", "\"Suspended\""] {
+        let refused = set_status(&pool, "erased", status)
+            .await
+            .expect_err("an erased person stays disabled");
+        assert!(
+            refused
+                .to_string()
+                .contains(ERASED_PRINCIPAL_STAYS_DISABLED),
+            "{refused}"
+        );
+    }
+    let upsert = sqlx::query(
+        "INSERT INTO principal (tenant_id, region, principal_id, kind, data_role, status) \
+         VALUES ($1, $2, 'erased', '\"Human\"', '\"Controller\"', '\"Active\"') \
+         ON CONFLICT (tenant_id, region, principal_id) DO UPDATE SET status = EXCLUDED.status",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .execute(&pool)
+    .await;
+    assert!(upsert.is_err(), "nor does an upsert enable them");
+    set_status(&pool, "erased", "\"Disabled\"")
+        .await
+        .expect("writing Disabled again is fine");
+
+    // A person disabled without an erasure, or under a time-limited revocation, can come back.
+    person(&pool, "paused").await;
+    revoke(&pool, "paused", Some("2099-01-01T00:00:00Z")).await;
+    set_status(&pool, "paused", "\"Disabled\"").await.unwrap();
+    set_status(&pool, "paused", "\"Active\"")
+        .await
+        .expect("only an erasure sticks");
 
     pool.close().await;
     sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))

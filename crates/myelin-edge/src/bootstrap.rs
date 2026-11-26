@@ -6,7 +6,7 @@ use myelin_identity::{
 use myelin_identity_service::{
     CapabilityMintSpec, CellTokenAuthority, PrincipalProfile, PrincipalStore, TupleStore,
 };
-use myelin_storage::TenantScope;
+use myelin_storage::{TenantScope, ERASED_PRINCIPAL_STAYS_DISABLED};
 use myelin_tenancy::{Region, TenantId};
 
 pub const BOOTSTRAP_SCHEME: &str = "agent";
@@ -108,7 +108,16 @@ pub fn bootstrap_principal_and_mint(
             PrincipalStatus::Active,
             profile.as_ref(),
         )
-        .map_err(|e| BootstrapError::Store(e.to_string()))?;
+        .map_err(|e| match e.to_string() {
+            refused if refused.contains(ERASED_PRINCIPAL_STAYS_DISABLED) => {
+                BootstrapError::BadParam(format!(
+                    "--principal `{}` was erased and cannot be bootstrapped again; choose another \
+                     principal id",
+                    params.principal
+                ))
+            }
+            other => BootstrapError::Store(other),
+        })?;
 
     let subject_key = params.principal.to_string();
     store

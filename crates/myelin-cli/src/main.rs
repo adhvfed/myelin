@@ -595,12 +595,21 @@ async fn logout(
     Ok(())
 }
 
+enum Expiry {
+    At(String),
+    Past,
+    Unknown,
+}
+
 /// What became of the stored session at the Edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServerSignOut {
     Ended,
-    /// The Edge refused the sign-out because the session had already ended or expired.
-    AlreadyEnded,
+    /// The Edge refused the sign-out with a 401. The session may have ended already, or the Edge
+    /// may have failed to check it, so it may still be valid.
+    Refused {
+        expires_at_unix: Option<i64>,
+    },
     /// The Edge answered with an error, so the session may still be valid.
     Failed {
         status: u16,
@@ -617,32 +626,45 @@ enum ServerSignOut {
 impl ServerSignOut {
     /// The line to print about the server side, if any. An expiry already past is not shown.
     fn describe(self, now: Option<myelin_events::clock::ClockReading>) -> Option<String> {
-        let still_valid = |expires_at_unix: Option<i64>| {
-            let now = now.map(|reading| reading.unix_seconds());
-            match expires_at_unix.filter(|expiry| now.is_none_or(|now| *expiry > now)) {
-                Some(expiry) => chrono::DateTime::from_timestamp(expiry, 0).map_or_else(
-                    || "may stay valid until it expires".to_string(),
-                    |at| format!("may stay valid until {}", at.format("%Y-%m-%d %H:%M UTC")),
-                ),
-                None if expires_at_unix.is_some() => "has expired by now anyway".to_string(),
-                None => "may stay valid until it expires".to_string(),
-            }
+        let now = now.map(|reading| reading.unix_seconds());
+        let expiry = |expires_at_unix: Option<i64>| match expires_at_unix {
+            Some(expiry) if now.is_some_and(|now| expiry <= now) => Expiry::Past,
+            Some(expiry) => chrono::DateTime::from_timestamp(expiry, 0)
+                .map_or(Expiry::Unknown, |at| {
+                    Expiry::At(at.format("%Y-%m-%d %H:%M UTC").to_string())
+                }),
+            None => Expiry::Unknown,
+        };
+        let may_stay_valid = |expires_at_unix| match expiry(expires_at_unix) {
+            Expiry::At(at) => format!("may stay valid until {at}"),
+            Expiry::Past => "has expired by now anyway".into(),
+            Expiry::Unknown => "may stay valid until it expires".into(),
         };
         match self {
             Self::Ended => Some("The session is signed out on the server too.".into()),
-            Self::AlreadyEnded => {
-                Some("The server had already ended this session, or it had expired.".into())
-            }
+            // A 401 cannot tell an ended session from one the server failed to check.
+            Self::Refused { expires_at_unix } => Some(match expiry(expires_at_unix) {
+                Expiry::At(at) => format!(
+                    "The server refused the sign-out; if the session was still valid, it stays \
+                     valid until {at}."
+                ),
+                Expiry::Past => {
+                    "The server refused the sign-out; the session has expired by now anyway.".into()
+                }
+                Expiry::Unknown => "The server refused the sign-out; if the session was still \
+                                    valid, it stays valid until it expires."
+                    .into(),
+            }),
             Self::Failed {
                 status,
                 expires_at_unix,
             } => Some(format!(
                 "The server could not end the session (HTTP {status}), so it {}.",
-                still_valid(expires_at_unix)
+                may_stay_valid(expires_at_unix)
             )),
             Self::Unreachable { expires_at_unix } => Some(format!(
                 "The server could not be reached, so the session {}.",
-                still_valid(expires_at_unix)
+                may_stay_valid(expires_at_unix)
             )),
             Self::NotASession => None,
         }
@@ -687,7 +709,7 @@ async fn end_stored_session(
     let expires_at_unix = credential.expires_at_unix;
     match ended {
         Ok(Ok(_)) => ServerSignOut::Ended,
-        Ok(Err(CliError::Unauthorized(_))) => ServerSignOut::AlreadyEnded,
+        Ok(Err(CliError::Unauthorized(_))) => ServerSignOut::Refused { expires_at_unix },
         Ok(Err(CliError::Edge { status, .. })) => ServerSignOut::Failed {
             status,
             expires_at_unix,
@@ -1267,8 +1289,18 @@ mod sign_out_tests {
             Some("The session is signed out on the server too.")
         );
         assert_eq!(
-            describe(ServerSignOut::AlreadyEnded).as_deref(),
-            Some("The server had already ended this session, or it had expired.")
+            describe(ServerSignOut::Refused {
+                expires_at_unix: Some(NOW + 3_600)
+            })
+            .as_deref(),
+            Some("The server refused the sign-out; if the session was still valid, it stays valid until 2030-03-17 18:46 UTC.")
+        );
+        assert_eq!(
+            describe(ServerSignOut::Refused {
+                expires_at_unix: Some(NOW - 60)
+            })
+            .as_deref(),
+            Some("The server refused the sign-out; the session has expired by now anyway.")
         );
         assert_eq!(
             describe(ServerSignOut::Unreachable {

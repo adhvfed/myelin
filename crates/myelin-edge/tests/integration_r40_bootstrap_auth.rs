@@ -148,6 +148,47 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     );
     assert_eq!(out1.principal_id, "founder");
 
+    // An erased person is never re-enabled by bootstrapping their id again.
+    let erased_tenant = format!("t-erased-{}", uniq());
+    let erased = BootstrapParams {
+        tenant: &erased_tenant,
+        principal: "erased-person",
+        ..params
+    };
+    bootstrap_principal_and_mint(&store, &tuples, &cell, &erased, now_unix())
+        .expect("bootstrap the person to erase");
+    let erased_scope = TenantScope::from_verified_token(
+        &Principal::new(
+            TenantId::from_token(erased_tenant.clone()),
+            Region::new(REGION),
+            PrincipalId("erased-person".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        ),
+        Region::new(REGION),
+    );
+    RevocationStore::with_pg(
+        DurableRevocationBacking::new(provider.clone()),
+        handle.clone(),
+    )
+    .disable_principal(
+        &erased_scope,
+        &PrincipalId("erased-person".into()),
+        myelin_events::clock::clock_reading_from_unix(now_unix())
+            .unwrap()
+            .timestamp(),
+    )
+    .expect("record the erasure");
+    let refused = bootstrap_principal_and_mint(&store, &tuples, &cell, &erased, now_unix())
+        .err()
+        .expect("an erased principal cannot be bootstrapped again");
+    assert!(
+        matches!(&refused, myelin_edge::BootstrapError::BadParam(message)
+            if message.contains("`erased-person` was erased")),
+        "{refused}"
+    );
+
     let founder = Principal::new(
         TenantId::from_token(tenant.clone()),
         Region::new(REGION),

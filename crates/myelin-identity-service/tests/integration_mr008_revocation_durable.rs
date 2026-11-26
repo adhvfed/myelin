@@ -503,3 +503,64 @@ async fn mint_returns_a_credential_only_after_its_run_grant_is_durable() {
     cleanup(&admin, &[&tenant]).await;
     println!("OK [e]: credential mint waits for both durable lifetime and run grant.");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sign_out_sweep_drops_only_expired_session_denials() {
+    let admin = migrate().await;
+    let app = common::app_provider(6).await;
+    let region = app.config().region.clone();
+    let handle = tokio::runtime::Handle::current();
+    let suffix = uniq();
+    let tenant = format!("mr008-sweep-{suffix}");
+    let other_tenant = format!("mr008-sweep-other-{suffix}");
+    let (s, other) = (scope(&tenant, &region), scope(&other_tenant, &region));
+    let store = RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle);
+    let now = ts("2026-06-26T00:00:00Z");
+    let (ended, live) = (ts("2020-01-01T00:00:00Z"), ts("2099-01-01T00:00:00Z"));
+    let jti = |handle: &str| RevokeTarget::Jti(handle.into());
+
+    store
+        .revoke_until(&s, &jti("session-ended"), now.clone(), ended.clone())
+        .unwrap();
+    store
+        .revoke_until(&s, &jti("session-live"), now.clone(), live)
+        .unwrap();
+    store
+        .register_run_token_ttl(&s, "runtok:ended-run", now.clone(), ended.clone())
+        .unwrap();
+    store.revoke(&s, &jti("jti-forever"), now.clone()).unwrap();
+    store
+        .revoke_until(&other, &jti("session-ended"), now, ended)
+        .unwrap();
+
+    assert_eq!(store.sweep_ended_sessions(&s).unwrap(), 1);
+    assert_eq!(
+        store.sweep_ended_sessions(&s).unwrap(),
+        0,
+        "nothing else is swept"
+    );
+    let remaining = |tenant: String| {
+        let pool = admin.db_pool().clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT handle FROM revocation WHERE tenant_id = $1 ORDER BY handle",
+            )
+            .bind(tenant)
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(
+        remaining(tenant.clone()).await,
+        ["jti-forever", "runtok:ended-run", "session-live"],
+        "live session denials, run lives and other denials stay"
+    );
+    assert_eq!(
+        remaining(other_tenant.clone()).await,
+        ["session-ended"],
+        "another tenant's rows are not swept"
+    );
+
+    cleanup(&admin, &[&tenant, &other_tenant]).await;
+}

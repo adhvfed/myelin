@@ -128,6 +128,31 @@ UPDATE principal AS person
    AND person.status <> '"Disabled"';
 "#;
 
+/// What the database says when something tries to re-enable an erased person.
+pub const ERASED_PRINCIPAL_STAYS_DISABLED: &str = "an erased principal stays disabled";
+
+/// A person with a permanent principal-wide revocation (an erasure) stays disabled: no write,
+/// an operator's re-bootstrap included, may give them another status.
+pub const ERASED_PRINCIPAL_STAYS_DISABLED_MIGRATION: &str = r#"
+CREATE OR REPLACE FUNCTION principal_erasure_sticks() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF OLD.status = '"Disabled"' AND NEW.status IS DISTINCT FROM OLD.status AND EXISTS (
+       SELECT 1 FROM revocation
+        WHERE kind = 'principal' AND expires_at IS NULL
+          AND tenant_id = OLD.tenant_id AND region = OLD.region AND handle = OLD.principal_id)
+  THEN
+    RAISE EXCEPTION 'an erased principal stays disabled: %', OLD.principal_id
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS principal_erasure_sticks ON principal;
+CREATE TRIGGER principal_erasure_sticks BEFORE UPDATE OF status ON principal
+  FOR EACH ROW EXECUTE FUNCTION principal_erasure_sticks();
+"#;
+
 pub const REVOCATION_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS revocation (
     tenant_id  text NOT NULL,
@@ -416,6 +441,11 @@ pub fn human_session_migrations() -> Migrations {
         Migration::plain_on(
             "0185_permanent_principal_revocation_disables",
             PERMANENT_PRINCIPAL_REVOCATION_DISABLES_MIGRATION,
+            "principal",
+        ),
+        Migration::plain_on(
+            "0186_erased_principal_stays_disabled",
+            ERASED_PRINCIPAL_STAYS_DISABLED_MIGRATION,
             "principal",
         ),
     ])
