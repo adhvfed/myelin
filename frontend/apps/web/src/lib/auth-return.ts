@@ -44,8 +44,13 @@ export function safeAuthReturnTo(value: unknown): string {
 }
 
 /** Preserve the safe return path while an authentication attempt returns to the login page. */
-export function authFailureDestination(error: string, returnTo: unknown): string {
+export function authFailureDestination(
+  error: string,
+  returnTo: unknown,
+  retryAfterSecs?: number,
+): string {
   const params = new URLSearchParams({ error });
+  if (retryAfterSecs) params.set("retry_after", String(retryAfterSecs));
   const safeReturnTo = safeAuthReturnTo(returnTo);
   if (safeReturnTo !== DEFAULT_AUTH_RETURN_TO) params.set("return_to", safeReturnTo);
   return `/login?${params.toString()}`;

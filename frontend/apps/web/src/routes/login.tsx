@@ -20,11 +20,17 @@ function errorCopy(code: string): string {
   switch (code) {
     case "credentials":
       return "That email and password don't match an account. Check both and try again.";
-    case "rate_limited":
-      return "Too many attempts. Wait a minute, then try again.";
     default:
       return "Sign-in couldn't be completed. Try again, or contact your Myelin administrator if it keeps happening.";
   }
+}
+
+/** How long a locked sign-in waits, from the edge's retry-after in seconds. */
+function waitCopy(retryAfter: unknown): string {
+  const seconds = Number(retryAfter);
+  if (!Number.isSafeInteger(seconds) || seconds <= 0) return "a few minutes";
+  const minutes = Math.ceil(seconds / 60);
+  return minutes === 1 ? "1 minute" : `${minutes} minutes`;
 }
 
 function resetErrorCopy(code: string): string {
@@ -95,7 +101,14 @@ export default function Login() {
 
         <Show when={error()}>
           <p role="alert" id="login-error-msg" class="auth-alert" data-testid="login-error">
-            {errorCopy(error())}
+            <Show when={error() === "rate_limited"} fallback={errorCopy(error())}>
+              Too many attempts. Try again in {waitCopy(params.retry_after)}, sign in from a device
+              you've used before, or{" "}
+              <a href={resetHelpHref()} data-testid="locked-reset">
+                reset your password
+              </a>
+              .
+            </Show>
           </p>
         </Show>
         <Show when={signedOut() && !error()}>

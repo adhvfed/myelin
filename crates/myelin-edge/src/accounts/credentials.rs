@@ -1,5 +1,5 @@
-//! The secrets behind password sign-in: password hashing, the email lookup digest, and invitation
-//! codes. Nothing here touches storage, and nothing here logs.
+//! The secrets behind password sign-in: password hashing, the email lookup digest, device tokens,
+//! and invitation codes. Nothing here touches storage, and nothing here logs.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -162,16 +162,16 @@ impl core::fmt::Debug for Email {
 /// Keyed digest used to find an account by email without storing the address in the clear. The
 /// key is derived from the cell's seal key, so the digest is useless without it.
 #[derive(Clone)]
-pub struct EmailDigester {
+pub(crate) struct EmailDigester {
     key: Zeroizing<[u8; 32]>,
 }
 
 pub(crate) type EmailDigest = [u8; 32];
 
 impl EmailDigester {
-    pub const SEAL_KEY_CONTEXT: &'static str = "myelin 2026-11-24 account email digest v1";
+    const SEAL_KEY_CONTEXT: &'static str = "myelin 2026-11-24 account email digest v1";
 
-    pub fn new(key: Zeroizing<[u8; 32]>) -> Self {
+    pub(crate) fn new(key: Zeroizing<[u8; 32]>) -> Self {
         Self { key }
     }
 
@@ -181,6 +181,96 @@ impl EmailDigester {
         mac.update(b"myelin.edge.account.email.v1\0");
         mac.update(email.as_str().as_bytes());
         mac.finalize().into_bytes().into()
+    }
+}
+
+/// The keys password accounts derive from the cell's seal key.
+#[derive(Clone)]
+pub struct AccountKeys {
+    pub(crate) email: EmailDigester,
+    pub(crate) devices: DeviceKey,
+}
+
+impl AccountKeys {
+    pub fn derive(seal: &myelin_storage::SealKey) -> Self {
+        Self {
+            email: EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
+            devices: DeviceKey(seal.derive_service_key(DeviceKey::SEAL_KEY_CONTEXT)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixed(byte: u8) -> Self {
+        Self {
+            email: EmailDigester::new(Zeroizing::new([byte; 32])),
+            devices: DeviceKey(Zeroizing::new([byte ^ 0xff; 32])),
+        }
+    }
+}
+
+pub(crate) type DeviceId = [u8; DEVICE_ID_BYTES];
+
+const DEVICE_ID_BYTES: usize = 16;
+const DEVICE_TOKEN_VERSION: u8 = 1;
+const DEVICE_TOKEN_BYTES: usize = 1 + DEVICE_ID_BYTES + 8 + 32;
+const DEVICE_TOKEN_B64URL_LEN: usize = 76;
+pub(crate) const DEVICE_TOKEN_TTL_SECS: i64 = 365 * 24 * 60 * 60;
+/// How far ahead of this Edge's clock another Edge may have issued a token.
+const DEVICE_TOKEN_SKEW_SECS: i64 = 5 * 60;
+
+/// Signs device tokens: proof that a browser once signed in to an email. A token binds the email
+/// digest, a random device id and its issue time under a MAC. It is stored nowhere and grants
+/// nothing but a sign-in allowance of its own, so strangers guessing at the email cannot use it up.
+#[derive(Clone)]
+pub(crate) struct DeviceKey(Zeroizing<[u8; 32]>);
+
+impl DeviceKey {
+    const SEAL_KEY_CONTEXT: &'static str = "myelin 2026-11-26 account device token v1";
+
+    /// A token for `device`, or for a new device when `None`.
+    pub(crate) fn issue(&self, email: &EmailDigest, device: Option<DeviceId>, now: i64) -> String {
+        let device = device.unwrap_or_else(|| {
+            let mut id = [0_u8; DEVICE_ID_BYTES];
+            OsRng.fill_bytes(&mut id);
+            id
+        });
+        let mut token = Vec::with_capacity(DEVICE_TOKEN_BYTES);
+        token.push(DEVICE_TOKEN_VERSION);
+        token.extend_from_slice(&device);
+        token.extend_from_slice(&now.to_be_bytes());
+        let mac = self.mac(email, &token).finalize().into_bytes();
+        token.extend_from_slice(&mac);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
+    }
+
+    /// The device a token names, if it was issued here for `email` and has not expired. Anything
+    /// else, however malformed, is `None`.
+    pub(crate) fn verify(&self, token: &str, email: &EmailDigest, now: i64) -> Option<DeviceId> {
+        if token.len() != DEVICE_TOKEN_B64URL_LEN {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .ok()?;
+        if bytes.len() != DEVICE_TOKEN_BYTES || bytes[0] != DEVICE_TOKEN_VERSION {
+            return None;
+        }
+        let (signed, mac) = bytes.split_at(DEVICE_TOKEN_BYTES - 32);
+        self.mac(email, signed).verify_slice(mac).ok()?;
+        let device: DeviceId = signed[1..1 + DEVICE_ID_BYTES].try_into().ok()?;
+        let issued_at = i64::from_be_bytes(signed[1 + DEVICE_ID_BYTES..].try_into().ok()?);
+        (issued_at <= now.saturating_add(DEVICE_TOKEN_SKEW_SECS)
+            && now < issued_at.saturating_add(DEVICE_TOKEN_TTL_SECS))
+        .then_some(device)
+    }
+
+    fn mac(&self, email: &EmailDigest, signed: &[u8]) -> Hmac<Sha256> {
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(self.0.as_slice())
+            .expect("HMAC accepts a 32-byte key");
+        mac.update(b"myelin.edge.account.device.v1\0");
+        mac.update(email);
+        mac.update(signed);
+        mac
     }
 }
 
@@ -421,6 +511,57 @@ mod tests {
             Sha256::digest(ada.as_str()).to_vec(),
             "the digest is keyed, not a bare hash anyone can recompute"
         );
+    }
+
+    #[test]
+    fn a_device_token_works_only_for_its_email_its_cell_and_its_lifetime() {
+        let keys = AccountKeys::fixed(1);
+        let devices = &keys.devices;
+        let (ada, grace) = ([1_u8; 32], [2_u8; 32]);
+        let now = 1_800_000_000;
+        let token = devices.issue(&ada, None, now);
+        assert_eq!(token.len(), DEVICE_TOKEN_B64URL_LEN);
+        let device = devices.verify(&token, &ada, now).expect("a fresh token");
+        assert_eq!(
+            devices.verify(&devices.issue(&ada, Some(device), now + 60), &ada, now + 60),
+            Some(device),
+            "a reissued token keeps its device"
+        );
+        assert_ne!(
+            devices.verify(&devices.issue(&ada, None, now), &ada, now),
+            Some(device)
+        );
+        assert_eq!(devices.verify(&token, &grace, now), None, "another email");
+        assert_eq!(
+            AccountKeys::fixed(2).devices.verify(&token, &ada, now),
+            None,
+            "another cell"
+        );
+        assert_eq!(
+            devices.verify(&token, &ada, now + DEVICE_TOKEN_TTL_SECS),
+            None,
+            "expired"
+        );
+        assert!(devices
+            .verify(&token, &ada, now + DEVICE_TOKEN_TTL_SECS - 1)
+            .is_some());
+        assert_eq!(
+            devices.verify(&token, &ada, now - DEVICE_TOKEN_SKEW_SECS - 1),
+            None,
+            "issued too far in the future"
+        );
+        let mut forged = token.into_bytes();
+        forged[10] = if forged[10] == b'A' { b'B' } else { b'A' };
+        let forged = String::from_utf8(forged).unwrap();
+        assert_eq!(devices.verify(&forged, &ada, now), None);
+        for junk in [
+            "",
+            "x",
+            &"A".repeat(DEVICE_TOKEN_B64URL_LEN),
+            &"é".repeat(38),
+        ] {
+            assert_eq!(devices.verify(junk, &ada, now), None, "{junk:?}");
+        }
     }
 
     #[test]

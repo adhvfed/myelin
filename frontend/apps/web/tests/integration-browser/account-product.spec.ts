@@ -3,7 +3,8 @@ import { expect, test, type Page } from "@playwright/test";
 // A person's account, start to finish, against the real stack: the operator's first invitation
 // link, a chosen password, an ordinary sign-in, an emailed invitation for a teammate, and a
 // forgotten password reset from an emailed link, a password change on one of two devices, and
-// signing out of all of them. Mail is read from the stack's Mailpit inbox.
+// signing out of all of them, and a stranger's guesses that lock out only new browsers. Mail is
+// read from the stack's Mailpit inbox.
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -48,6 +49,7 @@ test("an invited person creates an account, invites a teammate by email, and res
   page,
   browser,
 }) => {
+  test.setTimeout(60_000);
   await page.goto(new URL(inviteUrl).pathname);
   await page.waitForLoadState("networkidle");
   await expect(page.getByTestId("join-email")).toHaveValue(inviteEmail);
@@ -144,6 +146,23 @@ test("an invited person creates an account, invites a teammate by email, and res
   await phone.goto("/profile");
   await phone.waitForURL(/\/login\?signed_out=session$/);
   await expect(phone.getByTestId("signed-out")).toHaveText("You were signed out.");
+  await signIn(phone, inviteEmail, "a password changed in place");
+  await phone.waitForURL("**/git/repos");
+
+  // A stranger's ten wrong guesses lock out new browsers, not the phone that signed in before.
+  const strangerContext = await browser.newContext();
+  const stranger = await strangerContext.newPage();
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    await signIn(stranger, inviteEmail, "a stranger's guess");
+    await stranger.waitForURL(/error=credentials/);
+  }
+  await signIn(stranger, inviteEmail, "a password changed in place");
+  await stranger.waitForURL(/error=rate_limited/);
+  await expect(stranger.getByTestId("login-error")).toContainText(
+    "sign in from a device you've used before, or reset your password.",
+  );
+  await strangerContext.close();
+  await phoneContext.clearCookies({ name: /myelin_session$/ });
   await signIn(phone, inviteEmail, "a password changed in place");
   await phone.waitForURL("**/git/repos");
 

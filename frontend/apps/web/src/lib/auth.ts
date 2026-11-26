@@ -50,6 +50,7 @@ import {
   SIGNED_OUT_DESTINATION,
 } from "./auth-return";
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
+import { deviceTokenForEmail, rememberDevice } from "../server/device-trust";
 import {
   toAuthConfig,
 } from "./auth-config";
@@ -188,9 +189,11 @@ export const getDeploymentRegion = query(async (): Promise<string | null> => {
   return /^[a-z0-9][a-z0-9-]{0,62}$/.test(region) ? region : null;
 }, "deployment-region");
 
-/** Turn a fresh human session grant into the browser's server-side session. */
+/** Turn a fresh human session grant into the browser's server-side session, and remember the
+ * device token that came with it. */
 async function signInWithGrant(grant: EdgeSessionGrant): Promise<void> {
   const who = await edgeWhoamiWithToken(grant.accessToken, grant.scheme);
+  if (grant.deviceToken && who.email) rememberDevice(who.email, grant.deviceToken);
   await issueSession({
     token: grant.accessToken,
     refreshToken: "",
@@ -217,16 +220,18 @@ export const loginWithPassword = action(async (formData: FormData) => {
   const password = String(formData.get("password") ?? "");
   const returnTo = formData.get("return_to");
   let failure: AccountFailure | null = null;
+  let retryAfterSecs: number | undefined;
   if (!email || !password || email.length > 320 || password.length > 4_096) {
     failure = "credentials";
   } else {
     try {
-      await signInWithGrant(await edgePasswordLogin(email, password));
+      await signInWithGrant(await edgePasswordLogin(email, password, deviceTokenForEmail(email)));
     } catch (error) {
       failure = accountFailure(error);
+      if (error instanceof AccountError) retryAfterSecs = error.retryAfterSecs;
     }
   }
-  if (failure) throw redirect(authFailureDestination(failure, returnTo));
+  if (failure) throw redirect(authFailureDestination(failure, returnTo, retryAfterSecs));
   throw redirect(safeAuthReturnTo(returnTo));
 }, "login-with-password");
 
@@ -372,6 +377,16 @@ export const logoutEverywhere = action(async (): Promise<{ ok: false }> => {
 
 export type PasswordChangeResult = { ok: true } | { ok: false; reason: AccountFailure };
 
+/** The device token this browser holds for the signed-in person's email, if it has one. */
+async function ownDeviceToken(): Promise<string | undefined> {
+  try {
+    const email = (await edgeWhoami()).email;
+    return email ? deviceTokenForEmail(email) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Where a browser goes when its password changed but its fresh session could not be installed. */
 const PASSWORD_CHANGED_DESTINATION = "/login?signed_out=password_changed";
 /** Where it goes when the edge's answer to a change was lost, so the change may or may not stand. */
@@ -390,7 +405,7 @@ export const changePassword = action(
     if (next !== confirm) return { ok: false, reason: "password_mismatch" };
     let grant: EdgeSessionGrant;
     try {
-      grant = await edgeChangePassword(current, next);
+      grant = await edgeChangePassword(current, next, await ownDeviceToken());
     } catch (error) {
       const reason = accountFailure(error);
       // The gateway has already cleared the session the edge refused.

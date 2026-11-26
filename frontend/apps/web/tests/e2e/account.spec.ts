@@ -79,8 +79,35 @@ test.describe("signing in", () => {
   test("too many attempts asks the person to wait", async ({ page }) => {
     await setEdgeConfig({ loginRateLimited: true });
     await signIn(page, ADA.email, ADA.password);
-    await page.waitForURL(/\/login\?error=rate_limited/);
-    await expect(page.getByTestId("login-error")).toContainText(/wait a minute/i);
+    await page.waitForURL(/\/login\?error=rate_limited&retry_after=60/);
+    await expect(page.getByTestId("login-error")).toContainText("Try again in 1 minute,");
+  });
+
+  test("strangers' guesses do not lock out a browser that signed in before; axe green", async ({ page, browser }) => {
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL("**/git/repos");
+    const [device] = (await page.context().cookies()).filter((cookie) => cookie.name === "myelin_device");
+    expect(device, "sign-in leaves a device cookie").toBeDefined();
+    expect(device!.httpOnly).toBe(true);
+    expect(device!.sameSite).toBe("Lax");
+    expect(device!.expires * 1_000 - Date.now()).toBeGreaterThan(360 * 24 * 60 * 60 * 1_000);
+    expect(device!.value).not.toContain("ada");
+
+    await setEdgeConfig({ strangersLockedOut: true });
+    await page.context().clearCookies({ name: "myelin_session" });
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL("**/git/repos");
+
+    const stranger = await (await browser.newContext()).newPage();
+    await signIn(stranger, ADA.email, ADA.password);
+    await stranger.waitForURL(/\/login\?error=rate_limited&retry_after=540/);
+    await expect(stranger.getByTestId("login-error")).toHaveText(
+      "Too many attempts. Try again in 9 minutes, sign in from a device you've used before, or reset your password.",
+    );
+    await expectNoAxeViolations(stranger, "/login?error=rate_limited");
+    await stranger.getByTestId("locked-reset").click();
+    await expect(stranger.getByRole("heading", { name: "Reset your password" })).toBeVisible();
+    await stranger.context().close();
   });
 
   test("a failed sign-in keeps the page the person was heading to", async ({ page }) => {
@@ -302,6 +329,13 @@ test.describe("password and sessions", () => {
     await page.waitForURL(/error=credentials/);
     await signIn(page, ADA.email, "a newer passphrase");
     await page.waitForURL("**/git/repos");
+  });
+
+  test("strangers' guesses do not block a password change on a browser that signed in before", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await setEdgeConfig({ strangersLockedOut: true });
+    await changePassword(page, ADA.password, "a newer passphrase");
+    await expect(page.getByText("Password changed. Your other sessions were signed out.")).toBeVisible();
   });
 
   test("a change another device beat says so and keeps the person signed in", async ({ page }) => {

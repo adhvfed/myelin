@@ -18,13 +18,13 @@ use myelin_edge::{
     register_agent_threads, register_agents, register_chat, register_ci, register_git_durable,
     register_git_wire, register_issues, register_knowledge, register_notif, register_privacy,
     register_projects, register_refs, register_tools, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, spawn_merge_queue, validated_web_origin, AccountService,
-    AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices,
+    spawn_issue_authorization_reconciler, spawn_merge_queue, validated_web_origin, AccountKeys,
+    AccountService, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices,
     AgentThreadHttpInputs, AgentThreadRecoveryConfig, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
     DeviceAuthorizationBroker, DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess,
     DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiApi,
-    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, EmailDigester, Gateway,
+    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway,
     GitDatabaseProviders, InviteHandler, IssueReconciliationConfig, MailOutbox, MailSettings,
     MailWorker, Method, ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError,
     SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
@@ -296,7 +296,7 @@ struct ComposedCore {
     kms: Arc<KmsEngine>,
     cell: Arc<CellTokenAuthority>,
     ci_surface_cursor_key: zeroize::Zeroizing<[u8; 32]>,
-    email_digest_key: zeroize::Zeroizing<[u8; 32]>,
+    account_keys: AccountKeys,
     mail_outbox_key: zeroize::Zeroizing<[u8; 32]>,
     workspace_ssh_host: WorkspaceSshHostIdentity,
     workspace_ssh_routes: WorkspaceSshRouteKey,
@@ -832,7 +832,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
     };
     let ci_surface_cursor_key =
         seal_key.derive_service_key("myelin 2026-07-24 ci run surface cursor v1");
-    let email_digest_key = seal_key.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT);
+    let account_keys = AccountKeys::derive(&seal_key);
     let mail_outbox_key = seal_key.derive_service_key(MailOutbox::SEAL_KEY_CONTEXT);
     let workspace_ssh_host = WorkspaceSshHostIdentity::from_seal_key(&seal_key);
     let workspace_ssh_routes = WorkspaceSshRouteKey::from_seal_key(&seal_key);
@@ -868,7 +868,7 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         kms,
         cell,
         ci_surface_cursor_key,
-        email_digest_key,
+        account_keys,
         mail_outbox_key,
         workspace_ssh_host,
         workspace_ssh_routes,
@@ -886,7 +886,7 @@ impl ComposedCore {
                 DurablePrincipalBacking::new(self.provider.clone()),
                 self.handle.clone(),
             ),
-            EmailDigester::new(self.email_digest_key.clone()),
+            self.account_keys.clone(),
             self.provider.config().region.clone(),
             web_origin,
             self.handle.clone(),
@@ -1040,7 +1040,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         kms,
         cell,
         ci_surface_cursor_key,
-        email_digest_key: _,
+        account_keys: _,
         mail_outbox_key: _,
         workspace_ssh_host,
         workspace_ssh_routes,

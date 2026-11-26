@@ -9,8 +9,8 @@ use myelin_edge::accounts::{Acceptance, Checkpoint, MemberInvitation};
 use myelin_edge::catalogue::{Handler, HandlerCtx};
 use myelin_edge::mail::{DeliveryPass, DeliverySchedule};
 use myelin_edge::{
-    account_migrations, AccountError, AccountService, AllowAll, EdgeRequest, EdgeResponse,
-    EmailDigester, Gateway, InviteHandler, MailOutbox, MailSettings, MailWorker,
+    account_migrations, AccountError, AccountKeys, AccountService, AllowAll, EdgeRequest,
+    EdgeResponse, Gateway, InviteHandler, MailOutbox, MailSettings, MailWorker,
 };
 use myelin_identity::{Principal, PrincipalStatus};
 use myelin_identity_service::{
@@ -23,7 +23,7 @@ use myelin_storage::{
     PgBootstrap, SealKey, SubstrateProvider,
 };
 use sha2::{Digest as _, Sha256};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -283,10 +283,7 @@ impl Cell {
         let service = AccountService::new(
             self.provider.db_pool().clone(),
             self.principals.clone(),
-            EmailDigester::new(
-                self.seal
-                    .derive_service_key(EmailDigester::SEAL_KEY_CONTEXT),
-            ),
+            AccountKeys::derive(&self.seal),
             self.provider.config().region.clone(),
             Some("https://myelin.example".into()),
             tokio::runtime::Handle::current(),
@@ -847,7 +844,9 @@ async fn forgot_password_answers_alike_and_mails_only_a_capped_few() {
     assert!(notices[1]
         .decoded()
         .contains("\n\nhttps://myelin.example/login?help=password\n"));
-    let signed_in = accounts.login(&ada, "a fresh passphrase".into()).unwrap();
+    let signed_in = accounts
+        .login(&ada, "a fresh passphrase".into(), None)
+        .unwrap();
 
     // Changing it while signed in sends the same notice.
     accounts
@@ -855,12 +854,108 @@ async fn forgot_password_answers_alike_and_mails_only_a_capped_few() {
             &signed_in.principal,
             "a fresh passphrase".into(),
             "another fresh passphrase".into(),
+            None,
         )
         .unwrap();
     assert_eq!(deliver(&worker).await.sent, 1);
     let notices = smtp.delivered_to(&ada);
     assert_eq!(notices.len(), 3);
     assert!(notices[2].header("Subject").unwrap().contains("changed"));
+}
+
+fn login(gateway: &Gateway, email: &str, password: &str) -> EdgeResponse {
+    gateway.handle(EdgeRequest::new(
+        "POST",
+        "/v1/auth/password/login",
+        "",
+        vec![],
+        serde_json::to_vec(&serde_json::json!({ "email": email, "password": password })).unwrap(),
+    ))
+}
+
+/// Waits for the lock notice, queued off the request path, then lets any stray one land too.
+async fn settle_queue(cell: &Cell, expected: i64) {
+    for _ in 0..50 {
+        if cell.queued().await >= expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(cell.queued().await, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn strangers_filling_an_allowance_mail_the_owner_once_a_window_and_say_nothing_more() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let smtp = FakeSmtp::start().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let clock = Arc::new(AtomicI64::new(now));
+    let accounts = cell.accounts(true).with_clock({
+        let clock = clock.clone();
+        move || clock.load(Ordering::Relaxed)
+    });
+    let worker = cell.worker(&smtp, quick_retries());
+    let tenant = unique("t-mail-lock");
+    let ada = format!("{}@example.com", unique("ada"));
+    cell.person(&accounts, &tenant, &ada).await;
+    let disabled = format!("{}@example.com", unique("disabled"));
+    let gone = cell.person(&accounts, &tenant, &disabled).await;
+    cell.set_status(&gone, PrincipalStatus::Disabled);
+    let nobody = format!("{}@example.com", unique("nobody"));
+    let gateway = gateway(accounts.clone());
+
+    for _ in 0..10 {
+        let answers = [&ada, &disabled, &nobody]
+            .map(|email| shape(&login(&gateway, email, "a stranger's guess")));
+        assert_eq!(answers[0].0, 401);
+        assert_eq!(answers[1], answers[0]);
+        assert_eq!(answers[2], answers[0]);
+    }
+    let locked = [&ada, &disabled, &nobody].map(|email| shape(&login(&gateway, email, PASSWORD)));
+    assert_eq!(locked[0].0, 429);
+    assert!(locked[0]
+        .1
+        .contains(&("retry-after".to_string(), "900".to_string())));
+    assert_eq!(locked[1], locked[0], "a disabled account is locked alike");
+    assert_eq!(locked[2], locked[0], "an unknown email is locked alike");
+
+    settle_queue(&cell, 1).await;
+    assert_eq!(deliver(&worker).await.sent, 1);
+    let notices = smtp.delivered_to(&ada);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(
+        notices[0].header("Subject"),
+        Some("Failed sign-in attempts on your Myelin account")
+    );
+    assert!(notices[0].decoded().contains(
+        "Several sign-in attempts to your Myelin account failed. Devices you've signed in from \
+         before are unaffected. If this wasn't you, no action is needed; if you can't sign in, \
+         reset your password:\n\nhttps://myelin.example/login?help=password\n"
+    ));
+    assert!(smtp.delivered_to(&nobody).is_empty());
+    assert!(smtp.delivered_to(&disabled).is_empty());
+
+    for _ in 0..5 {
+        assert_eq!(shape(&login(&gateway, &ada, "a stranger's guess")).0, 429);
+    }
+    settle_queue(&cell, 0).await;
+
+    clock.fetch_add(15 * 60, Ordering::Relaxed);
+    for _ in 0..10 {
+        assert_eq!(shape(&login(&gateway, &ada, "a stranger's guess")).0, 401);
+    }
+    settle_queue(&cell, 1).await;
+    assert_eq!(deliver(&worker).await.sent, 1);
+    assert_eq!(
+        smtp.delivered_to(&ada).len(),
+        2,
+        "one notice for the next window"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1466,7 +1561,7 @@ async fn a_second_reset_link_accepted_mid_reset_waits_then_finds_its_link_gone()
         AccountError::InvitationNotFound
     );
     accounts
-        .login(&email, "the first passphrase".into())
+        .login(&email, "the first passphrase".into(), None)
         .unwrap();
 }
 
@@ -1656,7 +1751,7 @@ async fn a_refused_reset_queues_no_change_notice() {
         AccountError::InvitationNotFound
     );
     assert_eq!(cell.queued().await, 0, "an expired link sends no notice");
-    accounts.login(&email, PASSWORD.into()).unwrap();
+    accounts.login(&email, PASSWORD.into(), None).unwrap();
 }
 
 trait InTenant {

@@ -83,7 +83,12 @@ const state = {
   accounts: new Map(),
   invitations: new Map(),
   signedInDisplayName: null,
+  signedInEmail: "",
   loginRateLimited: false,
+  // With `strangersLockedOut`, sign-in and password change answer 429 unless they bring a device
+  // token the double issued for that email, as the real edge does once strangers fill the allowance.
+  strangersLockedOut: false,
+  deviceTokens: new Map(),
   mailDeliveryEnabled: true,
   sentMail: [],
   invitesPerRecipient: new Map(),
@@ -458,7 +463,10 @@ function resetAccounts() {
     [E2E_RESET_CODE, { kind: "reset", email: E2E_ACCOUNT.email }],
   ]);
   state.signedInDisplayName = null;
+  state.signedInEmail = "";
   state.loginRateLimited = false;
+  state.strangersLockedOut = false;
+  state.deviceTokens = new Map();
   state.mailDeliveryEnabled = true;
   state.sentMail = [];
   state.invitesPerRecipient = new Map();
@@ -481,13 +489,25 @@ function newInvitation(kind, email) {
   return `${WEB_ORIGIN}/join/${code}`;
 }
 
-function sessionGrant() {
+function sessionGrant(email) {
+  const deviceToken = `e2e-device-token-${String(state.deviceTokens.size).padStart(8, "0")}`;
+  state.deviceTokens.set(deviceToken, email);
   return {
     access_token: state.accessToken,
     token_type: "Bearer",
     scheme: "session",
     expires_at: Math.floor(Date.now() / 1_000) + 60 * 60,
+    device_token: deviceToken,
   };
+}
+
+/** Whether a locked-out sign-in for `email` is refused: only one without that email's token is. */
+function lockedOut(email, deviceToken) {
+  return state.strangersLockedOut && state.deviceTokens.get(deviceToken) !== email;
+}
+
+function lockedOutAnswer(res) {
+  return send(res, 429, { error: { message: "too many attempts" } }, { "retry-after": "540" });
 }
 
 function readJson(req) {
@@ -504,31 +524,39 @@ function readJson(req) {
   });
 }
 
-function exactKeys(body, keys) {
-  return body !== null && typeof body === "object" && !Array.isArray(body) &&
-    Object.keys(body).length === keys.length && keys.every((key) => typeof body[key] === "string");
+function exactKeys(body, keys, optional = []) {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return false;
+  const present = optional.filter((key) => key in body);
+  return Object.keys(body).length === keys.length + present.length &&
+    [...keys, ...present].every((key) => typeof body[key] === "string");
 }
 
 /** The public account routes: password sign-in and invitation links. Returns true when handled. */
 async function handleAccountRoute(req, res, method, path) {
   if (method === "POST" && path === "/v1/auth/password/login") {
     const body = await readJson(req);
-    if (!exactKeys(body, ["email", "password"])) return send(res, 400, { error: { message: "bad request" } }), true;
+    if (!exactKeys(body, ["email", "password"], ["device_token"])) {
+      return send(res, 400, { error: { message: "bad request" } }), true;
+    }
     if (state.loginRateLimited) return send(res, 429, { error: { message: "slow down" } }, { "retry-after": "60" }), true;
-    const account = state.accounts.get(body.email.trim().toLowerCase());
+    const email = body.email.trim().toLowerCase();
+    if (lockedOut(email, body.device_token)) return lockedOutAnswer(res), true;
+    const account = state.accounts.get(email);
     if (!account || account.password !== body.password) return send(res, 401, { error: { message: "login failed" } }), true;
     state.signedInDisplayName = account.displayName;
-    return send(res, 200, sessionGrant()), true;
+    state.signedInEmail = email;
+    return send(res, 200, sessionGrant(email)), true;
   }
   if (method === "POST" && path === "/v1/auth/password/change") {
     if (state.forceUnauthorized || bearer(req) !== state.accessToken) {
       return send(res, 401, unauthorizedEnvelope()), true;
     }
     const body = await readJson(req);
-    if (!exactKeys(body, ["current_password", "new_password"])) {
+    if (!exactKeys(body, ["current_password", "new_password"], ["device_token"])) {
       return send(res, 400, { error: { message: "bad request" } }), true;
     }
     if (state.loginRateLimited) return send(res, 429, { error: { message: "slow down" } }, { "retry-after": "60" }), true;
+    if (lockedOut(E2E_ACCOUNT.email, body.device_token)) return lockedOutAnswer(res), true;
     const account = state.accounts.get(E2E_ACCOUNT.email);
     if (account.password !== body.current_password) {
       return send(res, 403, { error: { code: "wrong_password", message: "the current password is not right" } }), true;
@@ -550,7 +578,7 @@ async function handleAccountRoute(req, res, method, path) {
       return send(res, 502, { error: { code: "bad_gateway", message: "upstream reset" } }), true;
     }
     state.sentMail.push({ to: E2E_ACCOUNT.email, kind: "password_changed", url: `${WEB_ORIGIN}/login?help=password` });
-    return send(res, 200, sessionGrant()), true;
+    return send(res, 200, sessionGrant(E2E_ACCOUNT.email)), true;
   }
   if (method === "POST" && path === "/v1/auth/password/forgot") {
     if (!state.mailDeliveryEnabled) return send(res, 503, { error: { message: "not configured" } }), true;
@@ -586,7 +614,8 @@ async function handleAccountRoute(req, res, method, path) {
     state.accounts.set(invitation.email, { password: body.password, displayName });
     state.invitations.delete(match[1]);
     state.signedInDisplayName = displayName;
-    return send(res, 200, sessionGrant()), true;
+    state.signedInEmail = invitation.email;
+    return send(res, 200, sessionGrant(invitation.email)), true;
   }
   return false;
 }
@@ -670,6 +699,7 @@ const server = createServer((req, res) => {
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (body.resetAccounts === true) resetAccounts();
         if (typeof body.loginRateLimited === "boolean") state.loginRateLimited = body.loginRateLimited;
+        if (typeof body.strangersLockedOut === "boolean") state.strangersLockedOut = body.strangersLockedOut;
         if (typeof body.mailDeliveryEnabled === "boolean") state.mailDeliveryEnabled = body.mailDeliveryEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
         if (typeof body.signOutUnavailable === "boolean") state.signOutUnavailable = body.signOutUnavailable;
@@ -1759,7 +1789,7 @@ const server = createServer((req, res) => {
     return send(res, 200, {
       ...whoamiJson(),
       display_name: state.signedInDisplayName ?? DEV_PRINCIPAL.displayName,
-      email: "",
+      email: state.signedInEmail,
     });
   }
 

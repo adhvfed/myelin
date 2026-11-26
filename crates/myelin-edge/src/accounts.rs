@@ -20,8 +20,11 @@ use tokio::sync::Semaphore;
 
 use crate::mail::{Letter, MailOutbox};
 
-pub use credentials::EmailDigester;
-use credentials::{DummyHash, Email, InvitationCode, Password, WeakPassword};
+pub use credentials::AccountKeys;
+use credentials::{
+    DeviceId, DeviceKey, DummyHash, Email, EmailDigest, EmailDigester, InvitationCode, Password,
+    WeakPassword,
+};
 pub use store::account_migrations;
 pub(crate) use store::InvitationKind;
 use store::{
@@ -41,12 +44,24 @@ struct Limit {
     window_secs: i64,
 }
 
-/// Failed sign-ins per email, whoever is asking, so spreading guesses over many sources does not
-/// help. A success clears the count. The Edge cannot see client addresses, so someone who knows an
-/// email can still lock that person out for one window; that is accepted here.
+/// Sign-in attempts per email from browsers without a device token for it, wherever they come
+/// from, so spreading guesses over many sources does not help. Filling it turns away only those
+/// browsers: one that has signed in to the email before is charged to its own allowance below.
 const LOGIN_FAILURES_PER_EMAIL: Limit = Limit {
     name: "login.email",
     hits: 10,
+    window_secs: 15 * 60,
+};
+/// Sign-in attempts per email from one browser holding a device token for it.
+const LOGIN_FAILURES_PER_DEVICE: Limit = Limit {
+    name: "login.device",
+    hits: 10,
+    window_secs: 15 * 60,
+};
+/// Emails telling a person that strangers' sign-ins to their account are being turned away.
+const LOCK_NOTICES_PER_EMAIL: Limit = Limit {
+    name: "login.lock_notice",
+    hits: 1,
     window_secs: 15 * 60,
 };
 const INVITES_PER_MEMBER: Limit = Limit {
@@ -184,10 +199,20 @@ pub enum MemberInvitation {
 
 /// A person whose password was just confirmed, and the moment the session made for them counts
 /// as issued: by the database clock, and never before the person's session cutoff.
+/// `device_token` lets this browser's later sign-ins to the email skip strangers' allowance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedIn {
     pub principal: Principal,
     pub issued_at_unix: i64,
+    pub device_token: String,
+}
+
+/// The allowance an attempt for one email is charged to: its device's, when it brought a good
+/// device token, otherwise the one every other browser shares.
+struct Charge {
+    limit: &'static Limit,
+    bucket: [u8; 32],
+    device: Option<DeviceId>,
 }
 
 /// What the person sends to accept a link. A join needs their name; a reset does not.
@@ -255,6 +280,7 @@ pub struct AccountService {
     store: AccountStore,
     principals: PrincipalStore,
     digester: EmailDigester,
+    devices: DeviceKey,
     links: LinkOrigin,
     mail: Option<MailOutbox>,
     reset_requests: Arc<Semaphore>,
@@ -275,7 +301,7 @@ impl AccountService {
     pub fn new(
         pool: PgPool,
         principals: PrincipalStore,
-        digester: EmailDigester,
+        keys: AccountKeys,
         region: impl Into<String>,
         web_origin: Option<String>,
         runtime: Handle,
@@ -283,7 +309,8 @@ impl AccountService {
         Self {
             store: AccountStore::new(pool),
             principals,
-            digester,
+            digester: keys.email,
+            devices: keys.devices,
             links: LinkOrigin::from_config(web_origin),
             mail: None,
             reset_requests: Arc::new(Semaphore::new(RESET_REQUESTS_IN_FLIGHT)),
@@ -378,6 +405,48 @@ impl AccountService {
         }
     }
 
+    /// Which allowance an attempt for `email` is charged to. A token that is malformed, forged,
+    /// expired or for another email counts as no token.
+    fn charge(
+        &self,
+        email: &EmailDigest,
+        device_token: Option<&str>,
+    ) -> Result<Charge, AccountError> {
+        let now = self.now_unix()?;
+        Ok(
+            match device_token.and_then(|token| self.devices.verify(token, email, now)) {
+                Some(device) => {
+                    let mut key = email.to_vec();
+                    key.extend_from_slice(&device);
+                    Charge {
+                        limit: &LOGIN_FAILURES_PER_DEVICE,
+                        bucket: Self::bucket(&LOGIN_FAILURES_PER_DEVICE, &key),
+                        device: Some(device),
+                    }
+                }
+                None => Charge {
+                    limit: &LOGIN_FAILURES_PER_EMAIL,
+                    bucket: Self::bucket(&LOGIN_FAILURES_PER_EMAIL, email),
+                    device: None,
+                },
+            },
+        )
+    }
+
+    fn signed_in(
+        &self,
+        principal: Principal,
+        issued_at_unix: i64,
+        email: &EmailDigest,
+        device: Option<DeviceId>,
+    ) -> Result<SignedIn, AccountError> {
+        Ok(SignedIn {
+            principal,
+            issued_at_unix,
+            device_token: self.devices.issue(email, device, self.now_unix()?),
+        })
+    }
+
     /// Runs one password hash or verification under the host-wide concurrency cap.
     fn hashing<T>(&self, work: impl FnOnce() -> T) -> Result<T, AccountError> {
         let _permit = self.hashing.enter()?;
@@ -387,20 +456,29 @@ impl AccountService {
     /// Signs a person in. Unknown email, wrong password, and an inactive person all fail the
     /// same way and cost the same password verification.
     ///
-    /// Each attempt takes a slot in the email's window before it verifies anything, so a burst
-    /// of guesses at one email gets at most the window's worth of verifications. A slot is only
-    /// given back for an attempt that never verified (the hash gate was busy) or that succeeded.
-    pub fn login(&self, email: &str, password: String) -> Result<SignedIn, AccountError> {
+    /// Each attempt takes a slot in its allowance (see `charge`) before it verifies anything, so a
+    /// burst of guesses gets at most the window's worth of verifications per allowance. A slot is
+    /// only given back for an attempt that never verified (the hash gate was busy) or that
+    /// succeeded.
+    pub fn login(
+        &self,
+        email: &str,
+        password: String,
+        device_token: Option<&str>,
+    ) -> Result<SignedIn, AccountError> {
         // A malformed email cannot belong to an account and is not counted, but it pays for a
         // verification like any other attempt so the answer reveals nothing.
-        let digest = Email::parse(email).map(|email| self.digester.digest(&email));
+        let email = Email::parse(email);
+        let digest = email.as_ref().map(|email| self.digester.digest(email));
+        let charge = digest
+            .map(|digest| self.charge(&digest, device_token))
+            .transpose()?;
         let (account, slot) = self.block(async {
-            let Some(digest) = digest else {
+            let (Some(digest), Some(charge)) = (&digest, &charge) else {
                 return Ok((None, None));
             };
-            let bucket = Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &digest);
-            let slot = self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
-            Ok((self.store.account(&digest).await?, Some(slot)))
+            let slot = self.reserve(charge.limit, charge.bucket).await?;
+            Ok((self.store.account(digest).await?, Some(slot)))
         })?;
         let stored_phc = account
             .as_ref()
@@ -411,23 +489,81 @@ impl AccountService {
                 return Err(match slot {
                     Some(slot) => self.refund(slot, busy),
                     None => busy,
-                })
+                });
             }
         };
         #[cfg(any(test, feature = "test-support"))]
         self.reached(Checkpoint::PasswordVerified);
-        let signed_in = match account {
-            Some(account) if verified => self.still_signs_in(&account)?,
+        let signed_in = match &account {
+            Some(account) if verified => self.still_signs_in(account)?,
             _ => None,
         };
-        match (signed_in, slot) {
-            (Some(signed_in), Some(slot)) => {
+        match (signed_in, slot, charge, digest) {
+            (Some((principal, issued_at)), Some(slot), Some(charge), Some(digest)) => {
                 self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
-                Ok(signed_in)
+                self.signed_in(principal, issued_at, &digest, charge.device)
             }
             // The failure was already counted when its slot was taken.
-            _ => Err(AccountError::LoginFailed),
+            (_, slot, charge, _) => {
+                let strangers_locked_out = slot.is_some_and(|slot| slot.filled)
+                    && charge.is_some_and(|charge| charge.device.is_none());
+                if let (true, Some(email), Some(account)) = (strangers_locked_out, email, account) {
+                    self.send_lock_notice(email, account);
+                }
+                Err(AccountError::LoginFailed)
+            }
         }
+    }
+
+    /// Tells the account's owner, off the request path so the attempt's timing says nothing about
+    /// whether the account exists. At most one notice per window goes to an email.
+    fn send_lock_notice(&self, email: Email, account: AccountRow) {
+        let Some(outbox) = self.mail.clone() else {
+            return;
+        };
+        let service = self.clone();
+        self.runtime.spawn_blocking(move || {
+            if let Err(error) = service.queue_lock_notice(&outbox, &email, &account) {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "edge.accounts.lock_notice_failed",
+                        "error": error.to_string(),
+                    })
+                );
+            }
+        });
+    }
+
+    fn queue_lock_notice(
+        &self,
+        outbox: &MailOutbox,
+        email: &Email,
+        account: &AccountRow,
+    ) -> Result<(), AccountError> {
+        if self
+            .active_human(&account.tenant, &account.region, &account.principal_id)?
+            .is_none()
+        {
+            return Ok(());
+        }
+        let letter = Letter::SignInLocked {
+            to: email.as_str().to_string(),
+            reset: self.reset_help(),
+        };
+        self.block(async {
+            let bucket = Self::bucket(&LOCK_NOTICES_PER_EMAIL, &account.email_digest);
+            let slot = match self.reserve(&LOCK_NOTICES_PER_EMAIL, bucket).await {
+                Ok(slot) => slot,
+                Err(AccountError::RateLimited { .. }) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            let queued = self.store.queue(outbox, &letter).await;
+            if queued.is_err() {
+                self.give_back(&[slot]).await;
+            }
+            Ok(queued?)
+        })
     }
 
     /// Verifies against the stored hash, or against the dummy when there is none or the
@@ -441,19 +577,20 @@ impl AccountService {
         }
     }
 
-    /// The person behind a verified password, if the password is still the stored one and the
-    /// person is still active. A reset that lands during verification makes this `None`.
-    fn still_signs_in(&self, account: &AccountRow) -> Result<Option<SignedIn>, AccountError> {
+    /// The person behind a verified password and when their session counts as issued, if the
+    /// password is still the stored one and the person is still active. A reset that lands during
+    /// verification makes this `None`.
+    fn still_signs_in(
+        &self,
+        account: &AccountRow,
+    ) -> Result<Option<(Principal, i64)>, AccountError> {
         let Some(principal) =
             self.active_human(&account.tenant, &account.region, &account.principal_id)?
         else {
             return Ok(None);
         };
         let issued_at = self.block(async { Ok(self.store.still_signs_in(account).await?) })?;
-        Ok(issued_at.map(|issued_at_unix| SignedIn {
-            principal,
-            issued_at_unix,
-        }))
+        Ok(issued_at.map(|issued_at| (principal, issued_at)))
     }
 
     fn active_human(
@@ -607,10 +744,18 @@ impl AccountService {
         let password = Password::new(acceptance.password)?;
         let password_phc = self.hashing(|| password.hash())?;
         let notice = self.password_changed_notice(live.email.as_str());
+        // A reset proves the owner, so strangers' failed attempts no longer hold them back.
+        let unlock = Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &live.invitation.email_digest);
         let outcome = self.block(async {
             Ok(self
                 .store
-                .accept_reset(&live.code.digest(), &live.invitation, password_phc, notice)
+                .accept_reset(
+                    &live.code.digest(),
+                    &live.invitation,
+                    password_phc,
+                    unlock,
+                    notice,
+                )
                 .await?)
         })?;
         self.signed_in_after(&live.invitation, outcome)
@@ -635,38 +780,38 @@ impl AccountService {
             AcceptOutcome::Accepted {
                 principal_id,
                 issued_at_unix,
-            } => self
-                .active_human(&invitation.tenant, &invitation.region, &principal_id)?
-                .map(|principal| SignedIn {
-                    principal,
-                    issued_at_unix,
-                })
-                .ok_or(AccountError::InvitationNotFound),
+            } => {
+                let principal = self
+                    .active_human(&invitation.tenant, &invitation.region, &principal_id)?
+                    .ok_or(AccountError::InvitationNotFound)?;
+                self.signed_in(principal, issued_at_unix, &invitation.email_digest, None)
+            }
             AcceptOutcome::Gone => Err(AccountError::InvitationNotFound),
             AcceptOutcome::EmailTaken => Err(AccountError::AccountExists),
         }
     }
 
     /// A signed-in person changes their password. A wrong current password counts against the
-    /// same per-email allowance as a failed sign-in. On success every session the person holds
-    /// ends, and they are signed in afresh.
+    /// same allowance as a failed sign-in from this browser would. On success every session the
+    /// person holds ends, and they are signed in afresh.
     pub fn change_password(
         &self,
         person: &Principal,
         current: String,
         new: String,
+        device_token: Option<&str>,
     ) -> Result<SignedIn, AccountError> {
         let new = Password::new(new)?;
         let (tenant, region) = (&person.tenant.0, &person.region.0);
-        let (account, slot) = self.block(async {
+        let (account, slot, device) = self.block(async {
             let account = self
                 .store
                 .account_of(tenant, region, &person.principal_id.0)
                 .await?
                 .ok_or(AccountError::NoPassword)?;
-            let bucket = Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &account.email_digest);
-            let slot = self.reserve(&LOGIN_FAILURES_PER_EMAIL, bucket).await?;
-            Ok((account, slot))
+            let charge = self.charge(&account.email_digest, device_token)?;
+            let slot = self.reserve(charge.limit, charge.bucket).await?;
+            Ok((account, slot, charge.device))
         })?;
         let verified = self.hashing(|| self.verify(current, Some(&account.password_phc)));
         #[cfg(any(test, feature = "test-support"))]
@@ -699,18 +844,15 @@ impl AccountService {
         let cutoff = match outcome {
             Ok(ChangeOutcome::Changed { cutoff }) => cutoff,
             Ok(ChangeOutcome::ChangedElsewhere) => {
-                return Err(self.refund(slot, AccountError::PasswordChangedElsewhere))
+                return Err(self.refund(slot, AccountError::PasswordChangedElsewhere));
             }
             Ok(ChangeOutcome::Inactive) => {
-                return Err(self.refund(slot, AccountError::SessionEnded))
+                return Err(self.refund(slot, AccountError::SessionEnded));
             }
             Err(error) => return Err(self.refund(slot, error)),
         };
         self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
-        Ok(SignedIn {
-            principal: person.clone(),
-            issued_at_unix: cutoff,
-        })
+        self.signed_in(person.clone(), cutoff, &account.email_digest, device)
     }
 
     /// Gives back a slot taken for an attempt that never got to verify a guess, and passes its
@@ -1145,7 +1287,7 @@ mod tests {
         let service = AccountService::new(
             pool,
             PrincipalStore::new(Arc::new(myelin_storage::KmsEngine::new())),
-            EmailDigester::new(zeroize::Zeroizing::new([0; 32])),
+            AccountKeys::fixed(0),
             "eu-west",
             None,
             Handle::current(),

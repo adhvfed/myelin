@@ -32,6 +32,8 @@ pub(crate) type SessionMint<'a> = &'a dyn Fn(&SignedIn) -> Result<(String, i64),
 struct LoginRequest {
     email: String,
     password: String,
+    #[serde(default)]
+    device_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -46,6 +48,8 @@ struct AcceptRequest {
 struct ChangePasswordRequest {
     current_password: String,
     new_password: String,
+    #[serde(default)]
+    device_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +142,7 @@ fn session(signed_in: &SignedIn, mint: SessionMint<'_>) -> EdgeResponse {
                 "token_type": "Bearer",
                 "scheme": myelin_identity_service::machine_scheme::SESSION,
                 "expires_at": expires_at,
+                "device_token": signed_in.device_token,
             }),
         )),
         Err(failure) => error(&failure),
@@ -161,7 +166,7 @@ pub(crate) fn login(
     let outcome = configured(accounts).and_then(|accounts| {
         let body: LoginRequest = parse(&request.body, "password login")?;
         accounts
-            .login(&body.email, body.password)
+            .login(&body.email, body.password, body.device_token.as_deref())
             .map_err(account_error)
     });
     match outcome {
@@ -181,7 +186,12 @@ pub(crate) fn change_password(
     let outcome = configured(accounts).and_then(|accounts| {
         let body: ChangePasswordRequest = parse(&request.body, "password change")?;
         accounts
-            .change_password(person, body.current_password, body.new_password)
+            .change_password(
+                person,
+                body.current_password,
+                body.new_password,
+                body.device_token.as_deref(),
+            )
             .map_err(account_error)
     });
     match outcome {
@@ -198,7 +208,7 @@ pub(crate) fn forgot(accounts: Option<&AccountService>, request: &EdgeRequest) -
         Ok(_) => {
             return error(&EdgeError::Unavailable(
                 "password reset by email is not configured".into(),
-            ))
+            ));
         }
         Err(response) => return response,
     };

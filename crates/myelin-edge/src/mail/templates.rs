@@ -23,6 +23,8 @@ pub(crate) enum Letter {
         /// Where to ask for a reset; absent when the web app's origin is not set.
         reset: Option<String>,
     },
+    /// Sign-in from browsers new to the account was refused for a while after failed attempts.
+    SignInLocked { to: String, reset: Option<String> },
 }
 
 pub(crate) struct Rendered {
@@ -36,7 +38,8 @@ impl Letter {
         match self {
             Self::Invitation { to, .. }
             | Self::PasswordReset { to, .. }
-            | Self::PasswordChanged { to, .. } => to,
+            | Self::PasswordChanged { to, .. }
+            | Self::SignInLocked { to, .. } => to,
         }
     }
 
@@ -100,6 +103,28 @@ impl Letter {
                     )),
                 }
                 compose("Your Myelin password was changed".into(), &lines)
+            }
+            Self::SignInLocked { reset, .. } => {
+                let opening = "Several sign-in attempts to your Myelin account failed. Devices \
+                               you've signed in from before are unaffected. If this wasn't you, no \
+                               action is needed;";
+                let mut lines = Vec::new();
+                match reset {
+                    Some(reset) => {
+                        lines.push(Line::Text(format!(
+                            "{opening} if you can't sign in, reset your password:"
+                        )));
+                        lines.push(Line::Link(reset));
+                    }
+                    None => lines.push(Line::Text(format!(
+                        "{opening} if you can't sign in, ask whoever runs your Myelin deployment \
+                         to reset your password."
+                    ))),
+                }
+                compose(
+                    "Failed sign-in attempts on your Myelin account".into(),
+                    &lines,
+                )
             }
         }
     }
@@ -216,6 +241,10 @@ mod tests {
                 to: "ada@example.com".into(),
                 reset: None,
             },
+            Letter::SignInLocked {
+                to: "ada@example.com".into(),
+                reset: Some(LINK.into()),
+            },
         ] {
             let queued = serde_json::to_vec(&letter).unwrap();
             assert_eq!(serde_json::from_slice::<Letter>(&queued).unwrap(), letter);
@@ -236,5 +265,20 @@ mod tests {
         assert!(rendered.text.contains(
             "If this wasn't you, reset your password:\n\nhttps://myelin.example/login?help=password"
         ));
+    }
+
+    #[test]
+    fn the_lock_notice_says_known_devices_still_work_and_where_to_reset() {
+        let rendered = Letter::SignInLocked {
+            to: "ada@example.com".into(),
+            reset: Some("https://myelin.example/login?help=password".into()),
+        }
+        .render();
+        assert_eq!(
+            rendered.text,
+            "Several sign-in attempts to your Myelin account failed. Devices you've signed in \
+             from before are unaffected. If this wasn't you, no action is needed; if you can't \
+             sign in, reset your password:\n\nhttps://myelin.example/login?help=password\n"
+        );
     }
 }

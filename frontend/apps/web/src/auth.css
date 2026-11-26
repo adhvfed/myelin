@@ -311,6 +311,12 @@
   color: var(--text-muted);
 }
 
+.auth-alert a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .auth-foot {
   margin: var(--space-5) 0 0;
   padding-block-start: var(--space-4);

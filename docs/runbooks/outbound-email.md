@@ -1,7 +1,8 @@
 # Send email from the edge
 
-The edge emails three things: a member's invitation to a teammate, a password reset link someone
-asked for on the sign-in page, and a notice after a password is changed. Without mail, members
+The edge emails four things: a member's invitation to a teammate, a password reset link someone
+asked for on the sign-in page, a notice after a password is changed, and a notice when failed
+sign-ins lock strangers out of an account (see below). Without mail, members
 get an invitation link to pass on themselves, and the sign-in page tells people to ask whoever
 runs the deployment for a reset link. The operator's `edge invite` and `edge reset-link` always
 print the link and never send mail.
@@ -24,6 +25,22 @@ between tries. A letter still failing a day after it was queued is dropped. Ever
 logged as `edge.mail.deferred` or `edge.mail.undeliverable` with the message id, the SMTP reply
 code, and nothing about the content. Delivery is at least once: a crash between sending and
 recording the send means the message goes out again, with the same Message-ID.
+
+## Sign-in limits
+
+Each email gets 10 password attempts per 15 minutes from browsers that have never signed in to it.
+A browser that has signed in before holds a device token in a long-lived cookie and gets its own
+10 per 15 minutes, which nobody else can use up. So someone guessing at an email locks out only
+other new browsers, never the person's own devices. A device that keeps failing is
+refused on that device only. A successful sign-in clears the allowance it was charged to, and a
+password reset clears the new-browser one.
+
+The first time the new-browser allowance fills in a window, the account's owner gets one email
+saying so, with a link to reset their password. Emails without an account get none, and the
+sign-in page answers the same either way. A reset is never blocked by the lock.
+
+Device tokens carry no authority and outlive password changes and signing out everywhere: they
+only decide which allowance an attempt is charged to.
 
 ## Settings
 

@@ -6,12 +6,14 @@ import { edgeOrigin } from "./edge-origin";
 import { readLimitedText } from "./bounded-response";
 import { edgePost, GatewayError, gatewayRequestSignal, isUnauthorized } from "./gateway";
 import { validSessionToken } from "./session-store";
+import { validDeviceToken } from "./device-cookie";
 
-/** A freshly minted human session capability. */
+/** A freshly minted human session capability, and the device token that came with it. */
 export interface EdgeSessionGrant {
   accessToken: string;
   scheme: "session";
   expiresAt: number;
+  deviceToken?: string;
 }
 
 export type AccountFailure =
@@ -62,7 +64,7 @@ async function publicRequest(
   method: "GET" | "POST",
   path: string,
   body?: unknown,
-): Promise<{ status: number; json: unknown }> {
+): Promise<{ status: number; json: unknown; retryAfterSecs?: number }> {
   let response: Response;
   let text: string;
   try {
@@ -86,7 +88,12 @@ async function publicRequest(
   } catch {
     json = null;
   }
-  return { status: response.status, json };
+  return { status: response.status, json, retryAfterSecs: retryAfter(response.headers) };
+}
+
+function retryAfter(headers: Headers): number | undefined {
+  const value = Number(headers.get("retry-after"));
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -108,15 +115,29 @@ function sessionGrant(json: unknown): EdgeSessionGrant {
   ) {
     throw new AccountError("unavailable");
   }
-  return { accessToken: grant.access_token, scheme: "session", expiresAt: grant.expires_at };
+  return {
+    accessToken: grant.access_token,
+    scheme: "session",
+    expiresAt: grant.expires_at,
+    ...(validDeviceToken(grant.device_token) ? { deviceToken: grant.device_token } : {}),
+  };
 }
 
-/** Exchange an email and password for a human session. */
-export async function edgePasswordLogin(email: string, password: string): Promise<EdgeSessionGrant> {
-  const { status, json } = await publicRequest("POST", "/v1/auth/password/login", { email, password });
+/** Exchange an email and password for a human session. `deviceToken` is the one this browser
+ * holds for the email, if any; it keeps strangers' failed guesses from locking this browser out. */
+export async function edgePasswordLogin(
+  email: string,
+  password: string,
+  deviceToken?: string,
+): Promise<EdgeSessionGrant> {
+  const { status, json, retryAfterSecs } = await publicRequest("POST", "/v1/auth/password/login", {
+    email,
+    password,
+    ...(deviceToken ? { device_token: deviceToken } : {}),
+  });
   if (status === 200) return sessionGrant(json);
   if (status === 401 || status === 400) throw new AccountError("credentials");
-  if (status === 429) throw new AccountError("rate_limited");
+  if (status === 429) throw new AccountError("rate_limited", retryAfterSecs);
   throw new AccountError("unavailable");
 }
 
@@ -219,12 +240,14 @@ export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedIn
 export async function edgeChangePassword(
   currentPassword: string,
   newPassword: string,
+  deviceToken?: string,
 ): Promise<EdgeSessionGrant> {
   let json: unknown;
   try {
     json = await edgePost<unknown>("/v1/auth/password/change", {
       current_password: currentPassword,
       new_password: newPassword,
+      ...(deviceToken ? { device_token: deviceToken } : {}),
     });
   } catch (error) {
     if (isUnauthorized(error)) throw new AccountError("signed_out");

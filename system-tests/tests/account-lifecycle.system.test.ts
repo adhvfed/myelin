@@ -32,11 +32,11 @@ function expectSession(response: SystemResponse<JsonRecord>): string {
   return string(response.body.access_token, "session token");
 }
 
-async function signIn(email: string, password: string, expectedStatus = 200) {
+async function signIn(email: string, password: string, expectedStatus = 200, deviceToken?: string) {
   return systemClient.json("/v1/auth/password/login", {
     method: "POST",
     ...anonymous,
-    body: { email, password },
+    body: { email, password, ...(deviceToken ? { device_token: deviceToken } : {}) },
     expectedStatus,
   });
 }
@@ -366,6 +366,50 @@ describe("a person's account", () => {
       body: {},
       expectedStatus: 403,
     });
+  });
+
+  test("strangers' failed guesses lock out only browsers that never signed in, and the owner is told", async () => {
+    const email = uniqueEmail("hamilton");
+    const code = codeOf(await operatorLink("invite", email));
+    await systemClient.json(`/v1/auth/invitations/${code}/accept`, {
+      method: "POST",
+      ...anonymous,
+      body: { display_name: "Margaret Hamilton", password: "lunar module guidance" },
+    });
+    const signedIn = await signIn(email, "lunar module guidance");
+    expectSession(signedIn);
+    const device = string(signedIn.body.device_token, "device token");
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      await signIn(email, "a stranger's guess", 401);
+    }
+    const locked = await signIn(email, "lunar module guidance", 429);
+    expect(Number(locked.headers.get("retry-after"))).toBeGreaterThan(0);
+    const forged = device.slice(0, -1) + (device.endsWith("A") ? "B" : "A");
+    await signIn(email, "lunar module guidance", 429, forged);
+
+    const trusted = await signIn(email, "lunar module guidance", 200, device);
+    expect(await whoami(expectSession(trusted))).toMatchObject({ email });
+    expect(string(trusted.body.device_token, "reissued device token")).not.toBe("");
+    await signIn(email, "lunar module guidance", 429);
+
+    const [notice] = await mailTo(email);
+    expect(notice!.subject).toBe("Failed sign-in attempts on your Myelin account");
+    expect(notice!.text).toContain(
+      "Several sign-in attempts to your Myelin account failed. Devices you've signed in from before are " +
+        "unaffected. If this wasn't you, no action is needed; if you can't sign in, reset your password:",
+    );
+    expect(notice!.text).toMatch(/reset your password:\s+https?:\/\/\S+\/login\?help=password/);
+
+    // A stranger's lock on an email with no account looks the same, and mails nobody.
+    const nobody = uniqueEmail("nobody");
+    for (let attempt = 0; attempt < 10; attempt += 1) await signIn(nobody, "a stranger's guess", 401);
+    const lockedNobody = await signIn(nobody, "lunar module guidance", 429);
+    expect(record(lockedNobody.body.error, "lock error").code).toBe(record(locked.body.error, "lock error").code);
+    expect(Object.keys(lockedNobody.body)).toEqual(Object.keys(locked.body));
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+    expect(await mailSoFar(nobody)).toEqual([]);
+    expect(await mailSoFar(email)).toHaveLength(1);
   });
 
   test("links are never echoed back and oversized sign-in bodies are refused", async () => {

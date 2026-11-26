@@ -8,8 +8,8 @@ use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::accounts::{Acceptance, Checkpoint};
 use myelin_edge::catalogue::Method;
 use myelin_edge::{
-    account_migrations, device_authorization_migrations, AccountError, AccountService, AllowAll,
-    DeviceAuthorizationBroker, EdgeRequest, EmailDigester, Gateway, WhoamiHandler,
+    account_migrations, device_authorization_migrations, AccountError, AccountKeys, AccountService,
+    AllowAll, DeviceAuthorizationBroker, EdgeRequest, Gateway, WhoamiHandler,
 };
 use myelin_identity::{Credential, RevokeTarget};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -138,7 +138,7 @@ fn account_service(
     AccountService::new(
         provider.db_pool().clone(),
         principals.clone(),
-        EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
+        AccountKeys::derive(seal),
         provider.config().region.clone(),
         Some("https://myelin.example".into()),
         tokio::runtime::Handle::current(),
@@ -214,7 +214,7 @@ impl Stack {
         );
         let principal = self
             .accounts
-            .login(email, PASSWORD.into())
+            .login(email, PASSWORD.into(), None)
             .unwrap()
             .principal;
         (principal, token)
@@ -646,7 +646,7 @@ async fn a_sign_in_racing_a_reset_waits_for_it_and_then_fails() {
     // The reset has replaced the password and ended the sessions but not committed.
     let signing_in = {
         let (accounts, email) = (stack.accounts.clone(), email.clone());
-        tokio::task::spawn_blocking(move || accounts.login(&email, PASSWORD.into()))
+        tokio::task::spawn_blocking(move || accounts.login(&email, PASSWORD.into(), None))
     };
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert!(

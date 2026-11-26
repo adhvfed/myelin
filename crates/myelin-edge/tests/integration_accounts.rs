@@ -5,7 +5,7 @@
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::accounts::{Acceptance, Checkpoint, MemberInvitation};
-use myelin_edge::{account_migrations, AccountError, AccountService, EmailDigester};
+use myelin_edge::{account_migrations, AccountError, AccountKeys, AccountService};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::PrincipalStore;
 use myelin_storage::{
@@ -48,7 +48,7 @@ struct Cell {
     provider: SubstrateProvider,
     accounts: AccountService,
     principals: PrincipalStore,
-    digest_key: EmailDigester,
+    keys: AccountKeys,
     clock: Arc<AtomicI64>,
 }
 
@@ -70,7 +70,7 @@ impl Cell {
         AccountService::new(
             self.provider.db_pool().clone(),
             self.principals.clone(),
-            self.digest_key.clone(),
+            self.keys.clone(),
             self.provider.config().region.clone(),
             web_origin.map(str::to_string),
             tokio::runtime::Handle::current(),
@@ -127,6 +127,14 @@ impl Cell {
         .unwrap();
     }
 
+    /// Signs in with the right password and returns the device token it hands back.
+    fn device_token(&self, email: &str) -> String {
+        self.accounts
+            .login(email, PASSWORD.into(), None)
+            .expect("the right password signs in")
+            .device_token
+    }
+
     async fn join_person(
         &self,
         tenant: &str,
@@ -177,12 +185,12 @@ async fn cell() -> Cell {
         accounts: AccountService::new(
             provider.db_pool().clone(),
             principals.clone(),
-            EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
+            AccountKeys::derive(&seal),
             provider.config().region.clone(),
             None,
             tokio::runtime::Handle::current(),
         ),
-        digest_key: EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
+        keys: AccountKeys::derive(&seal),
         provider,
         principals,
         clock: Arc::new(AtomicI64::new(real_now())),
@@ -273,7 +281,11 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
 
     let signed_in = cell
         .accounts
-        .login(&format!("  {}  ", email.to_uppercase()), PASSWORD.into())
+        .login(
+            &format!("  {}  ", email.to_uppercase()),
+            PASSWORD.into(),
+            None,
+        )
         .expect("sign-in normalizes the email")
         .principal;
     assert_eq!(signed_in.principal_id, joined.principal_id);
@@ -282,7 +294,7 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
         ("nobody@example.com", PASSWORD),
     ] {
         assert_eq!(
-            cell.accounts.login(who, password.into()).unwrap_err(),
+            cell.accounts.login(who, password.into(), None).unwrap_err(),
             AccountError::LoginFailed
         );
     }
@@ -329,11 +341,13 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
         .principal;
     assert_eq!(after_reset.principal_id, joined.principal_id);
     assert_eq!(
-        cell.accounts.login(&email, PASSWORD.into()).unwrap_err(),
+        cell.accounts
+            .login(&email, PASSWORD.into(), None)
+            .unwrap_err(),
         AccountError::LoginFailed
     );
     cell.accounts
-        .login(&email, "a brand new passphrase".into())
+        .login(&email, "a brand new passphrase".into(), None)
         .expect("the new password works");
 }
 
@@ -517,7 +531,9 @@ async fn sign_in_is_throttled_per_email_and_refused_to_inactive_or_removed_peopl
         )
         .unwrap();
     assert_eq!(
-        cell.accounts.login(&email, PASSWORD.into()).unwrap_err(),
+        cell.accounts
+            .login(&email, PASSWORD.into(), None)
+            .unwrap_err(),
         AccountError::LoginFailed,
         "a suspended person cannot sign in, even with the right password"
     );
@@ -545,15 +561,17 @@ async fn sign_in_is_throttled_per_email_and_refused_to_inactive_or_removed_peopl
 
     // One attempt so far; nine more fill the window of ten.
     for _ in 0..9 {
-        let _ = cell.accounts.login(&email, "wrong password!".into());
+        let _ = cell.accounts.login(&email, "wrong password!".into(), None);
     }
     assert!(matches!(
-        cell.accounts.login(&email, PASSWORD.into()),
+        cell.accounts.login(&email, PASSWORD.into(), None),
         Err(AccountError::RateLimited { retry_after_secs }) if retry_after_secs <= 15 * 60
     ));
     let other = format!("{}@example.com", unique("unrelated"));
     assert_eq!(
-        cell.accounts.login(&other, PASSWORD.into()).unwrap_err(),
+        cell.accounts
+            .login(&other, PASSWORD.into(), None)
+            .unwrap_err(),
         AccountError::LoginFailed,
         "the limit belongs to one email, not to everyone"
     );
@@ -591,7 +609,9 @@ async fn sign_in_is_throttled_per_email_and_refused_to_inactive_or_removed_peopl
     );
     cell.clock.fetch_add(15 * 60, Ordering::Relaxed);
     assert_eq!(
-        cell.accounts.login(&email, PASSWORD.into()).unwrap_err(),
+        cell.accounts
+            .login(&email, PASSWORD.into(), None)
+            .unwrap_err(),
         AccountError::LoginFailed
     );
 }
@@ -712,7 +732,7 @@ async fn an_expired_link_is_refused_even_when_the_edge_clock_lags() {
     );
     cell.clock.store(real_now(), Ordering::Relaxed);
     cell.accounts
-        .login(&member, PASSWORD.into())
+        .login(&member, PASSWORD.into(), None)
         .expect("the expired reset changed nothing");
 }
 
@@ -766,8 +786,8 @@ async fn failed_sign_ins_are_throttled_exactly_and_a_success_clears_them() {
     let tenant = unique("t-throttle");
     let email = format!("{}@example.com", unique("hamilton"));
     cell.join_person(&tenant, &email, "Margaret").await;
-    let wrong = || cell.accounts.login(&email, "wrong password!".into());
-    let right = || cell.accounts.login(&email, PASSWORD.into());
+    let wrong = || cell.accounts.login(&email, "wrong password!".into(), None);
+    let right = || cell.accounts.login(&email, PASSWORD.into(), None);
 
     for _ in 0..9 {
         assert_eq!(wrong().unwrap_err(), AccountError::LoginFailed);
@@ -807,7 +827,7 @@ async fn failed_sign_ins_are_throttled_exactly_and_a_success_clears_them() {
     for _ in 0..12 {
         assert_eq!(
             cell.accounts
-                .login("not an email", PASSWORD.into())
+                .login("not an email", PASSWORD.into(), None)
                 .unwrap_err(),
             AccountError::LoginFailed,
             "a malformed email is neither counted nor limited"
@@ -923,12 +943,12 @@ async fn a_sign_in_racing_a_password_reset_does_not_use_the_old_password() {
         });
 
     assert_eq!(
-        hooked.login(&email, PASSWORD.into()).unwrap_err(),
+        hooked.login(&email, PASSWORD.into(), None).unwrap_err(),
         AccountError::LoginFailed,
         "the old password no longer signs in once the reset has landed"
     );
     cell.accounts
-        .login(&email, "a brand new passphrase".into())
+        .login(&email, "a brand new passphrase".into(), None)
         .expect("the new password works");
 }
 
@@ -970,11 +990,11 @@ async fn a_disabled_persons_reset_link_does_not_change_their_password() {
     );
     set_status(PrincipalStatus::Active);
     cell.accounts
-        .login(&email, PASSWORD.into())
+        .login(&email, PASSWORD.into(), None)
         .expect("the old password still works: the refused reset changed nothing");
     assert_eq!(
         cell.accounts
-            .login(&email, "a brand new passphrase".into())
+            .login(&email, "a brand new passphrase".into(), None)
             .unwrap_err(),
         AccountError::LoginFailed
     );
@@ -985,6 +1005,7 @@ async fn burst_of_logins(
     accounts: &AccountService,
     email: &str,
     password: &str,
+    device_token: Option<&str>,
     attempts: usize,
 ) -> Vec<Result<myelin_edge::SignedIn, AccountError>> {
     let start = Arc::new(Barrier::new(attempts));
@@ -992,9 +1013,10 @@ async fn burst_of_logins(
         .map(|_| {
             let (accounts, start) = (accounts.clone(), start.clone());
             let (email, password) = (email.to_string(), password.to_string());
+            let device_token = device_token.map(str::to_string);
             tokio::task::spawn_blocking(move || {
                 start.wait();
-                accounts.login(&email, password)
+                accounts.login(&email, password, device_token.as_deref())
             })
         })
         .collect();
@@ -1005,16 +1027,15 @@ async fn burst_of_logins(
     answers
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_burst_of_wrong_passwords_at_one_email_is_verified_no_more_than_the_limit_allows() {
+/// Fires a burst of wrong passwords at one allowance and checks that no more than its limit were
+/// verified and the rest were refused unverified.
+async fn assert_burst_verifies_at_most_the_limit(
+    cell: &Cell,
+    email: &str,
+    device_token: Option<&str>,
+) {
     const LIMIT: usize = 10;
     const BURST: usize = 40;
-    let _turn = ONE_AT_A_TIME.lock().await;
-    let cell = cell().await;
-    let tenant = unique("t-burst");
-    let email = format!("{}@example.com", unique("curie"));
-    cell.join_person(&tenant, &email, "Marie").await;
-
     let verified = Arc::new(AtomicUsize::new(0));
     let counting = cell
         .service(Some("https://myelin.example"))
@@ -1026,7 +1047,7 @@ async fn a_burst_of_wrong_passwords_at_one_email_is_verified_no_more_than_the_li
                 }
             }
         });
-    let answers = burst_of_logins(&counting, &email, "wrong password!", BURST).await;
+    let answers = burst_of_logins(&counting, email, "wrong password!", device_token, BURST).await;
 
     let count = |wanted: fn(&AccountError) -> bool| {
         answers
@@ -1044,7 +1065,7 @@ async fn a_burst_of_wrong_passwords_at_one_email_is_verified_no_more_than_the_li
     );
     assert!(
         verified.load(Ordering::SeqCst) <= LIMIT,
-        "{} passwords were verified for one email in one window; the limit is {LIMIT}",
+        "{} passwords were verified for one allowance in one window; the limit is {LIMIT}",
         verified.load(Ordering::SeqCst)
     );
     assert!(
@@ -1055,14 +1076,27 @@ async fn a_burst_of_wrong_passwords_at_one_email_is_verified_no_more_than_the_li
         answer,
         Err(AccountError::RateLimited { retry_after_secs }) if *retry_after_secs > 15 * 60
     )));
-
     assert!(matches!(
-        cell.accounts.login(&email, PASSWORD.into()),
+        cell.accounts.login(email, PASSWORD.into(), device_token),
         Err(AccountError::RateLimited { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_wrong_passwords_at_one_email_is_verified_no_more_than_the_limit_allows() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-burst");
+    let email = format!("{}@example.com", unique("curie"));
+    cell.join_person(&tenant, &email, "Marie").await;
+    let device = cell.device_token(&email);
+
+    assert_burst_verifies_at_most_the_limit(&cell, &email, None).await;
+    assert_burst_verifies_at_most_the_limit(&cell, &email, Some(&device)).await;
+
     cell.clock.fetch_add(15 * 60, Ordering::Relaxed);
     cell.accounts
-        .login(&email, PASSWORD.into())
+        .login(&email, PASSWORD.into(), None)
         .expect("the right password works once the window has ended");
 }
 
@@ -1078,7 +1112,7 @@ async fn a_sign_in_turned_away_because_hashing_is_busy_keeps_its_slot() {
     let saturated = cell
         .service(Some("https://myelin.example"))
         .with_hash_capacity(0);
-    let answers = burst_of_logins(&saturated, &email, "wrong password!", 10).await;
+    let answers = burst_of_logins(&saturated, &email, "wrong password!", None, 10).await;
     assert!(
         answers
             .iter()
@@ -1090,14 +1124,14 @@ async fn a_sign_in_turned_away_because_hashing_is_busy_keeps_its_slot() {
     for attempt in 1..=10 {
         assert_eq!(
             cell.accounts
-                .login(&email, "wrong password!".into())
+                .login(&email, "wrong password!".into(), None)
                 .unwrap_err(),
             AccountError::LoginFailed,
             "attempt {attempt}: the busy refusals used none of the ten slots"
         );
     }
     assert!(matches!(
-        cell.accounts.login(&email, "wrong password!".into()),
+        cell.accounts.login(&email, "wrong password!".into(), None),
         Err(AccountError::RateLimited { .. })
     ));
 }
@@ -1117,13 +1151,13 @@ async fn a_slot_given_back_after_its_window_ended_leaves_the_next_window_alone()
         .with_hash_capacity(0);
     let stale = tokio::task::spawn_blocking({
         let email = email.clone();
-        move || saturated.login(&email, "wrong password!".into())
+        move || saturated.login(&email, "wrong password!".into(), None)
     });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     cell.clock.fetch_add(15 * 60, Ordering::Relaxed);
     assert_eq!(
         cell.accounts
-            .login(&email, "wrong password!".into())
+            .login(&email, "wrong password!".into(), None)
             .unwrap_err(),
         AccountError::LoginFailed
     );
@@ -1132,7 +1166,7 @@ async fn a_slot_given_back_after_its_window_ended_leaves_the_next_window_alone()
     for attempt in 2..=10 {
         assert_eq!(
             cell.accounts
-                .login(&email, "wrong password!".into())
+                .login(&email, "wrong password!".into(), None)
                 .unwrap_err(),
             AccountError::LoginFailed,
             "attempt {attempt}"
@@ -1140,7 +1174,7 @@ async fn a_slot_given_back_after_its_window_ended_leaves_the_next_window_alone()
     }
     assert!(
         matches!(
-            cell.accounts.login(&email, "wrong password!".into()),
+            cell.accounts.login(&email, "wrong password!".into(), None),
             Err(AccountError::RateLimited { .. })
         ),
         "the late give-back did not take back the new window's first hit"
@@ -1385,6 +1419,7 @@ async fn a_burst_of_wrong_current_passwords_is_verified_no_more_than_the_limit_a
                     &person,
                     "wrong password!".into(),
                     "a perfectly good new passphrase".into(),
+                    None,
                 )
             })
         })
@@ -1413,7 +1448,7 @@ async fn a_burst_of_wrong_current_passwords_is_verified_no_more_than_the_limit_a
         "attempts past the limit are refused before verifying (limited {limited})"
     );
     assert!(matches!(
-        cell.accounts.login(&email, PASSWORD.into()),
+        cell.accounts.login(&email, PASSWORD.into(), None),
         Err(AccountError::RateLimited { .. })
     ));
 }
@@ -1474,7 +1509,12 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
     let losing = {
         let person = person.clone();
         tokio::task::spawn_blocking(move || {
-            paused.change_password(&person, PASSWORD.into(), "the losing passphrase".into())
+            paused.change_password(
+                &person,
+                PASSWORD.into(),
+                "the losing passphrase".into(),
+                None,
+            )
         })
     };
     tokio::task::spawn_blocking({
@@ -1484,7 +1524,12 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
     .await
     .unwrap();
     cell.accounts
-        .change_password(&person, PASSWORD.into(), "the winning passphrase".into())
+        .change_password(
+            &person,
+            PASSWORD.into(),
+            "the winning passphrase".into(),
+            None,
+        )
         .expect("the other change wins");
     gate.release();
     assert_eq!(
@@ -1492,7 +1537,7 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
         AccountError::PasswordChangedElsewhere
     );
     cell.accounts
-        .login(&email, "the winning passphrase".into())
+        .login(&email, "the winning passphrase".into(), None)
         .expect("the winner's password stands");
 
     // Nine wrong guesses, then one change refused because the person was disabled meanwhile.
@@ -1502,7 +1547,8 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
                 .change_password(
                     &person,
                     "wrong password!".into(),
-                    "whatever passphrase".into()
+                    "whatever passphrase".into(),
+                    None
                 )
                 .unwrap_err(),
             AccountError::WrongPassword,
@@ -1518,6 +1564,7 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
                 &person,
                 "the winning passphrase".into(),
                 "a passphrase never stored".into(),
+                None,
             )
         })
     };
@@ -1553,7 +1600,8 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
             .change_password(
                 &person,
                 "wrong password!".into(),
-                "whatever passphrase".into()
+                "whatever passphrase".into(),
+                None
             )
             .unwrap_err(),
         AccountError::WrongPassword,
@@ -1563,7 +1611,8 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
         cell.accounts.change_password(
             &person,
             "wrong password!".into(),
-            "whatever passphrase".into()
+            "whatever passphrase".into(),
+            None
         ),
         Err(AccountError::RateLimited { .. })
     ));
@@ -1591,7 +1640,12 @@ async fn a_change_and_a_concurrent_status_write_take_turns_instead_of_deadlockin
     let change = {
         let person = person.clone();
         tokio::task::spawn_blocking(move || {
-            changing.change_password(&person, PASSWORD.into(), "an uncontended passphrase".into())
+            changing.change_password(
+                &person,
+                PASSWORD.into(),
+                "an uncontended passphrase".into(),
+                None,
+            )
         })
     };
     tokio::task::spawn_blocking({
@@ -1625,4 +1679,225 @@ async fn a_change_and_a_concurrent_status_write_take_turns_instead_of_deadlockin
         .unwrap()
         .expect("the change goes through, not into a deadlock");
     write.await.unwrap().expect("then the writer goes through");
+}
+
+/// Fills the allowance browsers without a device token share, as a stranger guessing at `email`.
+fn lock_out_strangers(cell: &Cell, email: &str) {
+    for _ in 0..10 {
+        assert_eq!(
+            cell.accounts
+                .login(email, "a stranger's guess".into(), None)
+                .unwrap_err(),
+            AccountError::LoginFailed
+        );
+    }
+    assert!(matches!(
+        cell.accounts.login(email, PASSWORD.into(), None),
+        Err(AccountError::RateLimited { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranger_using_up_the_shared_allowance_does_not_stop_a_known_device() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-device");
+    let email = format!("{}@example.com", unique("lovelace"));
+    cell.join_person(&tenant, &email, "Ada").await;
+    let laptop = cell.device_token(&email);
+    let phone = cell.device_token(&email);
+
+    lock_out_strangers(&cell, &email);
+    let again = cell
+        .accounts
+        .login(&email, PASSWORD.into(), Some(&laptop))
+        .expect("a device that signed in before is not held back by strangers");
+    assert!(
+        cell.accounts
+            .login(&email, PASSWORD.into(), Some(&again.device_token))
+            .is_ok(),
+        "the reissued token works too"
+    );
+    assert!(matches!(
+        cell.accounts.login(&email, PASSWORD.into(), None),
+        Err(AccountError::RateLimited { .. })
+    ));
+
+    // The laptop's own allowance: a success clears it, ten failures fill it.
+    for _ in 0..9 {
+        assert_eq!(
+            cell.accounts
+                .login(&email, "a typo!!!!!".into(), Some(&laptop))
+                .unwrap_err(),
+            AccountError::LoginFailed
+        );
+    }
+    cell.accounts
+        .login(&email, PASSWORD.into(), Some(&laptop))
+        .expect("nine failures are under the device's limit");
+    for _ in 0..10 {
+        assert_eq!(
+            cell.accounts
+                .login(&email, "a typo!!!!!".into(), Some(&laptop))
+                .unwrap_err(),
+            AccountError::LoginFailed
+        );
+    }
+    assert_eq!(
+        cell.accounts
+            .login(&email, PASSWORD.into(), Some(&laptop))
+            .unwrap_err(),
+        AccountError::RateLimited {
+            retry_after_secs: 15 * 60
+        },
+        "a device that keeps failing is refused"
+    );
+    cell.accounts
+        .login(&email, PASSWORD.into(), Some(&phone))
+        .expect("on that device only");
+
+    cell.clock.fetch_add(15 * 60, Ordering::Relaxed);
+    cell.accounts
+        .login(&email, PASSWORD.into(), None)
+        .expect("strangers' window has ended");
+    cell.accounts
+        .login(&email, PASSWORD.into(), Some(&laptop))
+        .expect("and so has the laptop's");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forged_expired_or_borrowed_device_token_counts_as_a_stranger() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-device-forged");
+    let email = format!("{}@example.com", unique("hopper"));
+    let other = format!("{}@example.com", unique("jennings"));
+    cell.join_person(&tenant, &email, "Grace").await;
+    cell.join_person(&tenant, &other, "Betty").await;
+    let genuine = cell.device_token(&email);
+    let borrowed = cell.device_token(&other);
+    let mut forged = genuine.clone().into_bytes();
+    forged[30] = if forged[30] == b'A' { b'B' } else { b'A' };
+    let forged = String::from_utf8(forged).unwrap();
+
+    // A token presented with room left in strangers' allowance is charged to it, and costs one
+    // verification like any other attempt.
+    let verified = Arc::new(AtomicUsize::new(0));
+    let counting = cell
+        .service(Some("https://myelin.example"))
+        .with_checkpoint({
+            let verified = verified.clone();
+            move |checkpoint| {
+                if checkpoint == Checkpoint::PasswordVerified {
+                    verified.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+    for token in [forged.as_str(), borrowed.as_str(), "junk", ""] {
+        assert_eq!(
+            counting
+                .login(&email, "a stranger's guess".into(), Some(token))
+                .unwrap_err(),
+            AccountError::LoginFailed,
+            "a bad token is not an error of its own"
+        );
+    }
+    assert_eq!(verified.load(Ordering::SeqCst), 4);
+    for _ in 0..6 {
+        let _ = cell
+            .accounts
+            .login(&email, "a stranger's guess".into(), None);
+    }
+    for token in [forged.as_str(), borrowed.as_str(), "junk"] {
+        assert!(
+            matches!(
+                counting.login(&email, PASSWORD.into(), Some(token)),
+                Err(AccountError::RateLimited { .. })
+            ),
+            "{token}"
+        );
+    }
+    assert_eq!(
+        verified.load(Ordering::SeqCst),
+        4,
+        "a refused attempt verifies nothing"
+    );
+    cell.accounts
+        .login(&email, PASSWORD.into(), Some(&genuine))
+        .expect("the genuine token still works");
+
+    // A year on, the token has expired; strangers' window has long ended, so fill it again.
+    cell.clock.fetch_add(365 * 24 * 60 * 60, Ordering::Relaxed);
+    lock_out_strangers(&cell, &email);
+    assert!(matches!(
+        cell.accounts.login(&email, PASSWORD.into(), Some(&genuine)),
+        Err(AccountError::RateLimited { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reset_lifts_strangers_lock_and_a_known_device_can_change_the_password_through_it() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-device-reset");
+    let email = format!("{}@example.com", unique("franklin"));
+    let person = cell.join_person(&tenant, &email, "Rosalind").await;
+    let laptop = cell.device_token(&email);
+
+    lock_out_strangers(&cell, &email);
+    assert!(matches!(
+        cell.accounts
+            .change_password(&person, PASSWORD.into(), "a new passphrase".into(), None,),
+        Err(AccountError::RateLimited { .. })
+    ));
+    assert_eq!(
+        cell.accounts
+            .change_password(
+                &person,
+                "not it at all".into(),
+                "a new passphrase".into(),
+                Some(&laptop)
+            )
+            .unwrap_err(),
+        AccountError::WrongPassword,
+        "a known device's change is charged to its own allowance"
+    );
+    let changed = cell
+        .accounts
+        .change_password(
+            &person,
+            PASSWORD.into(),
+            "a new passphrase".into(),
+            Some(&laptop),
+        )
+        .expect("strangers cannot block a known device's password change");
+    assert!(cell
+        .accounts
+        .login(
+            &email,
+            "a new passphrase".into(),
+            Some(&changed.device_token)
+        )
+        .is_ok());
+
+    let reset = code_of(
+        &cell
+            .accounts
+            .operator_reset_link(&tenant, &email, None)
+            .await
+            .unwrap()
+            .url,
+    );
+    cell.accounts
+        .accept(&reset, reset_to("the reset passphrase"))
+        .expect("a reset is not blocked by the lock");
+    cell.accounts
+        .login(&email, "the reset passphrase".into(), None)
+        .expect("accepting the reset lifted strangers' lock");
+    assert!(
+        cell.accounts
+            .login(&email, "the reset passphrase".into(), Some(&laptop))
+            .is_ok(),
+        "the reset kept the device's trust"
+    );
 }

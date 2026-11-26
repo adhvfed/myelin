@@ -294,6 +294,8 @@ fn settle(result: Result<(String, i64), Abort>) -> Result<AcceptOutcome, StoreEr
 pub(crate) struct Slot {
     pub bucket: [u8; 32],
     window_ends_at_unix: i64,
+    /// This hit was the window's last.
+    pub filled: bool,
 }
 
 /// What a password change did.
@@ -368,7 +370,7 @@ impl AccountStore {
         .await
         .map_err(StoreError::database)?;
         // A full window matches no row to update, so nothing is returned and nothing is written.
-        let taken: Option<i64> = sqlx::query_scalar(
+        let taken: Option<(i64, i64)> = sqlx::query_as(
             "INSERT INTO auth_rate_limit (bucket, window_ends_at_unix, hits) VALUES ($1, $2, 1) \
              ON CONFLICT (bucket) DO UPDATE SET \
                hits = CASE WHEN auth_rate_limit.window_ends_at_unix <= $3 THEN 1 \
@@ -377,7 +379,7 @@ impl AccountStore {
                                           THEN EXCLUDED.window_ends_at_unix \
                                           ELSE auth_rate_limit.window_ends_at_unix END \
              WHERE auth_rate_limit.window_ends_at_unix <= $3 OR auth_rate_limit.hits < $4 \
-             RETURNING window_ends_at_unix",
+             RETURNING window_ends_at_unix, hits",
         )
         .bind(bucket.as_slice())
         .bind(now_unix.saturating_add(window_secs))
@@ -386,10 +388,11 @@ impl AccountStore {
         .fetch_optional(&self.pool)
         .await
         .map_err(StoreError::database)?;
-        if let Some(window_ends_at_unix) = taken {
+        if let Some((window_ends_at_unix, hits)) = taken {
             return Ok(Reservation::Taken(Slot {
                 bucket,
                 window_ends_at_unix,
+                filled: hits >= i64::from(limit),
             }));
         }
         let window_ends_at_unix: Option<i64> = sqlx::query_scalar(
@@ -439,12 +442,23 @@ impl AccountStore {
     }
 
     pub(crate) async fn clear_hits(&self, bucket: [u8; 32]) -> Result<(), StoreError> {
-        sqlx::query("DELETE FROM auth_rate_limit WHERE bucket = $1")
-            .bind(bucket.as_slice())
-            .execute(&self.pool)
+        let mut conn = self.pool.acquire().await.map_err(StoreError::database)?;
+        clear_hits_in(&mut conn, bucket)
             .await
-            .map_err(StoreError::database)?;
-        Ok(())
+            .map_err(StoreError::database)
+    }
+
+    /// Queues a letter that carries no link.
+    pub(crate) async fn queue(
+        &self,
+        outbox: &MailOutbox,
+        letter: &Letter,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.pool.acquire().await.map_err(StoreError::database)?;
+        outbox
+            .enqueue(&mut conn, letter, None)
+            .await
+            .map_err(StoreError::database)
     }
 
     /// Decides whether the link may be issued and stores it, under the per-email lock that
@@ -473,7 +487,7 @@ impl AccountStore {
         let principal_id = match rule {
             IssueRule::OperatorJoin if account.is_some() => return Ok(IssueOutcome::AccountExists),
             IssueRule::MemberJoin if in_this_organization.is_some() => {
-                return Ok(IssueOutcome::AccountExists)
+                return Ok(IssueOutcome::AccountExists);
             }
             IssueRule::OperatorJoin | IssueRule::MemberJoin => None,
             IssueRule::OperatorReset | IssueRule::RequestedReset => match in_this_organization {
@@ -657,12 +671,14 @@ impl AccountStore {
 
     /// Consumes a reset invitation and replaces the password of the active account it names,
     /// ending the person's sessions and other reset links and withdrawing any mail still carrying
-    /// them. `notice`, the letter telling the owner, is queued only if the password changes.
+    /// them, and clears the `unlock` counter. `notice`, the letter telling the owner, is queued
+    /// only if the password changes.
     pub(crate) async fn accept_reset(
         &self,
         code: &CodeDigest,
         invitation: &Invitation,
         password_phc: String,
+        unlock: [u8; 32],
         notice: Option<(MailOutbox, Letter)>,
     ) -> Result<AcceptOutcome, StoreError> {
         let Some(principal_id) = invitation.principal_id.clone() else {
@@ -742,6 +758,7 @@ impl AccountStore {
                         if let Some(hook) = &checkpoint {
                             hook(super::Checkpoint::SessionsEnded);
                         }
+                        clear_hits_in(conn, unlock).await?;
                         if let Some((outbox, letter)) = notice {
                             outbox.enqueue(conn, &letter, None).await?;
                         }
@@ -1006,6 +1023,15 @@ async fn end_sessions(
     DurablePrincipalBacking::end_sessions_in_tx(conn, tenant, region, principal_id)
         .await?
         .ok_or(Abort::Gone)
+}
+
+async fn clear_hits_in(conn: &mut sqlx::PgConnection, bucket: [u8; 32]) -> Result<(), sqlx::Error> {
+    // @tenant-cross-scope: counters are opaque and keyed by digest.
+    sqlx::query("DELETE FROM auth_rate_limit WHERE bucket = $1")
+        .bind(bucket.as_slice())
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// Serializes everything that issues or ends links for one email in one organization.
