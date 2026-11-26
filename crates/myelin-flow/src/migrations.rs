@@ -205,6 +205,46 @@ CREATE OR REPLACE TRIGGER wf_timer_work_wake
 AFTER INSERT ON wf_timer
 FOR EACH ROW EXECUTE FUNCTION myelin_flow_work_wake()";
 
+/// Replaces [`WORK_WAKE_DDL`]'s function: the payload is built first and falls back to
+/// `[schema, "all"]` whenever the JSON (whose escaping can grow identifiers several-fold) would
+/// not fit in a notification, so the trigger never fails the write it observes.
+pub const WORK_WAKE_PAYLOAD_DDL: &str = "\
+CREATE OR REPLACE FUNCTION myelin_flow_work_wake()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+DECLARE
+  wake_partition smallint;
+  payload text;
+BEGIN
+  IF TG_TABLE_NAME = 'workflow_run' THEN
+    IF TG_OP = 'UPDATE' AND NEW.state IS NOT DISTINCT FROM OLD.state
+       AND NOT (NEW.lease_expires IS NULL AND OLD.lease_expires IS NOT NULL) THEN
+      RETURN NULL;
+    END IF;
+    wake_partition := NEW.partition;
+  ELSIF TG_TABLE_NAME = 'wf_timer' THEN
+    wake_partition := NEW.partition;
+  ELSE
+    SELECT run.partition INTO wake_partition FROM workflow_run AS run
+     WHERE run.tenant_id = NEW.tenant_id AND run.region = NEW.region
+       AND run.run_id = NEW.run_id;
+  END IF;
+  payload := json_build_array(TG_TABLE_SCHEMA, 'flow', NEW.region, NEW.tenant_id,
+                              wake_partition)::text;
+  IF octet_length(payload) >= 7000 THEN
+    payload := json_build_array(TG_TABLE_SCHEMA, 'all')::text;
+  END IF;
+  PERFORM pg_notify('myelin_work_wake', payload);
+  RETURN NULL;
+END
+$myelin$";
+
+/// Lets a partition find its earliest unfired timer without scanning other tenants' timers.
+pub const WF_TIMER_SCOPED_DUE_INDEX_DDL: &str = "\
+CREATE INDEX CONCURRENTLY IF NOT EXISTS wf_timer_scoped_due \
+ON wf_timer (tenant_id, region, partition, fire_at) WHERE NOT fired";
+
 const TABLE_DDLS: &[(&str, &str, &str, bool)] = &[
     (
         "flow_0001_workflow_run",
@@ -308,6 +348,18 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "workflow_run",
     ));
+    items.push(Migration::phased(
+        "flow_0014_work_wake_payload",
+        WORK_WAKE_PAYLOAD_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
+    items.push(Migration::phased(
+        "flow_0015_wf_timer_scoped_due_index",
+        WF_TIMER_SCOPED_DUE_INDEX_DDL,
+        MigrationPhase::Expand,
+        "wf_timer",
+    ));
     Migrations::of(items)
 }
 
@@ -325,9 +377,9 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            13,
-            "six-table data model plus six online control/drive/repair expansions (incl. the \
-             concurrent-index validation) and the commit-time work wake"
+            15,
+            "six-table data model, six online control/drive/repair expansions (incl. the \
+             concurrent-index validation), the commit-time work wake and its timer index"
         );
         let mut runner = MigrationRunner::new();
         runner
@@ -349,6 +401,8 @@ mod tests {
                 "flow_0011_workflow_run_waiting_repair_index",
                 "flow_0012_validate_workflow_run_waiting_repair_index",
                 "flow_0013_work_wake",
+                "flow_0014_work_wake_payload",
+                "flow_0015_wf_timer_scoped_due_index",
             ],
             "tables then online control expands, in order - 0 backward migration"
         );

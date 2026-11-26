@@ -950,22 +950,44 @@ impl DurableAgentTriggerBacking {
     }
 
     /// Milliseconds until the earliest current claim expires and its firing becomes claimable
-    /// again. Expiry is the one way a firing becomes claimable without a write that wakes the
-    /// worker.
-    pub async fn next_claim_expiry_ms(&self, tenant: &str) -> Result<Option<i64>, ProviderError> {
+    /// again by `request`'s runtime. Expiry is the one way a firing becomes claimable without a
+    /// write that wakes the worker, so this counts exactly the firings `claim_next_firing`
+    /// would take once expired: same runtime, active binding, active owner and agent.
+    pub async fn next_claim_expiry_ms(
+        &self,
+        tenant: &str,
+        request: &AgentTriggerClaimRequest,
+    ) -> Result<Option<i64>, ProviderError> {
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
+        let runtime_ref = request.runtime_ref.clone();
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
                     sqlx::query_scalar::<_, Option<i64>>(
-                        "SELECT (EXTRACT(EPOCH FROM (min(claim_until) - clock_timestamp())) \
+                        "SELECT (EXTRACT(EPOCH FROM (min(f.claim_until) - clock_timestamp())) \
                                  * 1000)::bigint \
-                           FROM agent_trigger_firing \
-                          WHERE tenant_id = $1 AND region = $2 AND state = 'claimed'",
+                           FROM agent_trigger_firing f \
+                           JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
+                            AND b.region = f.region AND b.binding_id = f.binding_id \
+                           JOIN identity_agent agent_row ON agent_row.tenant_id = b.tenant_id \
+                            AND agent_row.region = b.region \
+                            AND agent_row.agent_id = b.run_as_agent_id \
+                           JOIN principal owner ON owner.tenant_id = b.tenant_id \
+                            AND owner.region = b.region \
+                            AND owner.principal_id = b.owner_principal_id \
+                           JOIN principal agent ON agent.tenant_id = b.tenant_id \
+                            AND agent.region = b.region \
+                            AND agent.principal_id = 'agent:' || b.run_as_agent_id::text \
+                          WHERE f.tenant_id = $1 AND f.region = $2 AND f.state = 'claimed' \
+                            AND agent_row.runtime_ref = $3 AND b.state = 'active' \
+                            AND owner.kind = $4 AND owner.status = $5 AND agent.status = $5",
                     )
                     .bind(&tenant)
                     .bind(&region)
+                    .bind(&runtime_ref)
+                    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(query_error("read governed agent claim expiry"))

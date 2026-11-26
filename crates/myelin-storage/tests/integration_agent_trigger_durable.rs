@@ -1279,11 +1279,15 @@ async fn every_change_that_can_unblock_a_queued_firing_wakes_the_tenant_loops() 
     };
 
     let mut hub = WorkWakeHub::new(app.config().region.clone());
-    let wake = hub.tenant_triggers(&tenant);
-    let neighbour = hub.tenant_triggers("someone-else");
+    let wake = hub.trigger_claims(&tenant);
+    let neighbour = hub.trigger_claims("someone-else");
     let (shutdown, receiver) = tokio::sync::watch::channel(false);
-    let listener =
-        tokio::spawn(hub.run(app.db_pool().clone(), receiver, Duration::from_secs(3600)));
+    let listener = tokio::spawn(hub.run(
+        app.db_pool().clone(),
+        (*app.db_pool().connect_options()).clone(),
+        receiver,
+        Duration::from_secs(3600),
+    ));
     assert!(woken(&wake).await, "subscribing wakes every loop once");
     assert!(woken(&neighbour).await);
 

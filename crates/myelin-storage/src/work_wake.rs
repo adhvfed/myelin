@@ -5,23 +5,32 @@
 //! triggers now `pg_notify` on [`WORK_WAKE_CHANNEL`] whenever a write can make work claimable,
 //! and [`WorkWakeHub`] routes each notification to the loop that owns that work.
 //!
-//! A wake is only a hint to look again: claiming stays the job of the existing lease and
-//! `SKIP LOCKED` queries, so a lost, duplicated or spurious wake can delay work but never
-//! drive it twice. Loops still wake at their own deadlines (timers, lease expiry) and on a
-//! slow safety interval. While the listener is disconnected the hub wakes every loop on the
-//! old polling interval, so a broken listener degrades to the previous behaviour.
+//! Wakes make new work prompt; they are not a complete record of when work became claimable.
+//! A claim's `SKIP LOCKED` passes over a row locked by a transaction that then commits without
+//! a notifying change, a peer can claim silently after this loop read its deadlines and then
+//! die, and a half-open listener receives nothing. Every idle loop therefore also re-checks on
+//! a short jittered safety interval ([`jittered`]), which bounds all of these. A wake is still
+//! only a hint: the lease and claim queries decide who drives work, so a lost, duplicated or
+//! spurious wake can delay work but never drive it twice. While the listener is disconnected
+//! the hub wakes every loop on the old polling interval.
 
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgConnectOptions, PgListener, PgPoolOptions};
 use sqlx::PgPool;
 use tokio::sync::{watch, Notify};
 
 use crate::migration::{Migration, Migrations};
 
 pub const WORK_WAKE_CHANNEL: &str = "myelin_work_wake";
+
+/// How often the listener proves its connection is alive, and how long that may take.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(10);
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Wakes the agent-trigger loops of a tenant when a firing changes state, or when a binding or
 /// principal changes status (a queued firing waits for its binding, owner and agent to be
@@ -62,11 +71,54 @@ AFTER UPDATE OF status ON principal
 FOR EACH ROW EXECUTE FUNCTION myelin_agent_trigger_work_wake();
 "#;
 
+/// Builds the payload before notifying and falls back to `[schema, "all"]` whenever the JSON
+/// (whose escaping can grow identifiers several-fold) would not fit in a notification, so the
+/// trigger never fails the write it observes.
+pub const AGENT_TRIGGER_WORK_WAKE_PAYLOAD_MIGRATION: &str = r#"
+CREATE OR REPLACE FUNCTION myelin_agent_trigger_work_wake()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+DECLARE
+  payload text;
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    IF TG_TABLE_NAME = 'principal' THEN
+      IF NEW.status IS NOT DISTINCT FROM OLD.status THEN
+        RETURN NULL;
+      END IF;
+    ELSIF NEW.state IS NOT DISTINCT FROM OLD.state THEN
+      RETURN NULL;
+    END IF;
+  END IF;
+  payload := json_build_array(TG_TABLE_SCHEMA, 'triggers', NEW.region, NEW.tenant_id)::text;
+  IF octet_length(payload) >= 7000 THEN
+    payload := json_build_array(TG_TABLE_SCHEMA, 'all')::text;
+  END IF;
+  PERFORM pg_notify('myelin_work_wake', payload);
+  RETURN NULL;
+END
+$myelin$;
+"#;
+
 pub fn agent_trigger_work_wake_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0189_agent_trigger_work_wake",
-        AGENT_TRIGGER_WORK_WAKE_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain(
+            "0189_agent_trigger_work_wake",
+            AGENT_TRIGGER_WORK_WAKE_MIGRATION,
+        ),
+        Migration::plain(
+            "0190_agent_trigger_work_wake_payload",
+            AGENT_TRIGGER_WORK_WAKE_PAYLOAD_MIGRATION,
+        ),
+    ])
+}
+
+/// `interval` spread by ±20%, so loops started together do not re-check together.
+pub fn jittered(interval: Duration) -> Duration {
+    let random = RandomState::new().build_hasher().finish();
+    let factor = 0.8 + 0.4 * (random as f64 / u64::MAX as f64);
+    interval.mul_f64(factor)
 }
 
 /// One loop's wake-up. Wakes that arrive while the loop is busy are kept (at most one), so a
@@ -100,11 +152,14 @@ enum Wake {
     },
 }
 
+type Loops = HashMap<String, Vec<Arc<Notify>>>;
+
 /// Routes notifications for one region of one schema to the loops registered for them.
 pub struct WorkWakeHub {
     region: String,
     flow: HashMap<String, Vec<(i16, Arc<Notify>)>>,
-    triggers: HashMap<String, Vec<Arc<Notify>>>,
+    trigger_claims: Loops,
+    trigger_reconciliation: Loops,
 }
 
 impl WorkWakeHub {
@@ -112,7 +167,8 @@ impl WorkWakeHub {
         Self {
             region: region.into(),
             flow: HashMap::new(),
-            triggers: HashMap::new(),
+            trigger_claims: HashMap::new(),
+            trigger_reconciliation: HashMap::new(),
         }
     }
 
@@ -126,23 +182,25 @@ impl WorkWakeHub {
         WorkWake(notify)
     }
 
-    /// Woken when the tenant's trigger queue changes or any of its workflow runs changes
-    /// state (a terminal run is what trigger reconciliation waits for).
-    pub fn tenant_triggers(&mut self, tenant: &str) -> WorkWake {
-        let notify = Arc::new(Notify::new());
-        self.triggers
-            .entry(tenant.to_owned())
-            .or_default()
-            .push(notify.clone());
-        WorkWake(notify)
+    /// Woken when the tenant's trigger queue, a binding or a principal changes.
+    pub fn trigger_claims(&mut self, tenant: &str) -> WorkWake {
+        register(&mut self.trigger_claims, tenant)
     }
 
-    /// Listens until shutdown. Every (re)connection wakes all loops once, covering commits
-    /// made while no listener was subscribed; while disconnected, all loops are woken every
-    /// `degraded_poll`.
+    /// Woken by trigger-queue changes and by any workflow change in the tenant, since a
+    /// terminal run is what reconciliation waits for.
+    pub fn trigger_reconciliation(&mut self, tenant: &str) -> WorkWake {
+        register(&mut self.trigger_reconciliation, tenant)
+    }
+
+    /// Listens on a dedicated connection made from `listen` until shutdown. Every
+    /// (re)subscription wakes all loops once, covering commits made while no listener was
+    /// subscribed; while disconnected, all loops are woken every `degraded_poll`. The
+    /// connection is pinged regularly so a half-open one is replaced.
     pub async fn run(
         self,
         pool: PgPool,
+        listen: PgConnectOptions,
         mut shutdown: watch::Receiver<bool>,
         degraded_poll: Duration,
     ) -> Result<(), String> {
@@ -156,7 +214,26 @@ impl WorkWakeHub {
             if *shutdown.borrow() {
                 return Ok(());
             }
-            let mut listener = match subscribe(&pool).await {
+            // A subscribe attempt can block for the whole connect timeout; loops keep being
+            // woken on the degraded interval meanwhile.
+            let subscribed = {
+                let subscribing = subscribe(&listen);
+                tokio::pin!(subscribing);
+                let mut degraded = tokio::time::interval_at(
+                    tokio::time::Instant::now() + degraded_poll,
+                    degraded_poll,
+                );
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                        }
+                        _ = degraded.tick() => self.wake_all(),
+                        result = &mut subscribing => break result,
+                    }
+                }
+            };
+            let mut listener = match subscribed {
                 Ok(listener) => {
                     if reported_outage {
                         eprintln!("work wake listener reconnected");
@@ -182,10 +259,28 @@ impl WorkWakeHub {
                 }
             };
             self.wake_all();
+            let mut liveness = tokio::time::interval_at(
+                tokio::time::Instant::now() + LIVENESS_INTERVAL,
+                LIVENESS_INTERVAL,
+            );
             loop {
                 tokio::select! {
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+                    }
+                    _ = liveness.tick() => {
+                        let ping = sqlx::query("SELECT 1").execute(&mut listener);
+                        match tokio::time::timeout(LIVENESS_TIMEOUT, ping).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("work wake listener failed its liveness check: {error}");
+                                break;
+                            }
+                            Err(_) => {
+                                eprintln!("work wake listener did not answer its liveness check");
+                                break;
+                            }
+                        }
                     }
                     received = listener.try_recv() => match received {
                         Ok(Some(notification)) => self.route(&schema, notification.payload()),
@@ -213,29 +308,53 @@ impl WorkWakeHub {
                         notify.notify_one();
                     }
                 }
-                self.wake_triggers(&tenant);
+                wake(&self.trigger_reconciliation, &tenant);
             }
-            Some(Wake::Triggers { tenant }) => self.wake_triggers(&tenant),
+            Some(Wake::Triggers { tenant }) => {
+                wake(&self.trigger_claims, &tenant);
+                wake(&self.trigger_reconciliation, &tenant);
+            }
             None => {}
-        }
-    }
-
-    fn wake_triggers(&self, tenant: &str) {
-        for notify in self.triggers.get(tenant).into_iter().flatten() {
-            notify.notify_one();
         }
     }
 
     fn wake_all(&self) {
         let flow = self.flow.values().flatten().map(|(_, notify)| notify);
-        for notify in flow.chain(self.triggers.values().flatten()) {
+        let claims = self.trigger_claims.values().flatten();
+        let reconciliation = self.trigger_reconciliation.values().flatten();
+        for notify in flow.chain(claims).chain(reconciliation) {
             notify.notify_one();
         }
     }
 }
 
-async fn subscribe(pool: &PgPool) -> Result<PgListener, sqlx::Error> {
-    let mut listener = PgListener::connect_with(pool).await?;
+fn register(loops: &mut Loops, tenant: &str) -> WorkWake {
+    let notify = Arc::new(Notify::new());
+    loops
+        .entry(tenant.to_owned())
+        .or_default()
+        .push(notify.clone());
+    WorkWake(notify)
+}
+
+fn wake(loops: &Loops, tenant: &str) {
+    for notify in loops.get(tenant).into_iter().flatten() {
+        notify.notify_one();
+    }
+}
+
+/// Subscribes on its own one-connection pool, so listening never holds a slot of the pool
+/// the workers claim through.
+async fn subscribe(listen: &PgConnectOptions) -> Result<PgListener, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .acquire_timeout(LIVENESS_TIMEOUT)
+        .connect_with(listen.clone())
+        .await?;
+    let mut listener = PgListener::connect_with(&pool).await?;
+    listener.ignore_pool_close_event(true);
     listener.listen(WORK_WAKE_CHANNEL).await?;
     Ok(listener)
 }
@@ -316,16 +435,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routing_wakes_the_exact_partition_and_the_tenant_trigger_loops() {
+    async fn routing_wakes_only_the_loops_whose_work_changed() {
         let mut hub = WorkWakeHub::new("fr-par");
         let acme_3 = hub.flow_partition("acme", 3);
         let acme_4 = hub.flow_partition("acme", 4);
-        let acme_triggers = hub.tenant_triggers("acme");
+        let acme_claims = hub.trigger_claims("acme");
+        let acme_reconciliation = hub.trigger_reconciliation("acme");
         let other_3 = hub.flow_partition("other", 3);
 
         hub.route("public", r#"["public","flow","fr-par","acme",3]"#);
         assert!(woken(&acme_3).await);
-        assert!(woken(&acme_triggers).await);
+        assert!(woken(&acme_reconciliation).await);
+        assert!(
+            !woken(&acme_claims).await,
+            "workflow changes never unblock a claim"
+        );
         assert!(!woken(&acme_4).await);
         assert!(!woken(&other_3).await);
 
@@ -335,8 +459,22 @@ mod tests {
         assert!(!woken(&other_3).await);
 
         hub.route("public", r#"["public","triggers","fr-par","acme"]"#);
-        assert!(woken(&acme_triggers).await);
+        assert!(woken(&acme_claims).await);
+        assert!(woken(&acme_reconciliation).await);
         assert!(!woken(&acme_3).await);
+    }
+
+    #[test]
+    fn jitter_stays_within_a_fifth_of_the_interval() {
+        let interval = Duration::from_secs(5);
+        let samples: Vec<_> = (0..1000).map(|_| jittered(interval)).collect();
+        assert!(samples
+            .iter()
+            .all(|sample| (Duration::from_secs(4)..=Duration::from_secs(6)).contains(sample)));
+        assert!(
+            samples.iter().any(|sample| *sample != samples[0]),
+            "samples vary"
+        );
     }
 
     async fn woken(wake: &WorkWake) -> bool {

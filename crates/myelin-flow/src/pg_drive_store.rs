@@ -404,34 +404,54 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// When this partition next has work that no write will announce: the earliest lease that
-    /// can expire, and the earliest unfired timer.
+    /// When this partition next has work that no write will announce, counting only work its
+    /// claims can take: the earliest lease on a run of one of `definitions` that can expire,
+    /// and the earliest unfired timer whose run is not held by a live lease (that lease's
+    /// release notifies, and its expiry is counted when it is one of `definitions`).
     pub async fn partition_deadlines(
         &self,
         partition: i16,
+        definitions: &[(String, i32)],
     ) -> Result<PartitionDeadlines, DriveStoreError> {
         let tenant = self.tenant.0.clone();
         let region = self.region.0.clone();
         let scope_tenant = tenant.clone();
         let scope_region = region.clone();
+        let (wf_types, wf_versions): (Vec<String>, Vec<i32>) = definitions.iter().cloned().unzip();
         with_tenant_tx_error(&self.pool, &scope_tenant, &scope_region, move |conn| {
             Box::pin(async move {
                 let row = sqlx::query(
                     "SELECT \
-                       (SELECT (EXTRACT(EPOCH FROM (min(lease_expires) - clock_timestamp())) \
-                                * 1000)::bigint \
-                          FROM workflow_run \
-                         WHERE tenant_id = $1 AND region = $2 AND partition = $3 \
-                           AND state IN ('running', 'waiting') AND lease_expires IS NOT NULL) \
-                         AS lease_ms, \
-                       (SELECT ceil(EXTRACT(EPOCH FROM min(fire_at)))::bigint \
-                          FROM wf_timer \
-                         WHERE tenant_id = $1 AND region = $2 AND partition = $3 AND NOT fired) \
+                       (EXTRACT(EPOCH FROM (LEAST(\
+                          (SELECT min(run.lease_expires) FROM workflow_run AS run \
+                            WHERE run.tenant_id = $1 AND run.region = $2 \
+                              AND run.partition = $3 AND run.state = 'running' \
+                              AND run.lease_expires IS NOT NULL \
+                              AND (run.wf_type, run.wf_version) IN \
+                                  (SELECT * FROM unnest($4::text[], $5::integer[]))), \
+                          (SELECT min(run.lease_expires) FROM workflow_run AS run \
+                            WHERE run.tenant_id = $1 AND run.region = $2 \
+                              AND run.partition = $3 AND run.state = 'waiting' \
+                              AND run.lease_expires IS NOT NULL \
+                              AND (run.wf_type, run.wf_version) IN \
+                                  (SELECT * FROM unnest($4::text[], $5::integer[])))\
+                        ) - clock_timestamp())) * 1000)::bigint AS lease_ms, \
+                       (SELECT ceil(EXTRACT(EPOCH FROM min(timer.fire_at)))::bigint \
+                          FROM wf_timer AS timer \
+                         WHERE timer.tenant_id = $1 AND timer.region = $2 \
+                           AND timer.partition = $3 AND NOT timer.fired \
+                           AND (timer.run_id IS NULL OR NOT EXISTS (\
+                             SELECT 1 FROM workflow_run AS run \
+                             WHERE run.tenant_id = $1 AND run.region = $2 \
+                               AND run.run_id = timer.run_id AND run.lease_owner IS NOT NULL \
+                               AND run.lease_expires > clock_timestamp()))) \
                          AS timer_secs",
                 )
                 .bind(&tenant)
                 .bind(&region)
                 .bind(partition)
+                .bind(&wf_types)
+                .bind(&wf_versions)
                 .fetch_one(&mut *conn)
                 .await
                 .map_err(|e| db("read partition deadlines", e))?;

@@ -16,7 +16,7 @@ use myelin_config::Mode;
 use myelin_events::{Actor, UlidMinter};
 use myelin_flow::{IdlePacing, PgFlowWorker, PgWorkerScope, PARTITION_COUNT};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
-use myelin_storage::work_wake::{WorkWake, WorkWakeHub};
+use myelin_storage::work_wake::{jittered, WorkWake, WorkWakeHub};
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, AgentTriggerClaimRequest,
     DurableAgentTriggerBacking, DurablePlacementBacking, HotTables, PgBootstrap, SubstrateProvider,
@@ -30,10 +30,10 @@ const DETERMINISTIC_DEVELOPMENT_MODE: &str = "deterministic-development";
 /// The pause after a saturated workflow batch, and the polling interval while the wake
 /// listener is down.
 const BUSY_POLL: Duration = Duration::from_millis(250);
-/// The longest an idle loop sleeps without a wake or a deadline. Every write that makes work
-/// claimable notifies, and lease and timer expiry are deadlines, so this only bounds the cost
-/// of a missed path; it is long so that idle tenants cost next to nothing.
-const MAX_IDLE: Duration = Duration::from_secs(300);
+/// The longest an idle loop sleeps without a wake or a deadline, before ±20% jitter. Wakes
+/// make new work prompt but can be missed (see `myelin_storage::work_wake`); this bounds how
+/// long missed work waits, at a few queries per loop every few seconds.
+const MAX_IDLE: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() {
@@ -49,6 +49,13 @@ async fn main() {
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .unwrap_or_else(|error| refuse_start("durable migration aggregate", error));
+    bootstrap
+        .migrate(
+            &myelin_flow::migrations::migrations(),
+            &HotTables::declare(["workflow_run"]),
+        )
+        .await
+        .unwrap_or_else(|error| refuse_start("workflow prerequisite migrations", error));
     let provider = bootstrap
         .into_runtime()
         .await
@@ -167,8 +174,8 @@ async fn run_workers(
             .unwrap_or_else(|error| refuse_start("trigger workflow registration", error));
         let handoff_tenant = tenant.clone();
         let handoff_triggers = triggers.clone();
-        let handoff_wake = wakes.tenant_triggers(&tenant.0);
-        let reconcile_wake = wakes.tenant_triggers(&tenant.0);
+        let handoff_wake = wakes.trigger_claims(&tenant.0);
+        let reconcile_wake = wakes.trigger_reconciliation(&tenant.0);
         let mut handoff_shutdown = shutdown_rx.clone();
         let claim_request = AgentTriggerClaimRequest::new(
             myelin_identity_service::HOSTED_LUNA_RUNTIME,
@@ -192,8 +199,11 @@ async fn run_workers(
         });
     }
     let wake_pool = provider.db_pool().clone();
+    let listen = (*wake_pool.connect_options())
+        .clone()
+        .application_name("hosted-agent-worker work wake");
     let wake_shutdown = shutdown_rx.clone();
-    tasks.spawn(async move { wakes.run(wake_pool, wake_shutdown, BUSY_POLL).await });
+    tasks.spawn(async move { wakes.run(wake_pool, listen, wake_shutdown, BUSY_POLL).await });
 
     let early_failure = tokio::select! {
         () = shutdown_signal() => None,
@@ -261,7 +271,10 @@ async fn run_trigger_handoffs(
         };
         pause = backoff.next_delay();
         let Some(claim) = claim else {
-            pause = match triggers.next_claim_expiry_ms(&tenant.0).await {
+            pause = match triggers
+                .next_claim_expiry_ms(&tenant.0, &claim_request)
+                .await
+            {
                 Ok(expiry) => idle_pause(expiry),
                 Err(error) => {
                     eprintln!(
@@ -335,7 +348,7 @@ async fn reconcile_trigger_firings(
                 pause = if reconciled >= u64::from(BATCH) {
                     backoff.next_delay()
                 } else {
-                    MAX_IDLE
+                    jittered(MAX_IDLE)
                 };
             }
             Err(error) => {
@@ -372,10 +385,11 @@ async fn pause_until_work(
 
 /// The idle pause before the next claim expiry, bounded like a workflow partition's.
 fn idle_pause(expiry_ms: Option<i64>) -> Duration {
+    let safety = jittered(MAX_IDLE);
     expiry_ms
         .map(|ms| Duration::from_millis(ms.max(0) as u64))
-        .unwrap_or(MAX_IDLE)
-        .clamp(BUSY_POLL, MAX_IDLE)
+        .unwrap_or(safety)
+        .clamp(BUSY_POLL, safety)
 }
 
 fn model_factory() -> Result<Arc<dyn HostedModelFactory>, String> {

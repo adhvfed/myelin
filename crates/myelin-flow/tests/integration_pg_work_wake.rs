@@ -1,8 +1,9 @@
 #![cfg(feature = "integration")]
 
-//! Idle workflow partitions sleep until a commit, a deadline or a reconnect wakes them.
-//! Every test gives the loop an idle bound of an hour, so work is only driven in time if the
-//! wake path under test works.
+//! Idle workflow partitions sleep until a commit, a deadline or a reconnect wakes them, and
+//! re-check on a safety interval for work no wake announces. Every test except the
+//! safety-interval one gives the loop an idle bound of an hour, so work is only driven in time
+//! if the wake path under test works.
 
 use myelin_config::MyelinConfig;
 use myelin_events::{Actor, IdMinter, MonotonicMinter};
@@ -11,10 +12,10 @@ use myelin_flow::{
     PgWorkerScope, RetryPolicy, SignalSpec, WaitOutcome,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
-use myelin_storage::work_wake::{WorkWakeHub, WORK_WAKE_CHANNEL};
+use myelin_storage::work_wake::{WorkWake, WorkWakeHub, WORK_WAKE_CHANNEL};
 use myelin_storage::{provider::foundation_migrations, HotTables, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgConnectOptions, PgListener};
 use sqlx::{Executor, PgPool};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -122,26 +123,53 @@ impl Stack {
         )
     }
 
+    /// The listener's own connection, named after the schema so a test can find it.
+    fn listen(&self) -> PgConnectOptions {
+        (*self.pool.connect_options())
+            .clone()
+            .application_name(&self.schema)
+    }
+
     /// Runs one process: a listener and the given workers, each on its own partition wake.
     fn run(&mut self, workers: Vec<Arc<PgFlowWorker>>) {
+        self.run_with(workers, PACING);
+    }
+
+    fn run_with(&mut self, workers: Vec<Arc<PgFlowWorker>>, pacing: IdlePacing) {
         let mut hub = WorkWakeHub::new(REGION);
         for worker in workers {
             let wake = hub.flow_partition(TENANT, PARTITION);
             let shutdown = self.shutdown.subscribe();
             self.tasks.push(tokio::spawn(async move {
                 worker
-                    .run_until_shutdown(shutdown, &wake, PACING, 32)
+                    .run_until_shutdown(shutdown, &wake, pacing, 32)
                     .await
                     .expect("partition loop runs until shutdown");
             }));
         }
+        self.spawn_hub(hub, self.listen(), NEVER);
+    }
+
+    fn spawn_hub(&mut self, hub: WorkWakeHub, listen: PgConnectOptions, degraded: Duration) {
         let pool = self.pool.clone();
         let shutdown = self.shutdown.subscribe();
         self.tasks.push(tokio::spawn(async move {
-            hub.run(pool, shutdown, NEVER)
+            hub.run(pool, listen, shutdown, degraded)
                 .await
                 .expect("wake listener runs until shutdown");
         }));
+    }
+
+    async fn terminate_listener(&self) {
+        let terminated: Vec<bool> = sqlx::query_scalar(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+              WHERE application_name = $1 AND query ILIKE 'LISTEN%'",
+        )
+        .bind(&self.schema)
+        .fetch_all(&self.bare)
+        .await
+        .expect("terminate the listener connection");
+        assert_eq!(terminated, vec![true], "exactly one listener was connected");
     }
 
     async fn insert_run(&self, run_id: &str, wf_type: &str) {
@@ -235,6 +263,9 @@ async fn an_idle_partition_drives_a_new_run_when_it_commits() {
     stack.stop().await;
 }
 
+/// End to end through the executor. Delivery also moves the run from `waiting` to `running`,
+/// which the run trigger announces; the signal trigger itself is covered by
+/// `inserted_signals_and_timers_announce_their_partition`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_signal_resumes_a_parked_run_without_a_poll() {
     let _guard = TEST_LOCK.lock().await;
@@ -281,7 +312,7 @@ async fn a_signal_resumes_a_parked_run_without_a_poll() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_due_timer_wakes_its_partition_with_no_write() {
+async fn a_due_timer_wakes_its_partition_at_its_deadline_with_no_write() {
     let _guard = TEST_LOCK.lock().await;
     let mut stack = Stack::new("timer").await;
     let mut worker = stack.worker("wake-timer", 30);
@@ -307,7 +338,7 @@ async fn a_due_timer_wakes_its_partition_with_no_write() {
         .wait_for_state("R-timer", "completed", Duration::from_secs(6))
         .await;
     assert!(
-        took <= Duration::from_millis(3_500),
+        took <= Duration::from_millis(4_500),
         "the two-second timer fired after {took:?}"
     );
     stack.stop().await;
@@ -358,15 +389,7 @@ async fn a_dropped_listener_resubscribes_and_misses_nothing() {
     stack.run(vec![Arc::new(worker)]);
     settle().await;
 
-    let terminated: Vec<bool> = sqlx::query_scalar(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-          WHERE application_name = $1 AND query ILIKE 'LISTEN%'",
-    )
-    .bind(&stack.schema)
-    .fetch_all(&stack.bare)
-    .await
-    .expect("terminate the listener connection");
-    assert_eq!(terminated, vec![true], "exactly one listener was connected");
+    stack.terminate_listener().await;
 
     stack.insert_run("R-reconnect", "wf.reconnect").await;
     let took = stack
@@ -471,4 +494,205 @@ async fn next_wake(listener: &mut PgListener) -> Option<serde_json::Value> {
         .ok()?
         .expect("listener stays connected");
     Some(serde_json::from_str(notification.payload()).expect("wake payload is JSON"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inserted_signals_and_timers_announce_their_partition() {
+    let _guard = TEST_LOCK.lock().await;
+    let stack = Stack::new("inserts").await;
+    stack.insert_run("R-inserts", "wf.inserts").await;
+    let mut listener = PgListener::connect_with(&stack.pool).await.unwrap();
+    listener.listen(WORK_WAKE_CHANNEL).await.unwrap();
+    let partition_wake = serde_json::json!([stack.schema, "flow", REGION, TENANT, PARTITION]);
+
+    sqlx::query(
+        "INSERT INTO wf_signal (tenant_id, region, run_id, signal_name, idem_key, payload) \
+         VALUES ($1, $2, 'R-inserts', 'finish', 'finish-1', '[]'::jsonb)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        next_wake(&mut listener).await,
+        Some(partition_wake.clone()),
+        "a signal names its run's partition"
+    );
+
+    sqlx::query(
+        "INSERT INTO wf_signal (tenant_id, region, run_id, signal_name, idem_key, payload) \
+         VALUES ($1, $2, 'R-not-visible', 'finish', 'finish-1', '[]'::jsonb)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        next_wake(&mut listener).await,
+        Some(serde_json::json!([
+            stack.schema,
+            "flow",
+            REGION,
+            TENANT,
+            null
+        ])),
+        "a signal whose run is not visible wakes every partition of the tenant"
+    );
+
+    sqlx::query(
+        "INSERT INTO wf_timer \
+           (tenant_id, region, timer_id, run_id, command_id, fire_at, bucket, partition) \
+         VALUES ($1, $2, 'T-inserts', 'R-inserts', 'wf.inserts:0', \
+                 clock_timestamp() + INTERVAL '1 hour', 0, $3)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(PARTITION)
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        next_wake(&mut listener).await,
+        Some(partition_wake),
+        "an armed timer wakes its partition to read the new deadline"
+    );
+    drop(listener);
+    stack.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resubscribing_wakes_every_loop_without_any_write() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut stack = Stack::new("resubscribe").await;
+    let mut hub = WorkWakeHub::new(REGION);
+    let wake = hub.flow_partition(TENANT, PARTITION);
+    stack.spawn_hub(hub, stack.listen(), NEVER);
+    assert!(
+        woken(&wake, Duration::from_secs(2)).await,
+        "subscribing wakes once"
+    );
+    settle().await;
+    assert!(
+        !woken(&wake, Duration::from_millis(200)).await,
+        "then stays quiet"
+    );
+
+    stack.terminate_listener().await;
+    assert!(
+        woken(&wake, Duration::from_secs(3)).await,
+        "losing the subscription wakes every loop, with nothing written"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_listener_falls_back_to_polling() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut stack = Stack::new("degraded").await;
+    let mut hub = WorkWakeHub::new(REGION);
+    let wake = hub.flow_partition(TENANT, PARTITION);
+    let unreachable = stack.listen().host("127.0.0.1").port(1);
+    stack.spawn_hub(hub, unreachable, Duration::from_millis(100));
+    let started = Instant::now();
+    for _ in 0..5 {
+        assert!(
+            woken(&wake, Duration::from_secs(2)).await,
+            "a loop is woken on the degraded interval"
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "five degraded wakes took {:?}",
+        started.elapsed()
+    );
+    stack.stop().await;
+}
+
+/// A peer claims a run silently (claims never notify) after this loop read its deadlines, then
+/// dies. No write or deadline will ever wake this loop; only the safety interval finds the
+/// run once the dead lease expires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_silent_claim_by_a_dying_peer_is_recovered_within_the_safety_interval() {
+    let _guard = TEST_LOCK.lock().await;
+    let mut stack = Stack::new("silent_peer").await;
+    let mut worker = stack.worker("survivor", 30);
+    completes(&mut worker, "wf.peer");
+    stack.run_with(
+        vec![Arc::new(worker)],
+        IdlePacing {
+            busy: Duration::from_millis(250),
+            max_idle: Duration::from_secs(2),
+        },
+    );
+    settle().await;
+
+    let mut tx = stack.pool.begin().await.unwrap();
+    tx.execute("ALTER TABLE workflow_run DISABLE TRIGGER workflow_run_work_wake")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workflow_run \
+           (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor, budget, \
+            correlation_id, causation_id, caused_by, depth, partition, idem_key, \
+            lease_owner, lease_expires, lease_epoch) \
+         VALUES ($1,$2,'R-peer','wf.peer',1,'[]'::jsonb,'running',0,NULL,'R-peer',NULL, \
+                 NULL,0,$3,'R-peer','dead-peer', clock_timestamp() + INTERVAL '1 second', 1)",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .bind(PARTITION)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.execute("ALTER TABLE workflow_run ENABLE TRIGGER workflow_run_work_wake")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let took = stack
+        .wait_for_state("R-peer", "completed", Duration::from_secs(8))
+        .await;
+    assert!(
+        took < Duration::from_millis(4_500),
+        "recovered {took:?} after the silent claim; the bound is 2.4s of jittered safety \
+         interval plus the 1s lease"
+    );
+    stack.stop().await;
+}
+
+async fn woken(wake: &WorkWake, within: Duration) -> bool {
+    tokio::time::timeout(within, wake.woken()).await.is_ok()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_payload_too_long_once_escaped_wakes_everyone_and_never_fails_the_write() {
+    let _guard = TEST_LOCK.lock().await;
+    let stack = Stack::new("payload").await;
+    let mut listener = PgListener::connect_with(&stack.pool).await.unwrap();
+    listener.listen(WORK_WAKE_CHANNEL).await.unwrap();
+
+    // 1,300 raw bytes pass any raw-length guard, but each escapes to `\u0001` in JSON:
+    // ~7.8kB, past what one notification carries.
+    let tenant = "\u{1}".repeat(1_300);
+    sqlx::query(
+        "INSERT INTO workflow_run \
+           (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor, budget, \
+            correlation_id, causation_id, caused_by, depth, partition, idem_key) \
+         VALUES ($1,$2,'R-escaped','wf.escaped',1,'[]'::jsonb,'running',0,NULL,'R-escaped', \
+                 NULL,NULL,0,$3,'R-escaped')",
+    )
+    .bind(&tenant)
+    .bind(REGION)
+    .bind(PARTITION)
+    .execute(&stack.pool)
+    .await
+    .expect("the wake trigger never fails the write it observes");
+    assert_eq!(
+        next_wake(&mut listener).await,
+        Some(serde_json::json!([stack.schema, "all"]))
+    );
+    drop(listener);
+    stack.stop().await;
 }

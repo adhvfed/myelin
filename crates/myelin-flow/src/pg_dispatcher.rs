@@ -8,7 +8,7 @@ use crate::schema::{WfActivityAttemptRow, WfHistoryRow};
 use crate::{PgFlowExecutor, TimerStore, WfCtx};
 use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, Timestamp, Ulid};
 use myelin_refs::ArtifactRef;
-use myelin_storage::work_wake::WorkWake;
+use myelin_storage::work_wake::{jittered, WorkWake};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -803,7 +803,8 @@ impl PgFlowWorker {
 
     /// Drives this partition until shutdown. A saturated batch is followed by another after
     /// `pacing.busy`; an idle partition sleeps until it is woken, until its next lease expiry
-    /// or timer, or for at most `pacing.max_idle`.
+    /// or timer, or for at most `pacing.max_idle` (jittered). The wake makes new work prompt;
+    /// `max_idle` bounds the work no wake announces (see `myelin_storage::work_wake`).
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -831,7 +832,7 @@ impl PgFlowWorker {
             let pause = if batch.saturated {
                 pacing.busy
             } else {
-                self.idle_pause(pacing).await?
+                self.idle_pause(pacing).await
             };
             tokio::select! {
                 changed = shutdown.changed() => {
@@ -843,8 +844,26 @@ impl PgFlowWorker {
         }
     }
 
-    async fn idle_pause(&self, pacing: IdlePacing) -> Result<Duration, PgWorkerError> {
-        let deadlines = self.store.partition_deadlines(self.scope.partition).await?;
+    async fn idle_pause(&self, pacing: IdlePacing) -> Duration {
+        if pacing.max_idle <= pacing.busy {
+            return pacing.busy;
+        }
+        let mut definitions: Vec<_> = self.bodies.keys().cloned().collect();
+        definitions.sort();
+        let deadlines = match self
+            .store
+            .partition_deadlines(self.scope.partition, &definitions)
+            .await
+        {
+            Ok(deadlines) => deadlines,
+            Err(error) => {
+                eprintln!(
+                    "flow worker {} partition {}: deadline read failed; re-checking after {:?}: {error}",
+                    self.scope.tenant.0, self.scope.partition, pacing.busy,
+                );
+                return pacing.busy;
+            }
+        };
         let now_ms = chrono::Utc::now().timestamp_millis();
         let lease = deadlines
             .lease_expires_in_ms
@@ -853,10 +872,13 @@ impl PgFlowWorker {
             let fire_at_ms = fire_at.saturating_mul(1000);
             Duration::from_millis(fire_at_ms.saturating_sub(now_ms).max(0) as u64)
         });
-        let next = [lease, timer].into_iter().flatten().min();
-        Ok(next
-            .unwrap_or(pacing.max_idle)
-            .clamp(pacing.busy, pacing.max_idle))
+        let safety = jittered(pacing.max_idle).max(pacing.busy);
+        [lease, timer]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(safety)
+            .clamp(pacing.busy, safety)
     }
 }
 
@@ -865,7 +887,8 @@ impl PgFlowWorker {
 pub struct IdlePacing {
     /// The pause after a saturated batch, and the shortest pause before a deadline.
     pub busy: Duration,
-    /// The longest an idle partition sleeps without a wake or a deadline.
+    /// The longest an idle partition sleeps without a wake or a deadline, before ±20% jitter.
+    /// When it equals `busy` the loop simply polls and reads no deadlines.
     pub max_idle: Duration,
 }
 
