@@ -43,6 +43,7 @@ fn unique(prefix: &str) -> String {
 
 struct Cell {
     provider: SubstrateProvider,
+    kms: Arc<myelin_storage::KmsEngine>,
     principals: PrincipalStore,
     accounts: AccountService,
 }
@@ -72,7 +73,7 @@ async fn cell() -> Cell {
             .expect("KMS"),
     );
     let principals = PrincipalStore::with_pg(
-        kms,
+        kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),
         tokio::runtime::Handle::current(),
     );
@@ -86,6 +87,7 @@ async fn cell() -> Cell {
     );
     Cell {
         provider,
+        kms,
         principals,
         accounts,
     }
@@ -509,6 +511,10 @@ async fn a_person_invited_back_is_a_new_principal_and_the_removed_one_stays_disa
         "Grace",
     )
     .unwrap();
+    let reset = accounts
+        .operator_reset_link(&tenant, &grace_email, None)
+        .await
+        .unwrap();
 
     accounts.remove_member(&ada, &grace.principal_id.0).unwrap();
     let returned = accept(
@@ -518,6 +524,11 @@ async fn a_person_invited_back_is_a_new_principal_and_the_removed_one_stays_disa
     )
     .unwrap();
     assert_ne!(returned.principal_id, grace.principal_id);
+    assert_eq!(
+        accounts.invitation(code_of(&reset.url)).unwrap_err(),
+        AccountError::InvitationNotFound,
+        "the removed person's reset links end when their address moves on"
+    );
     let scope = TenantScope::from_verified_token(&grace, grace.region.clone());
     let removed = cell
         .principals
@@ -540,6 +551,59 @@ async fn a_person_invited_back_is_a_new_principal_and_the_removed_one_stays_disa
         AccountError::AccountExists,
         "once back, the address has an account again"
     );
+
+    // Erasing the person who came back erases who they were before, too.
+    let identity = myelin_identity_service::StoreBackedCheck::with_pg(
+        cell.provider.clone(),
+        cell.kms.clone(),
+        Arc::new(CellTokenAuthority::generate()),
+        tokio::runtime::Handle::current(),
+    );
+    let readable = |person: &Principal| matches!(accounts.profile(person), Ok(Some(profile)) if !profile.email.is_empty());
+    assert!(readable(&grace) && readable(&returned));
+    tokio::task::block_in_place(|| {
+        identity.erase_in(
+            &TenantScope::from_verified_token(&returned, returned.region.clone()),
+            &returned.principal_id,
+            myelin_events::Timestamp("2026-11-26T00:00:00Z".into()),
+        )
+    })
+    .unwrap();
+    assert!(!readable(&returned), "the person's profile is shredded");
+    assert!(!readable(&grace), "and so is the profile they had before");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removed_person_made_active_again_keeps_their_address() {
+    let cell = cell().await;
+    let accounts = &cell.accounts;
+    let tenant = unique("t-roles-reactivated");
+    let ada = owner(accounts, &tenant, "Ada").await;
+    let grace_email = format!("{}@example.com", unique("grace"));
+    let grace = accept(
+        accounts,
+        &link_from(accounts, &ada, &grace_email).unwrap(),
+        "Grace",
+    )
+    .unwrap();
+    accounts.remove_member(&ada, &grace.principal_id.0).unwrap();
+    let back = link_from(accounts, &ada, &grace_email).unwrap();
+
+    // Made active again by another writer (an operator's bootstrap upserts the status), Grace is
+    // present: her address is not moved away from her.
+    set_status(&cell.provider, &grace, "Active").await;
+    assert_eq!(
+        accept(accounts, &back, "Grace Again").unwrap_err(),
+        AccountError::AccountExists
+    );
+    assert_eq!(
+        link_from(accounts, &ada, &grace_email).unwrap_err(),
+        AccountError::AccountExists
+    );
+    assert!(accounts
+        .was_removed(&tenant, &grace.region.0, &grace.principal_id.0)
+        .await
+        .unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

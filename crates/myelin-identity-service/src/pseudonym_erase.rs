@@ -272,6 +272,23 @@ impl PseudonymErasureLedger {
         }
     }
 
+    /// Every principal `subject` was before (`principal_succession`). The in-memory ledger keeps
+    /// no succession.
+    pub fn predecessors(
+        &self,
+        scope: &TenantScope,
+        subject: &PrincipalId,
+    ) -> Result<Vec<PrincipalId>, PseudonymError> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            ErasureLedgerBackend::Memory(_) => Ok(Vec::new()),
+            ErasureLedgerBackend::Pg(pg) => pg
+                .block(pg.backing.predecessors(&scope.tenant().0, &subject.0))
+                .map(|ids| ids.into_iter().map(PrincipalId).collect())
+                .map_err(|error| PseudonymError::Storage(error.to_string())),
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn part_key(scope: &TenantScope) -> (String, String) {
         (scope.tenant().0.clone(), scope.region().0.clone())

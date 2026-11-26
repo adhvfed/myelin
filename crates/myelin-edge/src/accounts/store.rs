@@ -1437,6 +1437,33 @@ impl AccountStore {
         .await
     }
 
+    /// Whether the principal was ever removed from the organization.
+    pub(crate) async fn was_removed(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal_id: &str,
+    ) -> Result<bool, StoreError> {
+        let principal_id = principal_id.to_string();
+        let (tenant_owned, region_owned) = (tenant.to_string(), region.to_string());
+        with_tenant_tx_error(&self.pool, tenant, region, move |conn| {
+            Box::pin(async move {
+                Ok::<_, StoreError>(
+                    sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM auth_org_removal \
+                          WHERE tenant_id = $1 AND region = $2 AND principal_id = $3)",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region_owned)
+                    .bind(&principal_id)
+                    .fetch_one(&mut *conn)
+                    .await?,
+                )
+            })
+        })
+        .await
+    }
+
     /// Whether the person was removed from the organization (and may be invited back), erased, or
     /// neither.
     pub(crate) async fn standing(
@@ -1753,22 +1780,31 @@ async fn standing_in(
     region: &str,
     principal_id: &str,
 ) -> Result<Standing, sqlx::Error> {
-    let (erased, removed): (bool, bool) = sqlx::query_as(
+    // Removed means recorded as removed and still out: disabled, with no role. Someone who was
+    // made active again another way (an operator's bootstrap) is present, and keeps the address.
+    // The person's row stays locked, so nothing makes them active while their address moves.
+    let standing: Option<(bool, bool)> = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM revocation \
                          WHERE kind = 'principal' AND expires_at IS NULL AND tenant_id = $1 \
                            AND region = $2 AND handle = $3), \
-                EXISTS (SELECT 1 FROM auth_org_removal \
-                         WHERE tenant_id = $1 AND region = $2 AND principal_id = $3)",
+                person.status = '\"Disabled\"' \
+                AND EXISTS (SELECT 1 FROM auth_org_removal \
+                             WHERE tenant_id = $1 AND region = $2 AND principal_id = $3) \
+                AND NOT EXISTS (SELECT 1 FROM auth_org_member \
+                                 WHERE tenant_id = $1 AND region = $2 AND principal_id = $3) \
+           FROM principal AS person \
+          WHERE person.tenant_id = $1 AND person.region = $2 AND person.principal_id = $3 \
+            FOR UPDATE OF person",
     )
     .bind(tenant)
     .bind(region)
     .bind(principal_id)
-    .fetch_one(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
-    Ok(match (erased, removed) {
-        (true, _) => Standing::Erased,
-        (false, true) => Standing::Removed,
-        (false, false) => Standing::Present,
+    Ok(match standing {
+        Some((true, _)) => Standing::Erased,
+        Some((false, true)) => Standing::Removed,
+        Some((false, false)) | None => Standing::Present,
     })
 }
 
@@ -1791,6 +1827,9 @@ async fn rebind_account(
         Standing::Present => return Ok(None),
     }
     end_reset_links(conn, tenant, region, removed, None).await?;
+    // Erasing the person later erases both principals.
+    DurablePrincipalBacking::record_succession_in_tx(conn, tenant, region, removed, principal_id)
+        .await?;
     Ok(sqlx::query_scalar(&format!(
         "UPDATE auth_password_account \
             SET principal_id = $5, password_phc = $6, changed_at_unix = {DB_NOW} \
@@ -1807,16 +1846,25 @@ async fn rebind_account(
     .await?)
 }
 
-/// No active person (by any way of signing in) and no live owner's link: an operator's link
-/// without a role makes the organization's first owner.
+/// Nobody active holds a role, nobody active signs in with SSO, and no owner's link is live: an
+/// operator's link without a role makes the organization's first owner. Operator principals
+/// (`edge bootstrap`) are not people of the organization and do not count.
 async fn organization_is_empty(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
 ) -> Result<bool, sqlx::Error> {
+    let sso_schemes: Vec<&str> = myelin_identity_service::scheme::HUMAN_SSO_SCHEMES.to_vec();
     sqlx::query_scalar(&format!(
-        "SELECT NOT EXISTS (SELECT 1 FROM principal \
-                             WHERE tenant_id = $1 AND region = $2 AND kind = $3 AND status = $4) \
+        "SELECT NOT EXISTS (SELECT 1 FROM auth_org_member AS member \
+                              JOIN principal AS person USING (tenant_id, region, principal_id) \
+                             WHERE member.tenant_id = $1 AND member.region = $2 \
+                               AND person.status = $4) \
+            AND NOT EXISTS (SELECT 1 FROM principal AS person \
+                              JOIN credential_link AS link USING (tenant_id, region, principal_id) \
+                             WHERE person.tenant_id = $1 AND person.region = $2 \
+                               AND person.kind = $3 AND person.status = $4 \
+                               AND split_part(link.link_key, chr(31), 1) = ANY($5)) \
             AND NOT EXISTS (SELECT 1 FROM auth_invitation \
                              WHERE tenant_id = $1 AND region = $2 AND kind = 'join' \
                                AND role = 'owner' AND expires_at_unix > {DB_NOW})"
@@ -1825,6 +1873,7 @@ async fn organization_is_empty(
     .bind(region)
     .bind(HUMAN_PRINCIPAL_KIND_JSON)
     .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
+    .bind(sso_schemes)
     .fetch_one(&mut *conn)
     .await
 }

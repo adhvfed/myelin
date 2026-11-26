@@ -311,6 +311,40 @@ impl DurableErasureLedgerBacking {
             .await
     }
 
+    /// Every principal the person `subject` was before, nearest first (`principal_succession`).
+    pub async fn predecessors(
+        &self,
+        tenant: &str,
+        subject: &str,
+    ) -> Result<Vec<String>, ProviderError> {
+        let tenant_owned = tenant.to_string();
+        let region = self.region();
+        let subject = subject.to_string();
+        self.provider
+            .with_tenant_tx(tenant, move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "WITH RECURSIVE earlier (principal_id, depth) AS ( \
+                           SELECT predecessor, 1 FROM principal_succession \
+                            WHERE tenant_id = $1 AND region = $2 AND successor = $3 \
+                           UNION \
+                           SELECT link.predecessor, earlier.depth + 1 \
+                             FROM principal_succession AS link \
+                             JOIN earlier ON link.successor = earlier.principal_id \
+                            WHERE link.tenant_id = $1 AND link.region = $2 AND earlier.depth < 64) \
+                         SELECT principal_id FROM earlier ORDER BY depth, principal_id",
+                    )
+                    .bind(&tenant_owned)
+                    .bind(&region)
+                    .bind(&subject)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))
+                })
+            })
+            .await
+    }
+
     pub async fn is_erased(&self, tenant: &str, subject: &str) -> Result<bool, ProviderError> {
         let tenant_owned = tenant.to_string();
         let region = self.region();

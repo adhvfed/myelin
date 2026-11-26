@@ -443,6 +443,34 @@ CREATE POLICY myelin_tenant_isolation ON rebac_object_revision
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
               AND region = current_setting('myelin.region', true));";
 
+/// One person continuing as another principal: an address removed from an organization and
+/// invited back joins as a new principal, and the old one stays disabled with its history. Erasing
+/// the person erases every principal they were.
+pub const PRINCIPAL_SUCCESSION_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS principal_succession (
+    tenant_id    text NOT NULL,
+    region       text NOT NULL,
+    predecessor  text NOT NULL,
+    successor    text NOT NULL,
+    PRIMARY KEY (tenant_id, region, predecessor),
+    FOREIGN KEY (tenant_id, region, predecessor)
+        REFERENCES principal (tenant_id, region, principal_id) ON DELETE CASCADE,
+    FOREIGN KEY (tenant_id, region, successor)
+        REFERENCES principal (tenant_id, region, principal_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS principal_succession_successor_idx
+    ON principal_succession (tenant_id, region, successor);
+REVOKE ALL ON TABLE principal_succession FROM PUBLIC;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE principal_succession TO myelin_app;
+ALTER TABLE principal_succession ENABLE ROW LEVEL SECURITY;
+ALTER TABLE principal_succession FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON principal_succession;
+CREATE POLICY myelin_tenant_isolation ON principal_succession
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));";
+
 pub fn identity_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0010_rebac_tuple", crate::pg::REBAC_TUPLE_MIGRATION),
@@ -496,6 +524,7 @@ pub fn human_session_migrations() -> Migrations {
             ERASED_PRINCIPAL_INSERT_AND_UPGRADE_MIGRATION,
             "principal",
         ),
+        Migration::plain("0188_principal_succession", PRINCIPAL_SUCCESSION_MIGRATION),
     ])
 }
 
@@ -1264,6 +1293,29 @@ impl DurablePrincipalBacking {
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| PgError::Query(e.to_string()))
+    }
+
+    /// Records, inside a caller-owned tenant transaction, that the person who was `predecessor`
+    /// continues as `successor`.
+    pub async fn record_succession_in_tx(
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        predecessor: &str,
+        successor: &str,
+    ) -> Result<(), PgError> {
+        sqlx::query(
+            "INSERT INTO principal_succession (tenant_id, region, predecessor, successor) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(predecessor)
+        .bind(successor)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| PgError::Query(e.to_string()))?;
+        Ok(())
     }
 
     pub async fn end_sessions(

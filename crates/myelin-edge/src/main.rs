@@ -1649,6 +1649,7 @@ async fn shutdown_signal() -> Result<(), String> {
 }
 
 async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
+    let accounts = core.accounts(None);
     let ComposedCore {
         provider,
         kms,
@@ -1688,6 +1689,23 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
+    // A removed person stays out: making them active again would hand back everything tied to
+    // them. Inviting their address makes a new person instead.
+    match accounts.was_removed(&tenant, &region, &principal).await {
+        Ok(false) => {}
+        Ok(true) => {
+            eprintln!(
+                "edge bootstrap: --principal `{principal}` was removed from this organization and \
+                 cannot be bootstrapped again; invite their address to make a new person, or \
+                 choose another principal id"
+            );
+            std::process::exit(2);
+        }
+        Err(error) => {
+            eprintln!("edge bootstrap: {error}");
+            std::process::exit(1);
+        }
+    }
     let tuples = TupleStore::with_pg(DurableTupleBacking::new(provider.clone()), handle.clone());
     let now_unix = system_clock_reading_or_exit("bootstrap").unix_seconds();
     let outcome = bootstrap_principal_and_mint(

@@ -579,7 +579,22 @@ impl StoreBackedCheck {
         }
     }
 
+    /// Erases the person `subject`, and every principal they were before it (a person removed from
+    /// an organization and invited back joins as a new principal). The receipt is `subject`'s.
     pub fn erase_in(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        subject: &myelin_identity::PrincipalId,
+        now: myelin_events::Timestamp,
+    ) -> Result<pseudonym_erase::ErasureReceipt, PseudonymError> {
+        let receipt = self.erase_one(scope, subject, now.clone())?;
+        for predecessor in &self.erasure_ledger.predecessors(scope, subject)? {
+            self.erase_one(scope, predecessor, now.clone())?;
+        }
+        Ok(receipt)
+    }
+
+    fn erase_one(
         &self,
         scope: &myelin_storage::TenantScope,
         subject: &myelin_identity::PrincipalId,

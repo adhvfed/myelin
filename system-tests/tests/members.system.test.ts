@@ -218,6 +218,11 @@ describe("an organization's people", () => {
     await signIn(maxEmail, password, 401);
     expect(rolesIn(await members(olivia))).not.toHaveProperty(maxEmail);
 
+    // The operator cannot bring the removed person back with a bootstrap.
+    await expect(operatorBootstrap(tenant, max.id, "Max Member")).rejects.toMatchObject({
+      stderr: expect.stringContaining("was removed from this organization"),
+    });
+
     // Invited back, Max returns as a new person with the name and password he chooses. Nothing
     // that belonged to the removed person comes back: not his sessions, not his operator token.
     await invite(olivia, maxEmail);
@@ -307,6 +312,19 @@ describe("an organization's people", () => {
     await remove(olivia, outsider, 404);
     expect(await whoami(outsider.token)).toMatchObject({ role: "owner", tenant: outsiderTenant });
   }, 120_000);
+
+  test("start with an owner when the operator bootstraps before inviting", async () => {
+    // The documented self-host order: an operator capability first, then the first invitation.
+    // The operator's principal is not a person of the organization.
+    const fresh = `members-${randomUUID().slice(0, 8)}`;
+    await operatorBootstrap(fresh, "operator", "Operator");
+    const firstEmail = uniqueEmail("first");
+    const first = await join(codeOf(await operatorLink("invite", firstEmail, fresh)), "First Person", firstEmail);
+    expect(await whoami(first.token)).toMatchObject({ role: "owner", tenant: fresh });
+    const secondEmail = uniqueEmail("second");
+    const second = await join(codeOf(await operatorLink("invite", secondEmail, fresh)), "Second Person", secondEmail);
+    expect(await whoami(second.token)).toMatchObject({ role: "member" });
+  });
 
   test("answer only a person's own session", async () => {
     const founder = await browserApprovedCliClient();

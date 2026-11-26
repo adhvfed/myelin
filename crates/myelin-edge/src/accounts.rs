@@ -1418,6 +1418,17 @@ impl AccountService {
         }
     }
 
+    /// Whether the principal was removed from an organization: such a principal stays out, and an
+    /// operator may not bring it back with `edge bootstrap`.
+    pub async fn was_removed(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal_id: &str,
+    ) -> Result<bool, AccountError> {
+        Ok(self.store.was_removed(tenant, region, principal_id).await?)
+    }
+
     /// A person who signed in another way (SSO) becomes a member, if they have no role yet.
     pub fn enrol_member(&self, person: &Principal) -> Result<(), AccountError> {
         self.block(async {

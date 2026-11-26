@@ -11,9 +11,11 @@ person's next click.
 edge invite --tenant T --email ada@example.com
 ```
 
-An operator's invitation without `--role owner|admin|member` grants owner while the organization
-has no active person (by any way of signing in) and no pending owner's invitation, and member
-after that. It prints the role it chose.
+An operator's invitation without `--role owner|admin|member` grants owner while nobody active in
+the organization holds a role or signs in with SSO and no owner's invitation is pending, and member
+after that. Operator principals made by `edge bootstrap` are not people of the organization and do
+not count, so the documented order (bootstrap, then invite) still makes the first person owner. The
+command prints the role it chose.
 
 ## Recovering an organization with no owner
 
@@ -43,3 +45,16 @@ disabled any other way, or erased, keeps their address; it cannot be invited.
 
 Whenever a person stops being active (removed, erased or disabled), the invitations they sent stop
 working and their unsent mail is withdrawn.
+
+`edge bootstrap --principal` refuses a principal that was removed, as it refuses an erased one:
+making it active again would hand back everything tied to it. Invite their address instead.
+
+Erasing a person who came back this way erases every principal they were: the successions are kept
+in `principal_succession`.
+
+### Single sign-on after returning
+
+A person who signs in with SSO keeps their SSO link on the principal that was removed, so after
+they come back their SSO sign-in is refused until an operator links their SSO identity to the new
+principal. Myelin has no command for that yet; until it does, the person signs in with the
+password they chose when they came back.
