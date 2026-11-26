@@ -161,8 +161,8 @@ mod tests {
         );
         assert_eq!(
             spec.migrations.0.len(),
-            12,
-            "six table creates plus six online workflow control/drive/repair expands (incl. the concurrent-index validation)"
+            13,
+            "six table creates, six online workflow control/drive/repair expands (incl. the concurrent-index validation) and the work wake"
         );
         assert_eq!(
             spec.migrations,
@@ -246,8 +246,8 @@ mod tests {
         );
         assert_eq!(
             spec.migrations.0.len(),
-            12,
-            "the engine-wired spec keeps the schema and online control expands"
+            13,
+            "the engine-wired spec keeps the schema, online control expands and the work wake"
         );
 
         dispatcher.register(

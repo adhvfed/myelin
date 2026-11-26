@@ -14,8 +14,9 @@ use myelin_agent_model::{
 use myelin_agent_service::trigger_handoff::{TriggerHandoffDisposition, TriggerRunHandoff};
 use myelin_config::Mode;
 use myelin_events::{Actor, UlidMinter};
-use myelin_flow::{PgFlowWorker, PgWorkerScope, PARTITION_COUNT};
+use myelin_flow::{IdlePacing, PgFlowWorker, PgWorkerScope, PARTITION_COUNT};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
+use myelin_storage::work_wake::{WorkWake, WorkWakeHub};
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, AgentTriggerClaimRequest,
     DurableAgentTriggerBacking, DurablePlacementBacking, HotTables, PgBootstrap, SubstrateProvider,
@@ -25,6 +26,14 @@ use myelin_tenancy::{Region, TenantId};
 
 const MODEL_MODE_ENV: &str = "MYELIN_HOSTED_MODEL_MODE";
 const DETERMINISTIC_DEVELOPMENT_MODE: &str = "deterministic-development";
+
+/// The pause after a saturated workflow batch, and the polling interval while the wake
+/// listener is down.
+const BUSY_POLL: Duration = Duration::from_millis(250);
+/// The longest an idle loop sleeps without a wake or a deadline. Every write that makes work
+/// claimable notifies, and lease and timer expiry are deadlines, so this only bounds the cost
+/// of a missed path; it is long so that idle tenants cost next to nothing.
+const MAX_IDLE: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() {
@@ -81,6 +90,7 @@ async fn main() {
             .with_tool_executor(tool_executor),
     );
     let region = Region(provider.config().region.clone());
+    let mut wakes = WorkWakeHub::new(region.0.clone());
     let mut workers = Vec::with_capacity(tenants.len() * PARTITION_COUNT as usize);
     for tenant in &tenants {
         for partition in 0..PARTITION_COUNT as i16 {
@@ -114,7 +124,7 @@ async fn main() {
                 activity.clone(),
             )
             .unwrap_or_else(|error| refuse_start("hosted workflow registration", error));
-            workers.push(worker);
+            workers.push((worker, wakes.flow_partition(&tenant.0, partition)));
         }
     }
 
@@ -123,21 +133,26 @@ async fn main() {
         workers.len(),
         region.0
     );
-    run_workers(workers, provider, tenants).await;
+    run_workers(workers, wakes, provider, tenants).await;
 }
 
 async fn run_workers(
-    workers: Vec<PgFlowWorker>,
+    workers: Vec<(PgFlowWorker, WorkWake)>,
+    mut wakes: WorkWakeHub,
     provider: SubstrateProvider,
     tenants: Vec<TenantId>,
 ) {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut tasks = tokio::task::JoinSet::new();
-    for worker in workers {
+    let pacing = IdlePacing {
+        busy: BUSY_POLL,
+        max_idle: MAX_IDLE,
+    };
+    for (worker, wake) in workers {
         let receiver = shutdown_rx.clone();
         tasks.spawn(async move {
             worker
-                .run_until_shutdown(receiver, Duration::from_millis(250), 32)
+                .run_until_shutdown(receiver, &wake, pacing, 32)
                 .await
                 .map_err(|error| error.to_string())
         });
@@ -152,6 +167,8 @@ async fn run_workers(
             .unwrap_or_else(|error| refuse_start("trigger workflow registration", error));
         let handoff_tenant = tenant.clone();
         let handoff_triggers = triggers.clone();
+        let handoff_wake = wakes.tenant_triggers(&tenant.0);
+        let reconcile_wake = wakes.tenant_triggers(&tenant.0);
         let mut handoff_shutdown = shutdown_rx.clone();
         let claim_request = AgentTriggerClaimRequest::new(
             myelin_identity_service::HOSTED_LUNA_RUNTIME,
@@ -165,13 +182,18 @@ async fn run_workers(
                 handoff_triggers,
                 handoff,
                 claim_request,
+                &handoff_wake,
                 &mut handoff_shutdown,
             )
             .await
         });
-        tasks
-            .spawn(async move { reconcile_trigger_firings(tenant, triggers, &mut receiver).await });
+        tasks.spawn(async move {
+            reconcile_trigger_firings(tenant, triggers, &reconcile_wake, &mut receiver).await
+        });
     }
+    let wake_pool = provider.db_pool().clone();
+    let wake_shutdown = shutdown_rx.clone();
+    tasks.spawn(async move { wakes.run(wake_pool, wake_shutdown, BUSY_POLL).await });
 
     let early_failure = tokio::select! {
         () = shutdown_signal() => None,
@@ -207,46 +229,64 @@ async fn run_trigger_handoffs(
     triggers: DurableAgentTriggerBacking,
     handoff: TriggerRunHandoff,
     claim_request: AgentTriggerClaimRequest,
+    wake: &WorkWake,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     let mut backoff = PollBackoff::new(Duration::from_millis(100), Duration::from_secs(5));
+    let mut pause = backoff.next_delay();
+    let mut failing = false;
     loop {
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
+        if pause_until_work(shutdown, (!failing).then_some(wake), pause).await {
+            return Ok(());
+        }
+        let claim = match triggers
+            .claim_next_firing(&tenant.0, claim_request.clone())
+            .await
+        {
+            Ok(claim) => {
+                backoff.succeeded();
+                failing = false;
+                claim
             }
-            () = tokio::time::sleep(backoff.next_delay()) => {
-                let claim = match triggers.claim_next_firing(&tenant.0, claim_request.clone()).await {
-                    Ok(claim) => {
-                        backoff.succeeded();
-                        claim
-                    }
-                    Err(error) => {
-                        eprintln!(
-                            "hosted-agent-worker: trigger queue unavailable for tenant {}: {error}",
-                            tenant.0,
-                        );
-                        backoff.failed();
-                        continue;
-                    }
-                };
-                let Some(claim) = claim else { continue };
-                let Err(error) = handoff.start(&tenant, &claim).await else { continue };
-                match error.disposition() {
-                    TriggerHandoffDisposition::ClaimLost => eprintln!(
-                        "hosted-agent-worker: trigger claim was canceled or reclaimed for tenant {}",
+            Err(error) => {
+                eprintln!(
+                    "hosted-agent-worker: trigger queue unavailable for tenant {}: {error}",
+                    tenant.0,
+                );
+                backoff.failed();
+                failing = true;
+                pause = backoff.next_delay();
+                continue;
+            }
+        };
+        pause = backoff.next_delay();
+        let Some(claim) = claim else {
+            pause = match triggers.next_claim_expiry_ms(&tenant.0).await {
+                Ok(expiry) => idle_pause(expiry),
+                Err(error) => {
+                    eprintln!(
+                        "hosted-agent-worker: trigger claim expiry unavailable for tenant {}: {error}",
                         tenant.0,
-                    ),
-                    TriggerHandoffDisposition::Retry => eprintln!(
-                        "hosted-agent-worker: trigger handoff will retry after its lease for tenant {}: {error}",
-                        tenant.0,
-                    ),
-                    TriggerHandoffDisposition::Terminal { reason } => {
-                        isolate_poison_firing(&triggers, &tenant, &claim, &reason).await;
-                    }
+                    );
+                    pause
                 }
+            };
+            continue;
+        };
+        let Err(error) = handoff.start(&tenant, &claim).await else {
+            continue;
+        };
+        match error.disposition() {
+            TriggerHandoffDisposition::ClaimLost => eprintln!(
+                "hosted-agent-worker: trigger claim was canceled or reclaimed for tenant {}",
+                tenant.0,
+            ),
+            TriggerHandoffDisposition::Retry => eprintln!(
+                "hosted-agent-worker: trigger handoff will retry after its lease for tenant {}: {error}",
+                tenant.0,
+            ),
+            TriggerHandoffDisposition::Terminal { reason } => {
+                isolate_poison_firing(&triggers, &tenant, &claim, &reason).await;
             }
         }
     }
@@ -277,30 +317,65 @@ async fn isolate_poison_firing(
 async fn reconcile_trigger_firings(
     tenant: TenantId,
     triggers: DurableAgentTriggerBacking,
+    wake: &WorkWake,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
+    const BATCH: u32 = 100;
     let mut backoff = PollBackoff::new(Duration::from_millis(250), Duration::from_secs(5));
+    let mut pause = backoff.next_delay();
+    let mut failing = false;
     loop {
-        tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
+        if pause_until_work(shutdown, (!failing).then_some(wake), pause).await {
+            return Ok(());
+        }
+        match triggers.reconcile_terminal_firings(&tenant.0, BATCH).await {
+            Ok(reconciled) => {
+                backoff.succeeded();
+                failing = false;
+                pause = if reconciled >= u64::from(BATCH) {
+                    backoff.next_delay()
+                } else {
+                    MAX_IDLE
+                };
             }
-            () = tokio::time::sleep(backoff.next_delay()) => {
-                match triggers.reconcile_terminal_firings(&tenant.0, 100).await {
-                    Ok(_) => backoff.succeeded(),
-                    Err(error) => {
-                        eprintln!(
-                            "hosted-agent-worker: trigger reconciliation unavailable for tenant {}: {error}",
-                            tenant.0,
-                        );
-                        backoff.failed();
-                    }
-                }
+            Err(error) => {
+                eprintln!(
+                    "hosted-agent-worker: trigger reconciliation unavailable for tenant {}: {error}",
+                    tenant.0,
+                );
+                backoff.failed();
+                failing = true;
+                pause = backoff.next_delay();
             }
         }
     }
+}
+
+/// Waits for `pause`, cut short by `wake`. Returns true on shutdown.
+async fn pause_until_work(
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    wake: Option<&WorkWake>,
+    pause: Duration,
+) -> bool {
+    let woken = async {
+        match wake {
+            Some(wake) => wake.woken().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        () = woken => false,
+        () = tokio::time::sleep(pause) => false,
+    }
+}
+
+/// The idle pause before the next claim expiry, bounded like a workflow partition's.
+fn idle_pause(expiry_ms: Option<i64>) -> Duration {
+    expiry_ms
+        .map(|ms| Duration::from_millis(ms.max(0) as u64))
+        .unwrap_or(MAX_IDLE)
+        .clamp(BUSY_POLL, MAX_IDLE)
 }
 
 fn model_factory() -> Result<Arc<dyn HostedModelFactory>, String> {

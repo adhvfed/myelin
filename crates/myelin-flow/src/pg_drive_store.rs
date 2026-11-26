@@ -193,6 +193,13 @@ pub struct FiredTimer {
     pub command_id: String,
 }
 
+/// Lease expiry is measured on the database clock; timers fire against the worker clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartitionDeadlines {
+    pub lease_expires_in_ms: Option<i64>,
+    pub timer_fire_at_unix_secs: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct PgFlowDriveStore {
     pool: PgPool,
@@ -392,6 +399,50 @@ impl PgFlowDriveStore {
                 .map_err(|e| db("claim stranded waiting workflow", e))?;
                 row.map(|row| decode_lease(row, &tenant, &region))
                     .transpose()
+            })
+        })
+        .await
+    }
+
+    /// When this partition next has work that no write will announce: the earliest lease that
+    /// can expire, and the earliest unfired timer.
+    pub async fn partition_deadlines(
+        &self,
+        partition: i16,
+    ) -> Result<PartitionDeadlines, DriveStoreError> {
+        let tenant = self.tenant.0.clone();
+        let region = self.region.0.clone();
+        let scope_tenant = tenant.clone();
+        let scope_region = region.clone();
+        with_tenant_tx_error(&self.pool, &scope_tenant, &scope_region, move |conn| {
+            Box::pin(async move {
+                let row = sqlx::query(
+                    "SELECT \
+                       (SELECT (EXTRACT(EPOCH FROM (min(lease_expires) - clock_timestamp())) \
+                                * 1000)::bigint \
+                          FROM workflow_run \
+                         WHERE tenant_id = $1 AND region = $2 AND partition = $3 \
+                           AND state IN ('running', 'waiting') AND lease_expires IS NOT NULL) \
+                         AS lease_ms, \
+                       (SELECT ceil(EXTRACT(EPOCH FROM min(fire_at)))::bigint \
+                          FROM wf_timer \
+                         WHERE tenant_id = $1 AND region = $2 AND partition = $3 AND NOT fired) \
+                         AS timer_secs",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(partition)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| db("read partition deadlines", e))?;
+                Ok(PartitionDeadlines {
+                    lease_expires_in_ms: row
+                        .try_get("lease_ms")
+                        .map_err(|e| db("decode lease deadline", e))?,
+                    timer_fire_at_unix_secs: row
+                        .try_get("timer_secs")
+                        .map_err(|e| db("decode timer deadline", e))?,
+                })
             })
         })
         .await

@@ -1253,3 +1253,112 @@ async fn an_automation_owner_sees_the_newest_rule_evaluation_error() {
 
     clean_tenant(&app, &tenant).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_change_that_can_unblock_a_queued_firing_wakes_the_tenant_loops() {
+    use myelin_storage::work_wake::WorkWakeHub;
+
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(app_config(), 8).await.unwrap();
+    let tenant = unique_tenant();
+    let agent_id = Uuid::new_v4();
+    seed_people_and_agent(&app, &tenant, agent_id, "hosted:luna").await;
+    let triggers = DurableAgentTriggerBacking::new(app.clone());
+    let proposal = red_mainline_binding(agent_id);
+    let CreateAgentTriggerBindingOutcome::Created(_) =
+        triggers.create(&tenant, proposal.clone()).await.unwrap()
+    else {
+        panic!("a fresh binding is created");
+    };
+
+    let mut hub = WorkWakeHub::new(app.config().region.clone());
+    let wake = hub.tenant_triggers(&tenant);
+    let neighbour = hub.tenant_triggers("someone-else");
+    let (shutdown, receiver) = tokio::sync::watch::channel(false);
+    let listener =
+        tokio::spawn(hub.run(app.db_pool().clone(), receiver, Duration::from_secs(3600)));
+    assert!(woken(&wake).await, "subscribing wakes every loop once");
+    assert!(woken(&neighbour).await);
+
+    let reserved = triggers
+        .reserve_firing(
+            &tenant,
+            proposal.binding_id,
+            "ci-failed-wake",
+            "ci.run.failed",
+            serde_json::json!({"event_id": "ci-failed-wake"}),
+            1,
+            false,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        reserved,
+        ReserveAgentTriggerFiringOutcome::Reserved(_)
+    ));
+    assert!(woken(&wake).await, "a queued firing wakes the claim loop");
+
+    let paused = triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            proposal.binding_id,
+            AgentTriggerLifecycleAction::Pause,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        paused,
+        ChangeAgentTriggerLifecycleOutcome::Complete(_)
+    ));
+    assert!(
+        woken(&wake).await,
+        "a binding changing state wakes the loop"
+    );
+
+    let suspended = serde_json::to_string(&PrincipalStatus::Suspended).unwrap();
+    let agent_principal = format!("agent:{agent_id}");
+    let scoped = tenant.clone();
+    app.with_tenant_tx(&tenant, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "UPDATE principal SET status = $3 WHERE tenant_id = $1 AND principal_id = $2",
+            )
+            .bind(&scoped)
+            .bind(&agent_principal)
+            .bind(&suspended)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+    assert!(
+        woken(&wake).await,
+        "an agent or owner changing status wakes the loop"
+    );
+    assert!(
+        !woken(&neighbour).await,
+        "another tenant's loops stay asleep"
+    );
+
+    let _ = shutdown.send(true);
+    listener.await.unwrap().unwrap();
+    clean_tenant(&app, &tenant).await;
+}
+
+async fn woken(wake: &myelin_storage::work_wake::WorkWake) -> bool {
+    tokio::time::timeout(Duration::from_secs(2), wake.woken())
+        .await
+        .is_ok()
+}

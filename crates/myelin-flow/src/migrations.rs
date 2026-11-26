@@ -160,6 +160,51 @@ BEGIN
 END
 $myelin$";
 
+/// Notifies `myelin_storage::work_wake::WORK_WAKE_CHANNEL` when a write can make work in a
+/// partition claimable: a run is created, changes state or gives up its lease, or a signal or
+/// timer is added. Claims and lease renewals stay silent. Payload:
+/// `[schema, "flow", region, tenant, partition]`; the partition is null when a signal's run is
+/// not visible, and `[schema, "all"]` is sent when the identifiers are too long to notify.
+pub const WORK_WAKE_DDL: &str = "\
+CREATE OR REPLACE FUNCTION myelin_flow_work_wake()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $myelin$
+DECLARE
+  wake_partition smallint;
+BEGIN
+  IF TG_TABLE_NAME = 'workflow_run' THEN
+    IF TG_OP = 'UPDATE' AND NEW.state IS NOT DISTINCT FROM OLD.state
+       AND NOT (NEW.lease_expires IS NULL AND OLD.lease_expires IS NOT NULL) THEN
+      RETURN NULL;
+    END IF;
+    wake_partition := NEW.partition;
+  ELSIF TG_TABLE_NAME = 'wf_timer' THEN
+    wake_partition := NEW.partition;
+  ELSE
+    SELECT run.partition INTO wake_partition FROM workflow_run AS run
+     WHERE run.tenant_id = NEW.tenant_id AND run.region = NEW.region
+       AND run.run_id = NEW.run_id;
+  END IF;
+  IF octet_length(NEW.tenant_id) + octet_length(NEW.region) > 4000 THEN
+    PERFORM pg_notify('myelin_work_wake', json_build_array(TG_TABLE_SCHEMA, 'all')::text);
+  ELSE
+    PERFORM pg_notify('myelin_work_wake',
+      json_build_array(TG_TABLE_SCHEMA, 'flow', NEW.region, NEW.tenant_id, wake_partition)::text);
+  END IF;
+  RETURN NULL;
+END
+$myelin$;
+CREATE OR REPLACE TRIGGER workflow_run_work_wake
+AFTER INSERT OR UPDATE OF state, lease_expires ON workflow_run
+FOR EACH ROW EXECUTE FUNCTION myelin_flow_work_wake();
+CREATE OR REPLACE TRIGGER wf_signal_work_wake
+AFTER INSERT ON wf_signal
+FOR EACH ROW EXECUTE FUNCTION myelin_flow_work_wake();
+CREATE OR REPLACE TRIGGER wf_timer_work_wake
+AFTER INSERT ON wf_timer
+FOR EACH ROW EXECUTE FUNCTION myelin_flow_work_wake()";
+
 const TABLE_DDLS: &[(&str, &str, &str, bool)] = &[
     (
         "flow_0001_workflow_run",
@@ -257,6 +302,12 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "workflow_run",
     ));
+    items.push(Migration::phased(
+        "flow_0013_work_wake",
+        WORK_WAKE_DDL,
+        MigrationPhase::Expand,
+        "workflow_run",
+    ));
     Migrations::of(items)
 }
 
@@ -274,9 +325,9 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            12,
+            13,
             "six-table data model plus six online control/drive/repair expansions (incl. the \
-             concurrent-index validation)"
+             concurrent-index validation) and the commit-time work wake"
         );
         let mut runner = MigrationRunner::new();
         runner
@@ -297,6 +348,7 @@ mod tests {
                 "flow_0010_workflow_run_scoped_runnable_index",
                 "flow_0011_workflow_run_waiting_repair_index",
                 "flow_0012_validate_workflow_run_waiting_repair_index",
+                "flow_0013_work_wake",
             ],
             "tables then online control expands, in order - 0 backward migration"
         );

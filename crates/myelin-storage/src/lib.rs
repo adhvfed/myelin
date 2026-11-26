@@ -57,6 +57,7 @@ pub mod restore_verify_durable;
 pub mod s3blob;
 pub mod tenant_tx;
 pub mod valkey;
+pub mod work_wake;
 
 pub mod cell_root_durable;
 

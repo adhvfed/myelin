@@ -8,6 +8,7 @@ use crate::schema::{WfActivityAttemptRow, WfHistoryRow};
 use crate::{PgFlowExecutor, TimerStore, WfCtx};
 use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, Timestamp, Ulid};
 use myelin_refs::ArtifactRef;
+use myelin_storage::work_wake::WorkWake;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -800,15 +801,23 @@ impl PgFlowWorker {
         })
     }
 
+    /// Drives this partition until shutdown. A saturated batch is followed by another after
+    /// `pacing.busy`; an idle partition sleeps until it is woken, until its next lease expiry
+    /// or timer, or for at most `pacing.max_idle`.
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
-        poll_interval: Duration,
+        wake: &WorkWake,
+        pacing: IdlePacing,
         max_batch: usize,
     ) -> Result<(), PgWorkerError> {
-        if poll_interval.is_zero() || max_batch == 0 || max_batch > MAX_BATCH {
+        if pacing.busy.is_zero()
+            || pacing.max_idle < pacing.busy
+            || max_batch == 0
+            || max_batch > MAX_BATCH
+        {
             return Err(PgWorkerError::InvalidConfig(
-                "runtime poll interval and batch bound must be positive and bounded".into(),
+                "runtime pacing and batch bound must be positive and bounded".into(),
             ));
         }
         loop {
@@ -816,16 +825,48 @@ impl PgFlowWorker {
                 return Ok(());
             }
             let (secs, stamp) = system_clock()?;
-            self.run_until_idle_or_shutdown(max_batch, secs, &stamp, &shutdown)
+            let batch = self
+                .run_until_idle_or_shutdown(max_batch, secs, &stamp, &shutdown)
                 .await?;
+            let pause = if batch.saturated {
+                pacing.busy
+            } else {
+                self.idle_pause(pacing).await?
+            };
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { return Ok(()); }
                 }
-                _ = tokio::time::sleep(poll_interval) => {}
+                () = wake.woken() => {}
+                _ = tokio::time::sleep(pause) => {}
             }
         }
     }
+
+    async fn idle_pause(&self, pacing: IdlePacing) -> Result<Duration, PgWorkerError> {
+        let deadlines = self.store.partition_deadlines(self.scope.partition).await?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let lease = deadlines
+            .lease_expires_in_ms
+            .map(|ms| Duration::from_millis(ms.max(0) as u64));
+        let timer = deadlines.timer_fire_at_unix_secs.map(|fire_at| {
+            let fire_at_ms = fire_at.saturating_mul(1000);
+            Duration::from_millis(fire_at_ms.saturating_sub(now_ms).max(0) as u64)
+        });
+        let next = [lease, timer].into_iter().flatten().min();
+        Ok(next
+            .unwrap_or(pacing.max_idle)
+            .clamp(pacing.busy, pacing.max_idle))
+    }
+}
+
+/// How long a partition loop waits between batches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdlePacing {
+    /// The pause after a saturated batch, and the shortest pause before a deadline.
+    pub busy: Duration,
+    /// The longest an idle partition sleeps without a wake or a deadline.
+    pub max_idle: Duration,
 }
 
 fn build_commit(

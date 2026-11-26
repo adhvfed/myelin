@@ -271,6 +271,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_thread_durable::agent_thread_review_handoff_migrations(),
         crate::agent_thread_durable::agent_thread_environment_state_migrations(),
         crate::identity_durable::human_session_migrations(),
+        crate::work_wake::agent_trigger_work_wake_migrations(),
     ]
 }
 

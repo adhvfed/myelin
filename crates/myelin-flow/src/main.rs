@@ -2,8 +2,9 @@ use myelin_config::Mode;
 use myelin_events::{OutboxStore, UlidMinter};
 use myelin_flow::{
     boot_flow, configured_production_definitions, migrations::migrations as flow_migrations,
-    PgFlowWorker, PgWorkerScope, OPERATIONAL_PROBE_WF_TYPE,
+    IdlePacing, PgFlowWorker, PgWorkerScope, OPERATIONAL_PROBE_WF_TYPE,
 };
+use myelin_storage::work_wake::WorkWake;
 use myelin_storage::{all_durable_migrations, HotTables, PgBootstrap, PgOutboxBacking};
 use myelin_substrate::Config;
 use std::sync::Arc;
@@ -97,7 +98,15 @@ async fn main() {
         let worker = Arc::clone(&worker);
         tokio::spawn(async move {
             worker
-                .run_until_shutdown(shutdown_rx, Duration::from_millis(250), 32)
+                .run_until_shutdown(
+                    shutdown_rx,
+                    &WorkWake::detached(),
+                    IdlePacing {
+                        busy: Duration::from_millis(250),
+                        max_idle: Duration::from_millis(250),
+                    },
+                    32,
+                )
                 .await
         })
     };

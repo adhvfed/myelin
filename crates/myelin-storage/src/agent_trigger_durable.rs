@@ -949,6 +949,31 @@ impl DurableAgentTriggerBacking {
             .await
     }
 
+    /// Milliseconds until the earliest current claim expires and its firing becomes claimable
+    /// again. Expiry is the one way a firing becomes claimable without a write that wakes the
+    /// worker.
+    pub async fn next_claim_expiry_ms(&self, tenant: &str) -> Result<Option<i64>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, Option<i64>>(
+                        "SELECT (EXTRACT(EPOCH FROM (min(claim_until) - clock_timestamp())) \
+                                 * 1000)::bigint \
+                           FROM agent_trigger_firing \
+                          WHERE tenant_id = $1 AND region = $2 AND state = 'claimed'",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(query_error("read governed agent claim expiry"))
+                })
+            })
+            .await
+    }
+
     pub async fn claim_next_firing(
         &self,
         tenant: &str,

@@ -55,15 +55,15 @@ pub use maintenance::{
 };
 pub use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd};
 pub use pg_dispatcher::{
-    configured_production_definitions, PgClaimedDriveInput, PgDriveBatch, PgFlowWorker,
+    configured_production_definitions, IdlePacing, PgClaimedDriveInput, PgDriveBatch, PgFlowWorker,
     PgInputResolveError, PgResolvedDriveInput, PgResolvedWorkflowBody, PgRunOnceOutcome,
     PgWorkerError, PgWorkerScope, PgWorkflowBody, PgWorkflowInputResolver,
     MAX_PG_RESOLVED_INPUT_BYTES, OPERATIONAL_PROBE_WF_TYPE,
 };
 pub use pg_drive_store::{
     ActivityAttemptWrite, CommitOutcome as PgDriveCommitOutcome, DriveCommit, DriveLease,
-    DriveSnapshot, DriveStoreError, FiredTimer, HistoryWrite, LoadedHistory, PendingSignal,
-    PgFlowDriveStore, SignalKey, TimerArm,
+    DriveSnapshot, DriveStoreError, FiredTimer, HistoryWrite, LoadedHistory, PartitionDeadlines,
+    PendingSignal, PgFlowDriveStore, SignalKey, TimerArm,
 };
 pub use pg_executor::{CancelOnConnOutcome, PgFlowExecutor};
 pub use remint::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter};
