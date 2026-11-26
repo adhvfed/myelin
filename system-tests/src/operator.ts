@@ -67,6 +67,15 @@ export async function operatorLink(
   return link;
 }
 
+/** Runs `edge role` as the operator: gives the person with `email` in `tenant` a role. */
+export async function operatorRole(tenant: string, email: string, role: string): Promise<void> {
+  await run(
+    "cargo",
+    ["run", "--quiet", "-p", "myelin-edge", "--bin", "edge", "--", "role", "--tenant", tenant, "--email", email, "--role", role],
+    { timeout: 120_000, maxBuffer: 256 * 1024 },
+  );
+}
+
 /** Runs an operator link command expected to fail, and returns its exit code and stderr. */
 export async function failedOperatorLink(
   command: "invite" | "reset-link",

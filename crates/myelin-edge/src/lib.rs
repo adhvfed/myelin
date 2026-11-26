@@ -58,8 +58,10 @@ mod workspace_augmentation;
 mod workspace_effect;
 mod workspace_ssh_http;
 
-pub use accounts::http::InviteHandler;
-pub use accounts::{account_migrations, AccountError, AccountKeys, AccountService, SignedIn};
+pub use accounts::http::{invitation_handler, register_members};
+pub use accounts::{
+    account_migrations, AccountError, AccountKeys, AccountService, OrgRole, SignedIn,
+};
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{
     register_agent_mcp, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources,

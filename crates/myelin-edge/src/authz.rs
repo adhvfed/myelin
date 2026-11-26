@@ -9,6 +9,10 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "edge.whoami",
     "edge.auth.device.approve",
     "edge.invitations.create",
+    "edge.invitations.revoke",
+    "edge.members.list",
+    "edge.members.role.set",
+    "edge.members.remove",
     "edge.events.subscribe",
     "agent.tools.list",
     "agent.tool.view",
@@ -186,11 +190,25 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         "edge.auth.delegate",
         HUMAN_OR_OPERATOR
     ),
+    // A person's session may reach the people endpoints; their role in the organization, read
+    // fresh on every request, decides what they may do there.
     requirement!(
         "edge.invitations.create",
         "edge.members.invite",
         HUMAN_SESSION
     ),
+    requirement!(
+        "edge.invitations.revoke",
+        "edge.members.invite",
+        HUMAN_SESSION
+    ),
+    requirement!("edge.members.list", "edge.members.read", HUMAN_SESSION),
+    requirement!(
+        "edge.members.role.set",
+        "edge.members.manage",
+        HUMAN_SESSION
+    ),
+    requirement!("edge.members.remove", "edge.members.manage", HUMAN_SESSION),
     requirement!("edge.events.subscribe", "edge.events.subscribe", OP_PAT),
     requirement!("agent.tools.list", "agent.tools.read", OP_PAT),
     requirement!("agent.tool.view", "agent.tools.read", OP_PAT),

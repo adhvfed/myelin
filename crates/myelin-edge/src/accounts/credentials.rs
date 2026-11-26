@@ -189,6 +189,7 @@ impl EmailDigester {
 pub struct AccountKeys {
     pub(crate) email: EmailDigester,
     pub(crate) devices: DeviceKey,
+    pub(crate) roster: RosterKey,
 }
 
 impl AccountKeys {
@@ -196,6 +197,7 @@ impl AccountKeys {
         Self {
             email: EmailDigester::new(seal.derive_service_key(EmailDigester::SEAL_KEY_CONTEXT)),
             devices: DeviceKey(seal.derive_service_key(DeviceKey::SEAL_KEY_CONTEXT)),
+            roster: RosterKey(seal.derive_service_key(RosterKey::SEAL_KEY_CONTEXT)),
         }
     }
 
@@ -204,6 +206,7 @@ impl AccountKeys {
         Self {
             email: EmailDigester::new(Zeroizing::new([byte; 32])),
             devices: DeviceKey(Zeroizing::new([byte ^ 0xff; 32])),
+            roster: RosterKey(Zeroizing::new([byte ^ 0x5a; 32])),
         }
     }
 }
@@ -271,6 +274,51 @@ impl DeviceKey {
         mac.update(email);
         mac.update(signed);
         mac
+    }
+}
+
+/// Seals a pending invitation's email so the organization's owners and admins can list it. The
+/// copy sealed under the link's own code cannot serve them: only the link holder has that key.
+#[derive(Clone)]
+pub(crate) struct RosterKey(Zeroizing<[u8; 32]>);
+
+impl RosterKey {
+    const SEAL_KEY_CONTEXT: &'static str = "myelin 2026-11-26 invitation roster seal v1";
+
+    /// Bound to the email's digest, so a sealed address cannot be moved to another invitation.
+    pub(crate) fn seal(&self, email: &Email, digest: &EmailDigest) -> SealedEmail {
+        let mut nonce = [0_u8; EMAIL_NONCE_BYTES];
+        OsRng.fill_bytes(&mut nonce);
+        let ciphertext = self
+            .cipher()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: email.as_str().as_bytes(),
+                    aad: digest,
+                },
+            )
+            .expect("AES-256-GCM encryption of a short email cannot fail");
+        SealedEmail { nonce, ciphertext }
+    }
+
+    pub(crate) fn open(&self, sealed: &SealedEmail, digest: &EmailDigest) -> Option<Email> {
+        let plain = Zeroizing::new(
+            self.cipher()
+                .decrypt(
+                    Nonce::from_slice(&sealed.nonce),
+                    Payload {
+                        msg: &sealed.ciphertext,
+                        aad: digest,
+                    },
+                )
+                .ok()?,
+        );
+        Email::parse(std::str::from_utf8(&plain).ok()?)
+    }
+
+    fn cipher(&self) -> Aes256Gcm {
+        Aes256Gcm::new_from_slice(self.0.as_slice()).expect("AES-256-GCM takes a 32-byte key")
     }
 }
 
@@ -588,5 +636,17 @@ mod tests {
         let mut tampered = sealed.clone();
         tampered.ciphertext[0] ^= 1;
         assert_eq!(code.open_email(&tampered), None);
+    }
+
+    #[test]
+    fn the_roster_copy_opens_only_with_its_key_and_its_own_digest() {
+        let keys = AccountKeys::fixed(3);
+        let email = Email::parse("grace@example.com").unwrap();
+        let digest = keys.email.digest(&email);
+        let sealed = keys.roster.seal(&email, &digest);
+        assert!(!String::from_utf8_lossy(&sealed.ciphertext).contains("grace"));
+        assert_eq!(keys.roster.open(&sealed, &digest), Some(email));
+        assert_eq!(keys.roster.open(&sealed, &[0; 32]), None);
+        assert_eq!(AccountKeys::fixed(4).roster.open(&sealed, &digest), None);
     }
 }

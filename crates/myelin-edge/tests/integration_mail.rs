@@ -9,8 +9,8 @@ use myelin_edge::accounts::{Acceptance, Checkpoint, MemberInvitation};
 use myelin_edge::catalogue::{Handler, HandlerCtx};
 use myelin_edge::mail::{DeliveryPass, DeliverySchedule};
 use myelin_edge::{
-    account_migrations, AccountError, AccountKeys, AccountService, AllowAll, EdgeRequest,
-    EdgeResponse, Gateway, InviteHandler, MailOutbox, MailSettings, MailWorker,
+    account_migrations, invitation_handler, AccountError, AccountKeys, AccountService, AllowAll,
+    EdgeRequest, EdgeResponse, Gateway, MailOutbox, MailSettings, MailWorker, OrgRole,
 };
 use myelin_identity::{Principal, PrincipalStatus};
 use myelin_identity_service::{
@@ -387,7 +387,7 @@ impl Cell {
     /// Lets the operator invite a first person and returns them, signed in.
     async fn person(&self, accounts: &AccountService, tenant: &str, email: &str) -> Principal {
         let link = accounts
-            .operator_join_link(tenant, email, None)
+            .operator_join_link(tenant, email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url;
@@ -453,7 +453,9 @@ async fn an_emailed_invitation_reaches_only_the_invitee_and_its_link_works() {
         .await;
     let grace = format!("{}@example.com", unique("grace"));
 
-    let first = accounts.invite_member(&ada, &grace.to_uppercase()).unwrap();
+    let first = accounts
+        .invite_member(&ada, &grace.to_uppercase(), OrgRole::Member)
+        .unwrap();
     let MemberInvitation::Emailed {
         email,
         expires_at_unix,
@@ -464,7 +466,9 @@ async fn an_emailed_invitation_reaches_only_the_invitee_and_its_link_works() {
     assert_eq!(email, grace);
     assert!(expires_at_unix > 0);
     // A second invitation to the same address replaces the first, and withdraws its mail.
-    accounts.invite_member(&ada, &grace).unwrap();
+    accounts
+        .invite_member(&ada, &grace, OrgRole::Member)
+        .unwrap();
     assert_eq!(
         cell.queued().await,
         1,
@@ -509,7 +513,9 @@ async fn a_link_and_its_mail_are_stored_together_or_not_at_all() {
         )
         .await;
     let grace = format!("{}@example.com", unique("grace"));
-    accounts.invite_member(&ada, &grace).unwrap();
+    accounts
+        .invite_member(&ada, &grace, OrgRole::Member)
+        .unwrap();
     let links: Vec<Vec<u8>> = sqlx::query_scalar(
         "SELECT code_digest FROM auth_invitation WHERE tenant_id = $1 AND kind = 'join'",
     )
@@ -532,8 +538,18 @@ async fn a_link_and_its_mail_are_stored_together_or_not_at_all() {
     // An organization whose name cannot fit in a queued letter: the letter is refused, and the
     // link written just before it in the same transaction is rolled back with it.
     let oversized = format!("{}-{}", unique("t-oversized"), "x".repeat(17 * 1024));
-    let inviter = ada.clone().in_tenant(&oversized);
-    let refused = accounts.invite_member(&inviter, &format!("{}@example.com", unique("hedy")));
+    let inviter = cell
+        .person(
+            &accounts,
+            &oversized,
+            &format!("{}@example.com", unique("owner")),
+        )
+        .await;
+    let refused = accounts.invite_member(
+        &inviter,
+        &format!("{}@example.com", unique("hedy")),
+        OrgRole::Member,
+    );
     assert!(
         matches!(&refused, Err(AccountError::Unavailable(detail))
             if detail.contains("edge_mail_outbox_payload_check")),
@@ -1134,7 +1150,11 @@ async fn with_mail_off_links_go_to_the_inviter_and_nothing_is_queued() {
     let member = cell.person(&accounts, &tenant, &ada).await;
 
     let invited = accounts
-        .invite_member(&member, &format!("{}@example.com", unique("grace")))
+        .invite_member(
+            &member,
+            &format!("{}@example.com", unique("grace")),
+            OrgRole::Member,
+        )
         .unwrap();
     assert!(
         matches!(&invited, MemberInvitation::HandedOver(issued)
@@ -1271,7 +1291,9 @@ async fn a_used_invitation_withdraws_its_unsent_mail() {
         )
         .await;
     let grace = format!("{}@example.com", unique("grace"));
-    accounts.invite_member(&ada, &grace).unwrap();
+    accounts
+        .invite_member(&ada, &grace, OrgRole::Member)
+        .unwrap();
     smtp.refuse.store(true, Ordering::SeqCst);
     assert_eq!(
         deliver(&cell.worker(&smtp, quick_retries())).await.retrying,
@@ -1354,7 +1376,9 @@ async fn a_second_worker_never_takes_a_letter_the_first_holds() {
         .map(|n| format!("{}-{n}@example.com", unique("invitee")))
         .collect();
     for invitee in &invitees {
-        accounts.invite_member(&ada, invitee).unwrap();
+        accounts
+            .invite_member(&ada, invitee, OrgRole::Member)
+            .unwrap();
     }
 
     // The first worker takes one letter and stalls inside its send, holding the claim.
@@ -1414,7 +1438,9 @@ async fn a_relay_that_never_answers_costs_one_send_deadline_and_delivery_goes_on
     let grace = format!("{}@example.com", unique("grace"));
     let member = cell.person(&accounts, &tenant, &grace).await;
     let hedy = format!("{}@example.com", unique("hedy"));
-    accounts.invite_member(&member, &hedy).unwrap();
+    accounts
+        .invite_member(&member, &hedy, OrgRole::Member)
+        .unwrap();
     let running = cell.worker(&smtp, schedule).spawn();
     for _ in 0..100 {
         if !smtp.delivered_to(&ada).is_empty() && !smtp.delivered_to(&hedy).is_empty() {
@@ -1485,10 +1511,12 @@ async fn one_address_gets_at_most_three_invitations_an_hour_from_an_organization
         .await;
     let stranger = format!("{}@example.com", unique("stranger"));
     for inviter in [&ada, &bob, &ada] {
-        accounts.invite_member(inviter, &stranger).unwrap();
+        accounts
+            .invite_member(inviter, &stranger, OrgRole::Member)
+            .unwrap();
     }
     assert!(matches!(
-        accounts.invite_member(&bob, &stranger.to_uppercase()),
+        accounts.invite_member(&bob, &stranger.to_uppercase(), OrgRole::Member),
         Err(AccountError::RecipientRateLimited { retry_after_secs }) if retry_after_secs > 0
     ));
     assert_eq!(
@@ -1497,7 +1525,11 @@ async fn one_address_gets_at_most_three_invitations_an_hour_from_an_organization
         "the refusal did not cost the member a slot"
     );
     accounts
-        .invite_member(&bob, &format!("{}@example.com", unique("someone-else")))
+        .invite_member(
+            &bob,
+            &format!("{}@example.com", unique("someone-else")),
+            OrgRole::Member,
+        )
         .expect("other addresses are unaffected");
 
     // An invitation that is refused is not charged to anyone.
@@ -1505,7 +1537,9 @@ async fn one_address_gets_at_most_three_invitations_an_hour_from_an_organization
     cell.person(&accounts, &tenant, &member).await;
     for _ in 0..5 {
         assert_eq!(
-            accounts.invite_member(&ada, &member).unwrap_err(),
+            accounts
+                .invite_member(&ada, &member, OrgRole::Member)
+                .unwrap_err(),
             AccountError::AccountExists
         );
     }
@@ -1531,7 +1565,9 @@ async fn with_mail_off_a_lost_link_can_be_remade_without_the_address_cap() {
         .await;
     let stranger = format!("{}@example.com", unique("stranger"));
     for _ in 0..5 {
-        accounts.invite_member(&ada, &stranger).unwrap();
+        accounts
+            .invite_member(&ada, &stranger, OrgRole::Member)
+            .unwrap();
     }
 }
 
@@ -1548,7 +1584,7 @@ async fn the_address_cap_answers_429_with_its_code_and_wait() {
             &format!("{}@example.com", unique("ada")),
         )
         .await;
-    let handler = InviteHandler::new(accounts);
+    let handler = invitation_handler(accounts);
     let stranger = format!("{}@example.com", unique("stranger"));
     let invite = || {
         let request = EdgeRequest::new(
@@ -1617,8 +1653,12 @@ async fn a_worker_skips_a_row_another_transaction_has_locked() {
         format!("{}@example.com", unique("first")),
         format!("{}@example.com", unique("second")),
     );
-    accounts.invite_member(&ada, &first).unwrap();
-    accounts.invite_member(&ada, &second).unwrap();
+    accounts
+        .invite_member(&ada, &first, OrgRole::Member)
+        .unwrap();
+    accounts
+        .invite_member(&ada, &second, OrgRole::Member)
+        .unwrap();
 
     // The row the worker would take first is put at the head of the queue and row-locked by an
     // open transaction.
@@ -1746,7 +1786,7 @@ async fn an_invitation_made_while_its_address_joins_sees_the_new_account() {
     let grace = format!("{}@example.com", unique("grace"));
     let join = code_in(
         &accounts
-            .operator_join_link(&tenant, &grace, None)
+            .operator_join_link(&tenant, &grace, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -1758,7 +1798,7 @@ async fn an_invitation_made_while_its_address_joins_sees_the_new_account() {
         while_accept_is_open(
             &accounts.clone(),
             Checkpoint::JoinAccountStored,
-            move || accounts.invite_member(&ada, &grace),
+            move || accounts.invite_member(&ada, &grace, OrgRole::Member),
         )
     };
     hooked
@@ -1917,15 +1957,4 @@ async fn a_refused_reset_queues_no_change_notice() {
     );
     assert_eq!(cell.queued().await, 0, "an expired link sends no notice");
     accounts.login(&email, PASSWORD.into(), None).unwrap();
-}
-
-trait InTenant {
-    fn in_tenant(self, tenant: &str) -> Self;
-}
-
-impl InTenant for Principal {
-    fn in_tenant(mut self, tenant: &str) -> Self {
-        self.tenant = myelin_tenancy::TenantId(tenant.into());
-        self
-    }
 }

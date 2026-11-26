@@ -3,6 +3,7 @@
 
 mod credentials;
 pub(crate) mod http;
+mod roles;
 mod store;
 
 use myelin_events::clock::{system_clock_reading, ClockError};
@@ -23,13 +24,14 @@ use crate::mail::{Letter, MailOutbox};
 pub use credentials::AccountKeys;
 use credentials::{
     DeviceId, DeviceKey, DummyHash, Email, EmailDigest, EmailDigester, InvitationCode, Password,
-    WeakPassword,
+    RosterKey, WeakPassword,
 };
+pub use roles::OrgRole;
 pub use store::account_migrations;
 pub(crate) use store::InvitationKind;
 use store::{
     AcceptOutcome, AccountRow, AccountStore, ChangeOutcome, Invitation, IssueOutcome, IssueRule,
-    LinkLetter, LinkMail, NewInvitation, Reservation, Slot,
+    LinkLetter, LinkMail, MemberChange, NewInvitation, Reservation, RosterOutcome, Slot,
 };
 
 pub const JOIN_INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
@@ -124,6 +126,12 @@ pub enum AccountError {
     },
     Busy,
     LinksUnavailable,
+    /// The person's role in the organization does not allow this.
+    RoleRequired,
+    /// It would leave the organization without an owner.
+    LastOwner,
+    /// No active person in the organization has this id.
+    NoSuchMember,
     Unavailable(String),
 }
 
@@ -163,6 +171,11 @@ impl core::fmt::Display for AccountError {
             Self::LinksUnavailable => formatter.write_str(
                 "invitation links need MYELIN_WEB_PUBLIC_URL set to the web app's https origin",
             ),
+            Self::RoleRequired => {
+                formatter.write_str("your role in this organization does not allow this")
+            }
+            Self::LastOwner => formatter.write_str("an organization must keep at least one owner"),
+            Self::NoSuchMember => formatter.write_str("no such person in this organization"),
             Self::Unavailable(detail) => write!(formatter, "accounts are unavailable: {detail}"),
         }
     }
@@ -196,6 +209,34 @@ pub struct IssuedInvitation {
     pub url: String,
     pub email: String,
     pub expires_at_unix: i64,
+}
+
+/// An active person, as the organization's roster shows them. A profile that can no longer be
+/// read (erased) shows empty strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberView {
+    pub principal_id: String,
+    pub display_name: String,
+    pub email: String,
+    pub role: OrgRole,
+    pub joined_at_unix: i64,
+}
+
+/// A live join link. `email` is `None` for a link made before addresses were kept for the roster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingInvitation {
+    pub id: String,
+    pub email: Option<String>,
+    pub role: OrgRole,
+    pub expires_at_unix: i64,
+}
+
+/// The organization as one member sees it: pending invitations only for owners and admins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterView {
+    pub viewer: OrgRole,
+    pub people: Vec<MemberView>,
+    pub invitations: Option<Vec<PendingInvitation>>,
 }
 
 /// A member's invitation: emailed to the invitee when mail is on, otherwise handed to the
@@ -283,6 +324,8 @@ pub enum Checkpoint {
     /// Inside a reset's or change's transaction: the person's sessions are ended; nothing is
     /// committed yet.
     SessionsEnded,
+    /// Inside a role change or removal: both roles are read and allow it; nothing is written yet.
+    RolesRead,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -301,6 +344,7 @@ pub struct AccountService {
     principals: PrincipalStore,
     digester: EmailDigester,
     devices: DeviceKey,
+    roster: RosterKey,
     links: LinkOrigin,
     mail: Option<MailOutbox>,
     reset_requests: Arc<Semaphore>,
@@ -334,6 +378,7 @@ impl AccountService {
             principals,
             digester: keys.email,
             devices: keys.devices,
+            roster: keys.roster,
             links: LinkOrigin::from_config(web_origin),
             mail: None,
             reset_requests: Arc::new(Semaphore::new(RESET_REQUESTS_IN_FLIGHT)),
@@ -1003,13 +1048,21 @@ impl AccountService {
         error
     }
 
-    /// A signed-in member invites a teammate into their own organization. A member can only make
-    /// join links, and a join link can never touch an existing account or a reset link.
+    /// A signed-in owner or admin invites a teammate into their own organization, to join with
+    /// `role`. They can only make join links, and a join link can never touch an existing account
+    /// or a reset link. A role that may not grant `role` is refused before anything is counted.
     pub fn invite_member(
         &self,
         inviter: &Principal,
         email: &str,
+        role: OrgRole,
     ) -> Result<MemberInvitation, AccountError> {
+        if !self
+            .role_of(inviter)?
+            .is_some_and(|inviter| inviter.may_grant(role))
+        {
+            return Err(AccountError::RoleRequired);
+        }
         self.block(async {
             let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
             let mut taken = Vec::new();
@@ -1039,7 +1092,7 @@ impl AccountService {
             let outcome = match self.reserve(&INVITES_PER_MEMBER, bucket).await {
                 Ok(slot) => {
                     taken.push(slot);
-                    self.member_link(inviter, email).await
+                    self.member_link(inviter, email, role).await
                 }
                 Err(refused) => Err(refused),
             };
@@ -1055,15 +1108,20 @@ impl AccountService {
         &self,
         inviter: &Principal,
         email: Email,
+        role: OrgRole,
     ) -> Result<MemberInvitation, AccountError> {
         // Only an account in the inviter's own organization is reported, so a member cannot
         // probe which addresses have accounts elsewhere in the cell. An address taken in
         // another organization gets a link that fails when it is accepted.
         let tenant = &inviter.tenant.0;
+        let rule = IssueRule::MemberJoin {
+            inviter: &inviter.principal_id.0,
+            role,
+        };
         let Some(outbox) = &self.mail else {
             return self
                 .issue(
-                    IssueRule::MemberJoin,
+                    rule,
                     tenant,
                     &inviter.region.0,
                     email,
@@ -1077,7 +1135,7 @@ impl AccountService {
         let organization = self.store.organization_name(tenant).await?;
         let issued = self
             .issue(
-                IssueRule::MemberJoin,
+                rule,
                 tenant,
                 &inviter.region.0,
                 email,
@@ -1181,16 +1239,18 @@ impl AccountService {
         }
     }
 
-    /// The operator's join link, for the first person in an organization or anyone after.
+    /// The operator's join link, for the first person in an organization or anyone after. It
+    /// grants `role`: owner, unless the operator says otherwise.
     pub async fn operator_join_link(
         &self,
         tenant: &str,
         email: &str,
         ttl_secs: Option<i64>,
+        role: OrgRole,
     ) -> Result<IssuedInvitation, AccountError> {
         let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
         self.issue(
-            IssueRule::OperatorJoin,
+            IssueRule::OperatorJoin { role },
             tenant,
             &self.region,
             email,
@@ -1240,7 +1300,7 @@ impl AccountService {
     /// transaction, so the link exists only if its mail does.
     async fn issue(
         &self,
-        rule: IssueRule,
+        rule: IssueRule<'_>,
         tenant: &str,
         region: &str,
         email: Email,
@@ -1256,11 +1316,13 @@ impl AccountService {
         #[cfg(any(test, feature = "test-support"))]
         self.reached(Checkpoint::BeforeIssuing);
         let code = InvitationCode::generate();
+        let email_digest = self.digester.digest(&email);
         let link = NewInvitation {
             tenant: tenant.to_string(),
             region: region.to_string(),
-            email_digest: self.digester.digest(&email),
+            email_digest,
             email: code.seal_email(&email),
+            roster: rule.role().map(|_| self.roster.seal(&email, &email_digest)),
             ttl_secs: ttl_secs.clamp(60, MAX_INVITATION_TTL_SECS),
         };
         let url = format!("{origin}/join/{}", code.encoded());
@@ -1282,7 +1344,149 @@ impl AccountService {
             }),
             IssueOutcome::AccountExists => Err(AccountError::AccountExists),
             IssueOutcome::NoSuchAccount => Err(AccountError::NoSuchAccount),
+            IssueOutcome::NotAllowed => Err(AccountError::RoleRequired),
         }
+    }
+
+    /// The person's role in their organization; `None` unless they are an active member.
+    pub fn role_of(&self, person: &Principal) -> Result<Option<OrgRole>, AccountError> {
+        self.block(async {
+            Ok(self
+                .store
+                .role_of(&person.tenant.0, &person.region.0, &person.principal_id.0)
+                .await?)
+        })
+    }
+
+    /// The organization's people, and its pending invitations when `viewer` manages people.
+    pub fn roster(&self, viewer: &Principal) -> Result<RosterView, AccountError> {
+        let (tenant, region) = (&viewer.tenant.0, &viewer.region.0);
+        let roster = self
+            .block(async {
+                Ok(self
+                    .store
+                    .roster(tenant, region, &viewer.principal_id.0)
+                    .await?)
+            })?
+            .ok_or(AccountError::RoleRequired)?;
+        let scope = scope_for(tenant, region);
+        let people = roster
+            .people
+            .into_iter()
+            .map(|person| {
+                let (display_name, email) = self
+                    .principals
+                    .get_profile(&scope, &PrincipalId(person.principal_id.clone()))
+                    .ok()
+                    .flatten()
+                    .map(|profile| (profile.display_name, profile.email))
+                    .unwrap_or_default();
+                MemberView {
+                    principal_id: person.principal_id,
+                    display_name,
+                    email,
+                    role: person.role,
+                    joined_at_unix: person.joined_at_unix,
+                }
+            })
+            .collect();
+        let invitations = roster.viewer.manages_people().then(|| {
+            roster
+                .pending
+                .into_iter()
+                .map(|link| PendingInvitation {
+                    email: link
+                        .roster
+                        .and_then(|sealed| self.roster.open(&sealed, &link.email_digest))
+                        .map(|email| email.as_str().to_string()),
+                    id: link.id,
+                    role: link.role,
+                    expires_at_unix: link.expires_at_unix,
+                })
+                .collect()
+        });
+        Ok(RosterView {
+            viewer: roster.viewer,
+            people,
+            invitations,
+        })
+    }
+
+    /// An owner or admin gives a person `role`.
+    pub fn set_member_role(
+        &self,
+        actor: &Principal,
+        target: &str,
+        role: OrgRole,
+    ) -> Result<(), AccountError> {
+        self.change_member(actor, target, MemberChange::Role(role))
+    }
+
+    /// An owner or admin removes a person: they are disabled, and every session they hold ends.
+    pub fn remove_member(&self, actor: &Principal, target: &str) -> Result<(), AccountError> {
+        self.change_member(actor, target, MemberChange::Remove)
+    }
+
+    fn change_member(
+        &self,
+        actor: &Principal,
+        target: &str,
+        change: MemberChange,
+    ) -> Result<(), AccountError> {
+        let outcome = self.block(async {
+            Ok(self
+                .store
+                .change_member(
+                    &actor.tenant.0,
+                    &actor.region.0,
+                    Some(&actor.principal_id.0),
+                    target,
+                    change,
+                )
+                .await?)
+        })?;
+        roster_result(outcome, AccountError::NoSuchMember)
+    }
+
+    /// An owner or admin withdraws a pending invitation and any mail still carrying it.
+    pub fn revoke_invitation(&self, actor: &Principal, id: &str) -> Result<(), AccountError> {
+        let outcome = self.block(async {
+            Ok(self
+                .store
+                .revoke_invitation(&actor.tenant.0, &actor.region.0, &actor.principal_id.0, id)
+                .await?)
+        })?;
+        roster_result(outcome, AccountError::InvitationNotFound)
+    }
+
+    /// The operator gives the person with `email` in `tenant` a role, as an owner could. The
+    /// organization still keeps an owner: promote another before demoting the last.
+    pub async fn operator_set_role(
+        &self,
+        tenant: &str,
+        email: &str,
+        role: OrgRole,
+    ) -> Result<(), AccountError> {
+        let email = Email::parse(email).ok_or(AccountError::InvalidEmail)?;
+        let digest = self.digester.digest(&email);
+        let Some(principal_id) = self
+            .store
+            .principal_by_email(tenant, &self.region, &digest)
+            .await?
+        else {
+            return Err(AccountError::NoSuchAccount);
+        };
+        let outcome = self
+            .store
+            .change_member(
+                tenant,
+                &self.region,
+                None,
+                &principal_id,
+                MemberChange::Role(role),
+            )
+            .await?;
+        roster_result(outcome, AccountError::NoSuchMember)
     }
 
     /// The signed-in person's own name and email, for `/v1/whoami`.
@@ -1293,6 +1497,15 @@ impl AccountService {
                 &principal.principal_id,
             )
             .map_err(|error| AccountError::Unavailable(error.to_string()))
+    }
+}
+
+fn roster_result(outcome: RosterOutcome, not_found: AccountError) -> Result<(), AccountError> {
+    match outcome {
+        RosterOutcome::Done => Ok(()),
+        RosterOutcome::NotFound => Err(not_found),
+        RosterOutcome::NotAllowed => Err(AccountError::RoleRequired),
+        RosterOutcome::LastOwner => Err(AccountError::LastOwner),
     }
 }
 

@@ -9,7 +9,7 @@ use myelin_edge::accounts::{Acceptance, Checkpoint};
 use myelin_edge::catalogue::Method;
 use myelin_edge::{
     account_migrations, device_authorization_migrations, AccountError, AccountKeys, AccountService,
-    AllowAll, DeviceAuthorizationBroker, EdgeRequest, Gateway, WhoamiHandler,
+    AllowAll, DeviceAuthorizationBroker, EdgeRequest, Gateway, OrgRole, WhoamiHandler,
 };
 use myelin_identity::{Credential, RevokeTarget};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -205,7 +205,7 @@ impl Stack {
         let tenant = unique("t-sessions");
         let link = self
             .accounts
-            .operator_join_link(&tenant, email, None)
+            .operator_join_link(&tenant, email, None, OrgRole::Owner)
             .await
             .unwrap();
         let token = self.accept(

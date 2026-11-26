@@ -5,7 +5,7 @@
 
 use myelin_config::{Mode, MyelinConfig};
 use myelin_edge::accounts::{Acceptance, Checkpoint, MemberInvitation};
-use myelin_edge::{account_migrations, AccountError, AccountKeys, AccountService};
+use myelin_edge::{account_migrations, AccountError, AccountKeys, AccountService, OrgRole};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::PrincipalStore;
 use myelin_storage::{
@@ -144,7 +144,7 @@ impl Cell {
         let code = code_of(
             &self
                 .accounts
-                .operator_join_link(tenant, email, None)
+                .operator_join_link(tenant, email, None, OrgRole::Owner)
                 .await
                 .unwrap()
                 .url,
@@ -215,7 +215,7 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
 
     let issued = cell
         .accounts
-        .operator_join_link(&tenant, &email, None)
+        .operator_join_link(&tenant, &email, None, OrgRole::Owner)
         .await
         .expect("the operator invites the first person");
     assert!(issued.url.starts_with("https://myelin.example/join/"));
@@ -301,13 +301,15 @@ async fn an_invited_person_joins_signs_in_and_is_reset_by_the_operator() {
 
     assert_eq!(
         cell.accounts
-            .operator_join_link(&tenant, &email, None)
+            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap_err(),
         AccountError::AccountExists
     );
     assert_eq!(
-        cell.accounts.invite_member(&joined, &email).unwrap_err(),
+        cell.accounts
+            .invite_member(&joined, &email, OrgRole::Member)
+            .unwrap_err(),
         AccountError::AccountExists,
         "a member cannot make a link for an existing account"
     );
@@ -360,7 +362,7 @@ async fn two_people_racing_for_one_link_produce_exactly_one_account() {
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None)
+            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -412,18 +414,17 @@ async fn two_people_racing_for_one_link_produce_exactly_one_account() {
     // Two organizations inviting the same address: the second acceptance finds it taken and
     // creates nothing, and its link stays unused.
     let other_tenant = unique("t-race-other");
+    let other_owner = cell
+        .join_person(
+            &other_tenant,
+            &format!("{}@example.com", unique("hopper")),
+            "Hopper",
+        )
+        .await;
     let second = code_of(
         &cell
             .accounts
-            .invite_member(
-                &outcomes
-                    .into_iter()
-                    .find_map(Result::ok)
-                    .unwrap()
-                    .principal
-                    .with_tenant(&other_tenant),
-                &email,
-            )
+            .invite_member(&other_owner, &email, OrgRole::Member)
             .map(handed_over)
             .expect("another organization may still send a link"),
     );
@@ -436,20 +437,9 @@ async fn two_people_racing_for_one_link_produce_exactly_one_account() {
     assert!(cell.accounts.invitation(&second).is_ok());
     assert_eq!(
         cell.subject_keys(&other_tenant).await,
-        0,
+        1,
         "a join refused for a taken address leaves no key behind"
     );
-}
-
-trait InTenant {
-    fn with_tenant(self, tenant: &str) -> Self;
-}
-
-impl InTenant for myelin_identity::Principal {
-    fn with_tenant(mut self, tenant: &str) -> Self {
-        self.tenant = myelin_tenancy::TenantId(tenant.into());
-        self
-    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -461,7 +451,7 @@ async fn only_the_newest_link_works_and_none_outlives_its_expiry() {
     let first = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None)
+            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -469,7 +459,7 @@ async fn only_the_newest_link_works_and_none_outlives_its_expiry() {
     let second = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, Some(3600))
+            .operator_join_link(&tenant, &email, Some(3600), OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -508,7 +498,7 @@ async fn sign_in_is_throttled_per_email_and_refused_to_inactive_or_removed_peopl
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None)
+            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -646,7 +636,7 @@ async fn junk_codes_never_throttle_real_links_and_write_nothing() {
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None)
+            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -695,7 +685,7 @@ async fn an_expired_link_is_refused_even_when_the_edge_clock_lags() {
     let join_code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &joiner, None)
+            .operator_join_link(&tenant, &joiner, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -753,13 +743,15 @@ async fn links_are_made_only_for_an_https_or_loopback_origin() {
     let plain_http = cell.service(Some("http://myelin.example"));
     assert_eq!(
         plain_http
-            .operator_join_link(&tenant, &invitee, None)
+            .operator_join_link(&tenant, &invitee, None, OrgRole::Owner)
             .await
             .unwrap_err(),
         AccountError::LinksUnavailable
     );
     assert_eq!(
-        plain_http.invite_member(&member, &invitee).unwrap_err(),
+        plain_http
+            .invite_member(&member, &invitee, OrgRole::Member)
+            .unwrap_err(),
         AccountError::LinksUnavailable
     );
     assert_eq!(
@@ -773,10 +765,12 @@ async fn links_are_made_only_for_an_https_or_loopback_origin() {
     );
 
     let loopback = cell.service(Some("http://127.0.0.1:3000"));
-    assert!(
-        handed_over(loopback.invite_member(&member, &invitee).unwrap())
-            .starts_with("http://127.0.0.1:3000/join/")
-    );
+    assert!(handed_over(
+        loopback
+            .invite_member(&member, &invitee, OrgRole::Member)
+            .unwrap()
+    )
+    .starts_with("http://127.0.0.1:3000/join/"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -851,7 +845,7 @@ async fn a_member_invitation_racing_a_reset_link_never_removes_it() {
     let invitee_join = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &invitee, None)
+            .operator_join_link(&tenant, &invitee, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -896,7 +890,9 @@ async fn a_member_invitation_racing_a_reset_link_never_removes_it() {
         });
 
     assert_eq!(
-        hooked.invite_member(&member, &invitee).unwrap_err(),
+        hooked
+            .invite_member(&member, &invitee, OrgRole::Member)
+            .unwrap_err(),
         AccountError::AccountExists
     );
     let reset = reset.lock().unwrap().clone().expect("the checkpoint ran");
@@ -1196,7 +1192,7 @@ async fn a_new_link_replaces_only_the_same_kind_for_the_same_email_in_the_same_o
         async move {
             code_of(
                 &accounts
-                    .operator_join_link(&tenant, &email, None)
+                    .operator_join_link(&tenant, &email, None, OrgRole::Owner)
                     .await
                     .unwrap()
                     .url,
@@ -1272,7 +1268,12 @@ async fn an_operators_new_reset_link_revokes_their_earlier_one_for_that_person_o
     let pending_join = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &format!("{}@example.com", unique("moore")), None)
+            .operator_join_link(
+                &tenant,
+                &format!("{}@example.com", unique("moore")),
+                None,
+                OrgRole::Owner,
+            )
             .await
             .unwrap()
             .url,
@@ -1322,7 +1323,7 @@ async fn a_join_that_loses_the_email_inside_its_transaction_rolls_back_and_keeps
     let code = code_of(
         &cell
             .accounts
-            .operator_join_link(&tenant, &email, None)
+            .operator_join_link(&tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,
@@ -1330,7 +1331,7 @@ async fn a_join_that_loses_the_email_inside_its_transaction_rolls_back_and_keeps
     let rival_code = code_of(
         &cell
             .accounts
-            .operator_join_link(&rival_tenant, &email, None)
+            .operator_join_link(&rival_tenant, &email, None, OrgRole::Owner)
             .await
             .unwrap()
             .url,

@@ -16,19 +16,19 @@ use myelin_edge::{
     account_migrations, bootstrap_principal_and_mint, execute_secret_command,
     merge_queue_interval_from_env, recover_placed_git_at_boot, register_agent_mcp,
     register_agent_threads, register_agents, register_chat, register_ci, register_git_durable,
-    register_git_wire, register_issues, register_knowledge, register_notif, register_privacy,
-    register_projects, register_refs, register_tools, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, spawn_merge_queue, validated_web_origin, AccountKeys,
-    AccountService, AgentMcpAuthority, AgentMcpResourceInputs, AgentMcpResources, AgentMcpServices,
-    AgentThreadHttpInputs, AgentThreadRecoveryConfig, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DeviceAuthorizationBroker, DurableAgentThreadReferenceApi, DurableAgentWorkspaceAccess,
-    DurableChatMutationApi, DurableChatReadApi, DurableChatReferenceApi, DurableCiApi,
-    DurableGitBackend, DurableKnowledgeMutationApi, DurableRefsReadApi, Gateway,
-    GitDatabaseProviders, InviteHandler, IssueReconciliationConfig, MailOutbox, MailSettings,
-    MailWorker, Method, ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError,
-    SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
-    WorkspaceSshEndpoint,
+    register_git_wire, register_issues, register_knowledge, register_members, register_notif,
+    register_privacy, register_projects, register_refs, register_tools,
+    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, spawn_merge_queue,
+    validated_web_origin, AccountKeys, AccountService, AgentMcpAuthority, AgentMcpResourceInputs,
+    AgentMcpResources, AgentMcpServices, AgentThreadHttpInputs, AgentThreadRecoveryConfig,
+    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableAgentThreadReferenceApi,
+    DurableAgentWorkspaceAccess, DurableChatMutationApi, DurableChatReadApi,
+    DurableChatReferenceApi, DurableCiApi, DurableGitBackend, DurableKnowledgeMutationApi,
+    DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, MailOutbox,
+    MailSettings, MailWorker, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
+    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler, WorkspaceSshEndpoint,
 };
 use myelin_events::OutboxStore;
 use myelin_identity::{
@@ -912,13 +912,13 @@ async fn main() {
             let runtime = runtime_config_or_exit(false);
             operator_revoke(compose_core(runtime.cell_id).await, &args[1..]).await;
         }
-        Some(command @ ("invite" | "reset-link")) => {
+        Some(command @ ("invite" | "reset-link" | "role")) => {
             let runtime = runtime_config_or_exit(false);
             let web_origin = web_public_origin().unwrap_or_else(|error| {
                 eprintln!("edge {command}: {error}");
                 std::process::exit(2);
             });
-            if web_origin.is_none() {
+            if web_origin.is_none() && command != "role" {
                 eprintln!(
                     "edge {command}: MYELIN_WEB_PUBLIC_URL must be set to the web app's origin \
                      to build the link"
@@ -926,11 +926,8 @@ async fn main() {
                 std::process::exit(2);
             }
             let core = compose_core(runtime.cell_id).await;
-            let kind = if command == "invite" {
-                account_operator::LinkKind::Join
-            } else {
-                account_operator::LinkKind::Reset
-            };
+            let kind = account_operator::AccountCommand::named(command)
+                .expect("the match names only account commands");
             let region = core.provider.config().region.clone();
             account_operator::run(kind, core.accounts(web_origin), &region, &args[1..]).await;
         }
@@ -962,7 +959,7 @@ async fn main() {
         }
         Some(other) => {
             eprintln!(
-                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | invite | reset-link | revoke | secret | agent-thread-reconcile | git-pr-text-rekey | privacy-reerase)"
+                "edge: unknown subcommand `{other}` (expected: <none> = serve | bootstrap | invite | reset-link | role | revoke | secret | agent-thread-reconcile | git-pr-text-rekey | privacy-reerase)"
             );
             std::process::exit(2);
         }
@@ -1346,21 +1343,22 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
             Method::Get,
             "/v1/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler::with_profiles(profile_directory.clone())),
+            Arc::new(
+                WhoamiHandler::with_profiles(profile_directory.clone())
+                    .with_roles(accounts.clone()),
+            ),
         )
         .route(
             Method::Get,
             "/v1/t/{tenant}/whoami",
             "edge.whoami",
-            Arc::new(WhoamiHandler::with_profiles(profile_directory.clone())),
-        )
-        .route(
-            Method::Post,
-            "/v1/invitations",
-            "edge.invitations.create",
-            Arc::new(InviteHandler::new(accounts)),
+            Arc::new(
+                WhoamiHandler::with_profiles(profile_directory.clone())
+                    .with_roles(accounts.clone()),
+            ),
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
+    builder = register_members(builder, accounts.clone());
     builder = register_git_durable(builder, git_backend.clone());
     let ci_blobs: Arc<dyn BlobStore + Send + Sync> =
         Arc::from(provider.blob_store(handle.clone()).unwrap_or_else(|error| {

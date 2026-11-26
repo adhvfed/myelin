@@ -1,4 +1,4 @@
-use crate::accounts::{AccountService, SignedIn};
+use crate::accounts::{AccountService, OrgRole, SignedIn};
 use crate::auth_request::{
     parse_auth_request, require_auth_request_budget, DeviceApprovalRequest, DeviceClaimRequest,
     DeviceStartRequest, LoginRequest,
@@ -1440,17 +1440,25 @@ fn kind_label(kind: &PrincipalKind) -> &'static str {
     }
 }
 
-/// `/v1/whoami`. With a profile directory it also tells the caller their name and email.
+/// `/v1/whoami`. With a profile directory it also tells the caller their name and email, and
+/// with accounts their role in the organization (`null` for anyone who is not a member).
 #[derive(Default)]
 pub struct WhoamiHandler {
     profiles: Option<PrincipalStore>,
+    roles: Option<AccountService>,
 }
 
 impl WhoamiHandler {
     pub fn with_profiles(profiles: PrincipalStore) -> Self {
         Self {
             profiles: Some(profiles),
+            roles: None,
         }
+    }
+
+    pub fn with_roles(mut self, accounts: AccountService) -> Self {
+        self.roles = Some(accounts);
+        self
     }
 }
 
@@ -1464,6 +1472,12 @@ impl Handler for WhoamiHandler {
                 .ok()
                 .flatten()
         });
+        let role = match &self.roles {
+            Some(accounts) => accounts
+                .role_of(ctx.principal)
+                .map_err(|_| EdgeError::Unavailable("roles are temporarily unavailable".into()))?,
+            None => None,
+        };
         let display_name = profile
             .as_ref()
             .map(|profile| profile.display_name.trim())
@@ -1479,6 +1493,7 @@ impl Handler for WhoamiHandler {
                 "expires_at": ctx.identity.capability().expires_at_unix,
                 "display_name": display_name,
                 "email": profile.as_ref().map_or("", |profile| profile.email.as_str()),
+                "role": role.map(OrgRole::as_str),
             }),
         ))
     }

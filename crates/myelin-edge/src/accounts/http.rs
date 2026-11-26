@@ -5,12 +5,16 @@ use myelin_identity::{Principal, PrincipalKind};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
 
-use super::{Acceptance, AccountError, AccountService, MemberInvitation, SignedIn};
+use super::{
+    Acceptance, AccountError, AccountService, MemberInvitation, OrgRole, RosterView, SignedIn,
+};
 use crate::catalogue::{Handler, HandlerCtx};
 use crate::error::EdgeError;
-use crate::gateway::{no_store, route_segments};
+use crate::gateway::{no_store, route_segments, GatewayBuilder};
 use crate::request::{EdgeRequest, EdgeResponse};
+use crate::Method;
 
 /// Room for a 1024-character password even when every character is escaped in JSON. The server
 /// applies it while reading the body, so a larger one is never buffered.
@@ -21,7 +25,9 @@ pub(crate) fn is_account_path(path: &str) -> bool {
     let segments: Vec<&str> = route_segments(path).collect();
     matches!(
         segments.as_slice(),
-        ["v1", "auth", "password", "login" | "forgot" | "change"] | ["v1", "invitations"]
+        ["v1", "auth", "password", "login" | "forgot" | "change"]
+            | ["v1", "invitations"]
+            | ["v1", "members", _, "role"]
     ) || matches!(segments.as_slice(), ["v1", "auth", "invitations", _, ..])
 }
 
@@ -56,6 +62,14 @@ struct ChangePasswordRequest {
 #[serde(deny_unknown_fields)]
 struct InviteRequest {
     email: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleRequest {
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +141,15 @@ fn account_error(failure: AccountError) -> EdgeResponse {
             error(&EdgeError::Unavailable(message)).with_header("retry-after", "1")
         }
         AccountError::LinksUnavailable => error(&EdgeError::Unavailable(message)),
+        AccountError::RoleRequired => no_store(EdgeResponse::json(
+            403,
+            &json!({ "error": { "code": "role_required", "message": message } }),
+        )),
+        AccountError::LastOwner => no_store(EdgeResponse::json(
+            409,
+            &json!({ "error": { "code": "last_owner", "message": message } }),
+        )),
+        AccountError::NoSuchMember => error(&EdgeError::NotFound(message)),
         AccountError::Unavailable(_) => error(&EdgeError::Unavailable(
             "accounts are temporarily unavailable".into(),
         )),
@@ -263,52 +286,192 @@ pub(crate) fn accept(
     }
 }
 
-/// `POST /v1/invitations`: a signed-in member invites a teammate.
-pub struct InviteHandler {
-    accounts: AccountService,
+/// The people endpoints, each answered for a signed-in person. Roles are judged by the account
+/// service against the database on every request, not by the session's authority.
+pub fn register_members(builder: GatewayBuilder, accounts: AccountService) -> GatewayBuilder {
+    let route = |op| {
+        Arc::new(MembersHandler {
+            accounts: accounts.clone(),
+            op,
+        })
+    };
+    builder
+        .route(
+            Method::Post,
+            "/v1/invitations",
+            "edge.invitations.create",
+            route(MembersOp::Invite),
+        )
+        .route(
+            Method::Delete,
+            "/v1/invitations/{id}",
+            "edge.invitations.revoke",
+            route(MembersOp::Revoke),
+        )
+        .route(
+            Method::Get,
+            "/v1/members",
+            "edge.members.list",
+            route(MembersOp::List),
+        )
+        .route(
+            Method::Post,
+            "/v1/members/{id}/role",
+            "edge.members.role.set",
+            route(MembersOp::SetRole),
+        )
+        .route(
+            Method::Delete,
+            "/v1/members/{id}",
+            "edge.members.remove",
+            route(MembersOp::Remove),
+        )
 }
 
-impl InviteHandler {
-    pub fn new(accounts: AccountService) -> Self {
-        Self { accounts }
+/// `POST /v1/invitations` on its own.
+pub fn invitation_handler(accounts: AccountService) -> impl Handler {
+    MembersHandler {
+        accounts,
+        op: MembersOp::Invite,
     }
 }
 
-impl Handler for InviteHandler {
+#[derive(Clone, Copy)]
+enum MembersOp {
+    Invite,
+    Revoke,
+    List,
+    SetRole,
+    Remove,
+}
+
+struct MembersHandler {
+    accounts: AccountService,
+    op: MembersOp,
+}
+
+impl Handler for MembersHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if !matches!(ctx.principal.kind, PrincipalKind::Human) {
             return Err(EdgeError::Forbidden(
-                "only a person can invite a teammate".into(),
+                "only a person can manage an organization's people".into(),
             ));
         }
+        let id = || ctx.params.get("id").map(String::as_str).unwrap_or_default();
+        let person = ctx.principal;
+        Ok(match self.op {
+            MembersOp::Invite => self.invite(ctx),
+            MembersOp::List => respond(self.accounts.roster(person), |roster| {
+                (200, roster_json(&roster))
+            }),
+            MembersOp::SetRole => {
+                let body: RoleRequest = match parse(&ctx.request.body, "role change") {
+                    Ok(body) => body,
+                    Err(response) => return Ok(response),
+                };
+                let Some(role) = OrgRole::parse(&body.role) else {
+                    return Ok(unknown_role());
+                };
+                respond(self.accounts.set_member_role(person, id(), role), |()| {
+                    (200, json!({ "id": id(), "role": role.as_str() }))
+                })
+            }
+            MembersOp::Remove => respond(self.accounts.remove_member(person, id()), |()| {
+                (200, json!({ "id": id(), "status": "removed" }))
+            }),
+            MembersOp::Revoke => respond(self.accounts.revoke_invitation(person, id()), |()| {
+                (200, json!({ "id": id(), "status": "revoked" }))
+            }),
+        })
+    }
+}
+
+impl MembersHandler {
+    /// `POST /v1/invitations`: an owner or admin invites a teammate, as a member unless the body
+    /// names another role.
+    fn invite(&self, ctx: &HandlerCtx<'_>) -> EdgeResponse {
         let body: InviteRequest = match parse(&ctx.request.body, "invitation") {
             Ok(body) => body,
-            Err(response) => return Ok(response),
+            Err(response) => return response,
         };
-        Ok(
-            match self.accounts.invite_member(ctx.principal, &body.email) {
-                Ok(MemberInvitation::Emailed {
-                    email,
-                    expires_at_unix,
-                }) => no_store(EdgeResponse::json(
-                    201,
-                    &json!({
+        let role = match body.role.as_deref().map(OrgRole::parse) {
+            None => OrgRole::Member,
+            Some(Some(role)) => role,
+            Some(None) => return unknown_role(),
+        };
+        respond(
+            self.accounts
+                .invite_member(ctx.principal, &body.email, role),
+            |invitation| {
+                let mut body = match invitation {
+                    MemberInvitation::Emailed {
+                        email,
+                        expires_at_unix,
+                    } => json!({
                         "delivery": "email",
                         "email": email,
                         "expires_at": expires_at_unix,
                     }),
-                )),
-                Ok(MemberInvitation::HandedOver(issued)) => no_store(EdgeResponse::json(
-                    201,
-                    &json!({
+                    MemberInvitation::HandedOver(issued) => json!({
                         "delivery": "link",
                         "url": issued.url,
                         "email": issued.email,
                         "expires_at": issued.expires_at_unix,
                     }),
-                )),
-                Err(failure) => account_error(failure),
+                };
+                body["role"] = json!(role.as_str());
+                (201, body)
             },
         )
     }
+}
+
+fn respond<T>(
+    outcome: Result<T, AccountError>,
+    ok: impl FnOnce(T) -> (u16, serde_json::Value),
+) -> EdgeResponse {
+    match outcome {
+        Ok(value) => {
+            let (status, body) = ok(value);
+            no_store(EdgeResponse::json(status, &body))
+        }
+        Err(failure) => account_error(failure),
+    }
+}
+
+fn unknown_role() -> EdgeResponse {
+    error(&EdgeError::BadRequest(
+        "role must be one of owner, admin or member".into(),
+    ))
+}
+
+fn roster_json(roster: &RosterView) -> serde_json::Value {
+    let people: Vec<_> = roster
+        .people
+        .iter()
+        .map(|person| {
+            json!({
+                "id": person.principal_id,
+                "display_name": person.display_name,
+                "email": person.email,
+                "role": person.role.as_str(),
+                "joined_at": person.joined_at_unix,
+            })
+        })
+        .collect();
+    let mut body = json!({ "role": roster.viewer.as_str(), "people": people });
+    if let Some(invitations) = &roster.invitations {
+        body["invitations"] = invitations
+            .iter()
+            .map(|invitation| {
+                json!({
+                    "id": invitation.id,
+                    "email": invitation.email,
+                    "role": invitation.role.as_str(),
+                    "expires_at": invitation.expires_at_unix,
+                })
+            })
+            .collect();
+    }
+    body
 }
