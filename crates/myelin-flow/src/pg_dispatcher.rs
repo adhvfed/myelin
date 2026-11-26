@@ -291,6 +291,21 @@ impl std::fmt::Display for PgWorkerError {
 
 impl std::error::Error for PgWorkerError {}
 
+impl PgWorkerError {
+    /// The drive's lease ended under it: the run was canceled, deleted, or reclaimed after it
+    /// expired. The store refused every write the drive attempted after that, so nothing was
+    /// committed, and whoever holds the run now decides what happens to it.
+    pub fn is_lost_lease(&self) -> bool {
+        match self {
+            Self::Store(DriveStoreError::LeaseLost) => true,
+            Self::LeaseReleaseFailed { drive, release } => {
+                *release == DriveStoreError::LeaseLost || drive.is_lost_lease()
+            }
+            _ => false,
+        }
+    }
+}
+
 impl From<DriveStoreError> for PgWorkerError {
     fn from(value: DriveStoreError) -> Self {
         Self::Store(value)
@@ -317,6 +332,8 @@ pub enum PgRunOnceOutcome {
 pub struct PgDriveBatch {
     pub driven: usize,
     pub timers_fired: usize,
+    /// Drives abandoned without committing because their lease was lost mid-drive.
+    pub lost_leases: usize,
     pub saturated: bool,
 }
 
@@ -511,16 +528,25 @@ impl PgFlowWorker {
             return Ok(PgRunOnceOutcome::Idle);
         };
 
-        match self.drive_claimed(&lease, now_unix_secs, now_rfc3339).await {
-            Ok(outcome) => Ok(outcome),
-            Err(drive) => match self.store.release_lease(&lease).await {
-                Ok(()) => Err(drive),
-                Err(release) => Err(PgWorkerError::LeaseReleaseFailed {
-                    drive: Box::new(drive),
-                    release,
-                }),
+        let drive = match self.drive_claimed(&lease, now_unix_secs, now_rfc3339).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(drive) => drive,
+        };
+        let error = match self.store.release_lease(&lease).await {
+            Ok(()) => drive,
+            Err(release) => PgWorkerError::LeaseReleaseFailed {
+                drive: Box::new(drive),
+                release,
             },
+        };
+        if error.is_lost_lease() {
+            eprintln!(
+                "flow worker {} partition {}: abandoned run {} without committing; its lease \
+                 was lost (canceled or reclaimed): {error}",
+                self.scope.tenant.0, self.scope.partition, lease.run_id,
+            );
         }
+        Err(error)
     }
 
     async fn drive_claimed(
@@ -762,11 +788,13 @@ impl PgFlowWorker {
         let mut cycles = 0;
         let mut driven = 0;
         let mut timers_fired = 0;
+        let mut lost_leases = 0;
         while cycles < max_cycles {
             if shutdown.is_some_and(|receiver| *receiver.borrow()) {
                 return Ok(PgDriveBatch {
                     driven,
                     timers_fired,
+                    lost_leases,
                     saturated: true,
                 });
             }
@@ -778,7 +806,18 @@ impl PgFlowWorker {
                 .is_some();
             timers_fired += usize::from(timer_fired);
 
-            match self.run_once_validated(now_unix_secs, now_rfc3339).await? {
+            let outcome = match self.run_once_validated(now_unix_secs, now_rfc3339).await {
+                Ok(outcome) => outcome,
+                // A lost lease ends that drive only: the run now belongs to whoever canceled
+                // or reclaimed it, and this partition keeps driving its other work.
+                Err(error) if error.is_lost_lease() => {
+                    lost_leases += 1;
+                    cycles += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match outcome {
                 PgRunOnceOutcome::Idle => {
                     if timer_fired {
                         cycles += 1;
@@ -787,6 +826,7 @@ impl PgFlowWorker {
                     return Ok(PgDriveBatch {
                         driven,
                         timers_fired,
+                        lost_leases,
                         saturated: false,
                     });
                 }
@@ -797,6 +837,7 @@ impl PgFlowWorker {
         Ok(PgDriveBatch {
             driven,
             timers_fired,
+            lost_leases,
             saturated: true,
         })
     }

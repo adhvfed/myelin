@@ -483,6 +483,113 @@ async fn a_failed_drive_never_hides_that_its_lease_could_not_be_released() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_canceled_mid_drive_ends_only_that_drive_and_commits_nothing() {
+    let _guard = TEST_LOCK.lock().await;
+    let (bare, pool, schema) = setup("cancel_mid_drive").await;
+    let mut worker = worker(&pool, "acme", "no-osl", 8, "worker-canceled");
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel::<()>();
+    let started_tx = std::sync::Mutex::new(started_tx);
+    let finish_rx = std::sync::Mutex::new(finish_rx);
+    worker
+        .register_definition("wf.cancelable", 1, "cancelable-v1", move |input, ctx| {
+            if input.run_id == "R-canceled" {
+                started_tx
+                    .lock()
+                    .expect("start sender lock")
+                    .send(())
+                    .expect("announce body start");
+                finish_rx
+                    .lock()
+                    .expect("finish receiver lock")
+                    .recv()
+                    .expect("test releases body");
+            }
+            ctx.activity(RetryPolicy { max_attempts: 1 }, |_, _| Ok(Vec::new()))
+                .map_err(|error| format!("{error:?}"))?;
+            Ok(Vec::new())
+        })
+        .unwrap();
+    seed_run(&pool, "acme", "no-osl", "R-canceled", "wf.cancelable", 0, 8).await;
+    seed_run(&pool, "acme", "no-osl", "R-next", "wf.cancelable", 0, 8).await;
+    sqlx::query(
+        "UPDATE workflow_run SET updated_at = updated_at - INTERVAL '1 minute' \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-canceled'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let worker = Arc::new(worker);
+    let batch = {
+        let worker = Arc::clone(&worker);
+        tokio::spawn(async move {
+            worker
+                .run_until_idle(8, 1_752_796_800, "2026-07-18T00:00:00Z")
+                .await
+        })
+    };
+    tokio::task::spawn_blocking(move || {
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("body started")
+    })
+    .await
+    .unwrap();
+
+    // The owner disables the automation while its run is mid-drive.
+    worker
+        .executor()
+        .cancel(
+            &myelin_flow::RunId("R-canceled".into()),
+            "automation disabled by owner",
+        )
+        .expect("cancel the leased run");
+    finish_tx.send(()).unwrap();
+
+    let batch = batch
+        .await
+        .unwrap()
+        .expect("a lost lease ends that drive, not the worker");
+    assert_eq!((batch.lost_leases, batch.driven), (1, 1));
+
+    let canceled = sqlx::query(
+        "SELECT state, cursor, last_drive_id, lease_owner FROM workflow_run \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-canceled'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(canceled.get::<String, _>("state"), "terminated");
+    assert_eq!(canceled.get::<i64, _>("cursor"), 0);
+    assert!(canceled.get::<Option<String>, _>("last_drive_id").is_none());
+    assert!(canceled.get::<Option<String>, _>("lease_owner").is_none());
+    let written: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM wf_history WHERE run_id = 'R-canceled') \
+              + (SELECT count(*) FROM wf_activity_attempt WHERE run_id = 'R-canceled')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        written, 0,
+        "the abandoned drive committed none of its effects"
+    );
+    let next: String = sqlx::query_scalar(
+        "SELECT state FROM workflow_run \
+         WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-next'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        next, "completed",
+        "the batch kept driving after the lost lease"
+    );
+
+    cleanup(bare, pool, schema).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ready_batches_fire_every_due_deadline_amid_ordinary_work() {
     let _guard = TEST_LOCK.lock().await;
     let (bare, pool, schema) = setup("timer_fairness").await;
