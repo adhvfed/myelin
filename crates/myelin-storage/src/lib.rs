@@ -316,7 +316,8 @@ pub use tenant_tx::{
     TxScope, TypedTxScope,
 };
 pub use tuple_subgraph::{
-    rebac_tuple_subgraph_migrations, SubgraphEdge, SubgraphRoots, SubgraphSubjects, TupleSubgraph,
+    rebac_tuple_subgraph_migrations, relationship_object_key_migrations, SubgraphEdge,
+    SubgraphRoots, SubgraphSubjects, TupleSubgraph,
 };
 
 pub use cell_root_durable::{

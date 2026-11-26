@@ -137,6 +137,10 @@ impl PgMigrator {
                 continue;
             }
 
+            // The one data step SQL cannot express: object keys are parsed by `myelin_refs`.
+            if m.id == crate::tuple_subgraph::CANONICALIZE_RELATIONSHIP_OBJECTS_MIGRATION_ID {
+                crate::tuple_subgraph::canonicalize_relationship_objects(&mut *conn).await?;
+            }
             conn.execute(m.ddl.as_ref())
                 .await
                 .map_err(|e| PgError::Migrate(format!("apply migration {}: {e}", m.id)))?;

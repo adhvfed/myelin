@@ -22,12 +22,16 @@ import {
   findInboxItem,
   notificationSignalEnvelope,
   readInboxPage,
+  snoozeInboxItem,
   retireSeededInbox,
   seedInbox,
 } from "../src/journeys/inbox.js";
 import { systemTestConfig } from "../src/config.js";
 import { operatorBootstrap } from "../src/operator.js";
-import { findPaged } from "../src/paging.js";
+import { string, type JsonRecord } from "../src/json.js";
+import { findPaged, walkPaged } from "../src/paging.js";
+
+const ATTENTION: Record<string, number> = { unread: 3, seen: 2, read: 1, done: 0, archived: 0 };
 
 const SEED_COUNT = 250;
 const STALE_APPROVAL_COUNT = 30;
@@ -83,8 +87,12 @@ describe.sequential("notification inbox at scale", () => {
   }, 360_000);
 
   afterAll(async () => {
-    await bus?.close();
-  });
+    if (bus !== undefined) {
+      await retireSeededInbox(bus, recipientClient, seed);
+      await bus.publish(notificationSignalEnvelope({ ...freshMention, state: "Resolved" }));
+      await bus.close();
+    }
+  }, 360_000);
 
   test("surfaces fresh work ahead of completed high-priority approvals", async () => {
     const subject = freshMention.subject;
@@ -128,5 +136,56 @@ describe.sequential("notification inbox at scale", () => {
       subject: midSubject,
     });
     expect(await findInboxItem(recipientClient, midSubject)).toEqual(walked);
+  });
+  // ~280 rows at 25 a page is a dozen pages crossing every attention band (unread, read, done)
+  // with snoozed rows held out: enough to catch a keyset that skips or repeats at a band or
+  // priority boundary. Inbox size itself is measured outside the suite.
+  test("pages every attention band in rank order without skipping or repeating", async () => {
+    const before: JsonRecord[] = [];
+    for await (const item of walkPaged(recipientClient, "/v1/notif/inbox?view=all")) {
+      before.push(item);
+    }
+    const unreadSeed = before.filter((item) =>
+      String(item.subject).startsWith(`${seedPrefix}:`) && item.state === "unread");
+    expect(unreadSeed.length).toBeGreaterThanOrEqual(30);
+    const snoozed = unreadSeed.slice(0, 10).map((item) => string(item.id, "seed id"));
+    const read = unreadSeed.slice(10, 30).map((item) => string(item.id, "seed id"));
+    const until = new Date(Date.now() + 30_000).toISOString();
+    for (const id of snoozed) await snoozeInboxItem(recipientClient, id, until);
+    for (const id of read) {
+      await recipientClient.json(`/v1/notif/inbox/${encodeURIComponent(id)}/read`, {
+        method: "POST",
+        body: {},
+        idempotencyKey: false,
+      });
+    }
+
+    const pages: JsonRecord[][] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await readInboxPage(recipientClient, cursor, 25);
+      pages.push(page.items);
+      cursor = page.nextCursor;
+    } while (cursor !== null && pages.length < 100);
+    const walked = pages.flat();
+    const ids = walked.map((item) => string(item.id, "walked id"));
+
+    expect(pages.length).toBeGreaterThanOrEqual(10);
+    expect(new Set(ids).size, "no notification repeats").toBe(ids.length);
+    expect(new Set(ids)).toEqual(
+      new Set(before.map((item) => string(item.id, "id")).filter((id) => !snoozed.includes(id))),
+    );
+    expect(new Set(walked.map((item) => item.state))).toEqual(new Set(["unread", "read", "done"]));
+    const rank = (item: JsonRecord): [number, number, number] => [
+      ATTENTION[string(item.state, "state")] ?? -1,
+      Number(item.priority),
+      Date.parse(string(item.occurred_at, "occurred_at")),
+    ];
+    for (let index = 1; index < walked.length; index += 1) {
+      const [a, b] = [rank(walked[index - 1]!), rank(walked[index]!)];
+      const order = a[0] - b[0] || a[1] - b[1] || a[2] - b[2] ||
+        (ids[index - 1]! < ids[index]! ? 1 : -1);
+      expect(order, `item ${index} ranks above the one before it`).toBeGreaterThan(0);
+    }
   });
 });

@@ -18,8 +18,8 @@ use myelin_identity_service::StoreBackedCheck;
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     identity_durable_migrations, identity_tuple_revision_migrations,
-    rebac_tuple_subgraph_migrations, DurableTupleBacking, PgStore, SubgraphRoots, SubgraphSubjects,
-    SubstrateProvider, TenantScope,
+    rebac_tuple_subgraph_migrations, relationship_object_key_migrations, DurableTupleBacking,
+    SubgraphRoots, SubgraphSubjects, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
@@ -76,6 +76,7 @@ impl Fixture {
             identity_durable_migrations(),
             identity_tuple_revision_migrations(),
             rebac_tuple_subgraph_migrations(),
+            relationship_object_key_migrations(),
         ] {
             admin
                 .migrate(&migrations, &HotTables::none())
@@ -267,33 +268,286 @@ async fn an_artifact_reference_write_is_stored_under_its_object_key() {
         Decision::Deny,
         "removing by reference removes the keyed tuple"
     );
+}
 
-    // A tuple stored under a reference spelling before writes were keyed stays revocable by
-    // that spelling.
-    let (tenant, region, legacy) = (
-        f.alice.tenant.0.clone(),
-        f.alice.region.0.clone(),
-        urn.clone(),
+/// A provider whose every connection works in `schema` (then `public`, for the RLS helpers).
+async fn schema_provider(config: myelin_config::MyelinConfig, schema: &str) -> SubstrateProvider {
+    let mut config = config;
+    let separator = if config.database_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    config.database_url = format!(
+        "{}{separator}options=-c%20search_path%3D{schema}%2Cpublic",
+        config.database_url
     );
-    f.app
-        .with_tenant_tx(&tenant.clone(), move |conn| {
-            Box::pin(async move {
-                PgStore::insert_tuple_on_conn(conn, &tenant, &region, &legacy, "reader", "p:alice")
-                    .await
-            })
-        })
+    SubstrateProvider::connect(config, 4)
         .await
-        .expect("seed a reference-spelled tuple");
-    assert_eq!(f.check(&urn), Decision::Allow);
-    f.write(&[TupleDelta::Remove(tuple(&urn, "reader", "p:alice"))]);
-    assert_eq!(
-        f.check(&urn),
-        Decision::Deny,
-        "removing by the stored spelling revokes it"
+        .expect("connect inside the test schema")
+}
+
+/// An empty schema holding the relationship tables as they stood before object keys were
+/// enforced, so legacy spellings can be written the way older code wrote them.
+async fn legacy_relationship_schema() -> (sqlx::PgPool, String, SubstrateProvider, SubstrateProvider)
+{
+    let bare = sqlx::PgPool::connect(&common::admin_database_config().database_url)
+        .await
+        .expect("connect as the migration role");
+    let schema = format!("object_keys_{}", suffix());
+    sqlx::raw_sql(&format!(
+        "CREATE SCHEMA {schema} AUTHORIZATION myelin_admin;
+         GRANT USAGE ON SCHEMA {schema} TO myelin_app;
+         ALTER DEFAULT PRIVILEGES FOR ROLE myelin_admin IN SCHEMA {schema}
+           GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO myelin_app;"
+    ))
+    .execute(&bare)
+    .await
+    .expect("create the test schema");
+    let admin = schema_provider(common::admin_database_config(), &schema).await;
+    for migrations in [
+        identity_durable_migrations(),
+        identity_tuple_revision_migrations(),
+        rebac_tuple_subgraph_migrations(),
+    ] {
+        admin
+            .migrate(&migrations, &HotTables::none())
+            .await
+            .expect("pre-key relationship schema");
+    }
+    let app = schema_provider(common::app_database_config(), &schema).await;
+    (bare, schema, admin, app)
+}
+
+async fn insert_legacy(
+    admin: &SubstrateProvider,
+    tenant: &str,
+    region: &str,
+    rows: &[(&str, &str, &str, Option<&str>)],
+    revisions: &[(&str, i64)],
+) {
+    let pool = admin.db_pool();
+    let mut conn = pool.acquire().await.expect("admin connection");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *conn)
+    .await
+    .expect("scope the legacy writes");
+    for (object, relation, subject, expires_at) in rows {
+        sqlx::query(
+            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6::timestamptz)",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(object)
+        .bind(relation)
+        .bind(subject)
+        .bind(expires_at)
+        .execute(&mut *conn)
+        .await
+        .expect("write a legacy tuple");
+    }
+    for (object, revision) in revisions {
+        sqlx::query(
+            "INSERT INTO rebac_object_revision (tenant_id, region, object_id, revision) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(object)
+        .bind(revision)
+        .execute(&mut *conn)
+        .await
+        .expect("write a legacy revision");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_legacy_reference_spelled_exclusion_is_migrated_and_denies() {
+    let (bare, schema, admin, app) = legacy_relationship_schema().await;
+    let region = app.config().region.clone();
+    let tenant = format!("legacy-{}", suffix());
+    let alice = Principal::new(
+        TenantId(tenant.clone()),
+        Region(region.clone()),
+        PrincipalId("p:alice".into()),
+        PrincipalKind::Human,
+        DataRole::Controller,
+        PrincipalStatus::Active,
     );
-    assert!(f
-        .tuples
-        .tuples_in(&f.scope)
-        .expect("whole tenant reads")
-        .is_empty());
+    let secret = format!("myelin://{tenant}/issue/issue/secret");
+    let dup = format!("myelin://{tenant}/issue/issue/dup");
+    insert_legacy(
+        &admin,
+        &tenant,
+        &region,
+        &[
+            ("project:proj", "reader", "p:alice", None),
+            ("issue:secret", "parent_project", "project:proj#view", None),
+            (&secret, "confidential", "p:alice", None),
+            (
+                "issue:dup",
+                "watcher",
+                "p:alice",
+                Some("2030-01-01T00:00:00Z"),
+            ),
+            (&dup, "watcher", "p:alice", None),
+        ],
+        &[("issue:secret", 3), (&secret, 7)],
+    )
+    .await;
+
+    let check = StoreBackedCheck::new(TupleStore::with_pg(
+        DurableTupleBacking::new(app.clone()),
+        tokio::runtime::Handle::current(),
+    ));
+    for admit in check.admit_issue_fragment() {
+        assert!(matches!(
+            admit,
+            myelin_identity::FragmentAdmit::Admitted { .. }
+        ));
+    }
+    let view = |check: &StoreBackedCheck| {
+        check
+            .check(
+                &alice,
+                &Permission("view".into()),
+                &ArtifactRef("issue:secret".into()),
+                &strong(),
+                None,
+            )
+            .expect("check evaluates")
+    };
+    assert_eq!(
+        view(&check),
+        Decision::Allow,
+        "before the migration the reference-spelled `confidential` row is not read, so the \
+         exclusion fails open - the gap the migration closes"
+    );
+
+    admin
+        .migrate(&relationship_object_key_migrations(), &HotTables::none())
+        .await
+        .expect("legacy spellings are rewritten and the key constraints validate");
+    assert_eq!(
+        view(&check),
+        Decision::Deny,
+        "the migrated `confidential` row subtracts the inherited view"
+    );
+
+    let mut conn = admin.db_pool().acquire().await.unwrap();
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    let objects: Vec<(String, String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT object_id, relation, expires_at FROM rebac_tuple ORDER BY object_id, relation",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(
+        objects
+            .iter()
+            .map(|(object, relation, expires)| (
+                object.as_str(),
+                relation.as_str(),
+                expires.is_some()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("issue:dup", "watcher", false),
+            ("issue:secret", "confidential", false),
+            ("issue:secret", "parent_project", false),
+            ("project:proj", "reader", false),
+        ],
+        "colliding spellings merge, keeping the longer (never-expiring) lifetime"
+    );
+    let revisions: Vec<(String, i64)> =
+        sqlx::query_as("SELECT object_id, revision FROM rebac_object_revision")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+    assert_eq!(revisions, vec![("issue:secret".to_string(), 7)]);
+    let validated: Vec<bool> = sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conname IN ('rebac_tuple_object_is_key', 'rebac_object_revision_object_is_key') \
+           AND connamespace = (SELECT oid FROM pg_namespace WHERE nspname = $1)",
+    )
+    .bind(&schema)
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap();
+    assert_eq!(validated, vec![true, true]);
+
+    // The constraint and the Rust rule agree on every shape, whitespace included.
+    for object in [
+        "repo:core",
+        "team/app",
+        "foo://bar",
+        "\u{200b}x",
+        "\u{180e}x",
+        "x y",
+        " repo:core",
+        "repo:core ",
+        "repo:core\u{3000}",
+        "\u{a0}x",
+        "x\u{85}",
+        "\tx",
+        "a#b",
+        "myelin://t/git/repo/x",
+        "",
+    ] {
+        let stored = sqlx::query(
+            "INSERT INTO rebac_tuple (tenant_id, region, object_id, relation, subject) \
+             VALUES ($1, $2, $3, 'probe', 'p:probe')",
+        )
+        .bind(&tenant)
+        .bind(&region)
+        .bind(object)
+        .execute(&mut *conn)
+        .await
+        .is_ok();
+        assert_eq!(
+            stored,
+            myelin_storage::tuple_subgraph::is_canonical_tuple_object(object),
+            "{object:?}"
+        );
+    }
+    drop(conn);
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&bare)
+        .await
+        .expect("remove the test schema");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relationship_object_without_a_key_stops_the_migration() {
+    let (bare, schema, admin, app) = legacy_relationship_schema().await;
+    let tenant = format!("keyless-{}", suffix());
+    insert_legacy(
+        &admin,
+        &tenant,
+        &app.config().region.clone(),
+        &[("#anchor-only", "reader", "p:alice", None)],
+        &[],
+    )
+    .await;
+    let refused = admin
+        .migrate(&relationship_object_key_migrations(), &HotTables::none())
+        .await
+        .expect_err("a row no check can find is reported, not guessed at");
+    assert!(refused.to_string().contains("no key"), "{refused}");
+    sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&bare)
+        .await
+        .expect("remove the test schema");
 }

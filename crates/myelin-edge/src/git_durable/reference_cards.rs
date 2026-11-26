@@ -324,11 +324,41 @@ impl DurableGitBackend {
             return Ok(BTreeSet::new());
         }
         let viewer = Self::pseudonym(principal.tenant.as_str(), principal);
-        Ok(self
-            .reference_card_pr_records(principal, &coordinates)?
+        let records = match &self.pg_prs {
+            Some(store) => {
+                let scope = TenantScope::from_verified_token(principal, principal.region.clone());
+                store.get_each(&scope, &coordinates)?
+            }
+            None => coordinates
+                .iter()
+                .filter_map(|(repository, number)| {
+                    let loc = Self::loc(
+                        principal.tenant.as_str(),
+                        principal.region.as_str(),
+                        repository,
+                    );
+                    self.prs
+                        .get(&loc, *number)
+                        .transpose()
+                        .map(|record| ((repository.clone(), *number), record))
+                })
+                .collect(),
+        };
+        // One record that cannot be read must not hide the others: skip it alone.
+        Ok(records
             .into_iter()
-            .filter(|(_, record)| record.has_review_relationship_with(&viewer))
-            .map(|(coordinate, _)| coordinate)
+            .filter_map(|(coordinate, record)| match record {
+                Ok(record) => record
+                    .has_review_relationship_with(&viewer)
+                    .then_some(coordinate),
+                Err(error) => {
+                    eprintln!(
+                        "review relationship: skipping unreadable pull request {}#{}: {error}",
+                        coordinate.0, coordinate.1
+                    );
+                    None
+                }
+            })
             .collect())
     }
 

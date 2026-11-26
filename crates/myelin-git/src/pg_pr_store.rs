@@ -228,6 +228,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_auto_merge_queue_idx
   WHERE record->>'state' = 'Open' AND record->'auto_merge' IS NOT NULL
 "#;
 
+/// Each read pull request's coordinate with its record, or why that one record did not decode.
+pub type PrBatchRecords = Vec<((String, u64), Result<PrRecord, DurableError>)>;
+
 pub fn git_pr_migrations() -> Migrations {
     Migrations::of([
         Migration::plain_on(
@@ -1176,6 +1179,19 @@ impl PgPrStore {
         scope: &TenantScope,
         coordinates: &[(String, u64)],
     ) -> Result<Vec<(String, PrRecord)>, DurableError> {
+        self.get_each(scope, coordinates)?
+            .into_iter()
+            .map(|((repo, _), record)| record.map(|record| (repo, record)))
+            .collect()
+    }
+
+    /// `get_many`, but each record decodes on its own: one undecodable record is returned as its
+    /// own error instead of failing the whole read.
+    pub fn get_each(
+        &self,
+        scope: &TenantScope,
+        coordinates: &[(String, u64)],
+    ) -> Result<PrBatchRecords, DurableError> {
         let cell = self.scoped_cell(scope)?;
         let coordinates = normalize_pr_batch_coordinates(coordinates)?;
         if coordinates.is_empty() {
@@ -1195,7 +1211,8 @@ impl PgPrStore {
                     .with_tenant_tx(&transaction_tenant.clone(), move |conn| {
                         Box::pin(async move {
                             let read_sql = format!(
-                                "SELECT pr.repo_slug AS requested_repo_slug, {PR_RECORD_COLUMNS} \
+                                "SELECT pr.repo_slug AS requested_repo_slug, pr.number AS requested_number, \
+                                 {PR_RECORD_COLUMNS} \
                                  FROM git_pr AS pr \
                                  JOIN unnest($3::text[], $4::bigint[]) \
                                    AS requested(repo_slug, number) \
@@ -1219,11 +1236,16 @@ impl PgPrStore {
             .map_err(pg_error)?;
         rows.into_iter()
             .map(|row| {
-                let repo = row
+                let repo: String = row
                     .try_get("requested_repo_slug")
                     .map_err(|_| DurableError::Io("PR batch repository malformed".into()))?;
-                let record = decode_record(&kms, &crypto_region, &expected_tenant, row)?;
-                Ok((repo, record))
+                let number = row
+                    .try_get::<i64, _>("requested_number")
+                    .ok()
+                    .and_then(|number| u64::try_from(number).ok())
+                    .ok_or_else(|| DurableError::Io("PR batch number malformed".into()))?;
+                let record = decode_record(&kms, &crypto_region, &expected_tenant, row);
+                Ok(((repo, number), record))
             })
             .collect()
     }
@@ -6203,6 +6225,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(ledger_rows, 1);
+
+        sqlx::query(
+            "UPDATE git_pr SET record = record || '{\"state\":\"NotAState\"}'::jsonb \
+             WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=2",
+        )
+        .bind(&tenant_a)
+        .bind(&region)
+        .bind(repo)
+        .execute(&admin)
+        .await
+        .unwrap();
+        let pair = [(repo.to_string(), 2), (repo.to_string(), 3)];
+        let each = store.get_each(&scope_a, &pair).unwrap();
+        assert_eq!(each.len(), 2);
+        assert!(
+            each[0].0 == (repo.to_string(), 2) && each[0].1.is_err(),
+            "the undecodable record fails alone"
+        );
+        assert!(each[1].0 == (repo.to_string(), 3) && each[1].1.is_ok());
+        assert!(
+            store.get_many(&scope_a, &pair).is_err(),
+            "the all-or-nothing read still refuses a batch it cannot fully decode"
+        );
 
         sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant'=$1")
             .bind(&tenant_a)

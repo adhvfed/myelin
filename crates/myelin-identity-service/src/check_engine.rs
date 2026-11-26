@@ -129,9 +129,13 @@ impl CheckEngine {
     }
 }
 
-/// Userset hops a check can take: relation rewrites nest up to `MAX_RULE_DEPTH`, and each
-/// direct check beneath them follows up to `MAX_REWRITE_DEPTH` usersets.
-pub(crate) const SUBGRAPH_MAX_HOPS: usize = MAX_REWRITE_DEPTH + crate::namespace::MAX_RULE_DEPTH;
+/// The furthest a check can read from the object it asks about. Rewrites move to a parent
+/// object at most `MAX_RULE_DEPTH` times (they evaluate up to and including that depth), and the
+/// direct check at the last one reads objects at userset depths `0..MAX_REWRITE_DEPTH`, which is
+/// `MAX_REWRITE_DEPTH - 1` further hops. Expansion reaches only `MAX_RULE_DEPTH`. A graph that
+/// reaches beyond this is refused rather than read short.
+pub(crate) const SUBGRAPH_MAX_HOPS: usize =
+    crate::namespace::MAX_RULE_DEPTH + (MAX_REWRITE_DEPTH - 1);
 
 pub(crate) struct CheckSnapshot {
     by_object: HashMap<String, Vec<SnapTuple>>,
@@ -170,7 +174,7 @@ impl CheckSnapshot {
             None => return Decision::Deny,
         };
 
-        let mut memo: HashMap<MemoKey, bool> = HashMap::new();
+        let mut memo = HashMap::new();
         let granted = self.has_relation(
             &subject.principal_id.0,
             &permission.0,
@@ -235,13 +239,16 @@ struct SnapTuple {
 }
 
 impl CheckSnapshot {
+    /// Memoises per question with the depth it was answered at. A grant holds at any depth; a
+    /// denial computed deeper may only reflect the depth bound, so it is reused only at the same
+    /// depth or deeper. That makes the answer independent of the order tuples are visited in.
     fn has_relation(
         &self,
         subject: &str,
         relation: &str,
         object: &str,
         depth: usize,
-        memo: &mut HashMap<MemoKey, bool>,
+        memo: &mut HashMap<MemoKey, (bool, usize)>,
     ) -> bool {
         if depth >= MAX_REWRITE_DEPTH {
             return false;
@@ -252,10 +259,12 @@ impl CheckSnapshot {
             relation: relation.to_string(),
             object: object.to_string(),
         };
-        if let Some(&hit) = memo.get(&key) {
-            return hit;
+        match memo.get(&key) {
+            Some((true, _)) => return true,
+            Some((false, answered_at)) if *answered_at <= depth => return false,
+            _ => {}
         }
-        memo.insert(key.clone(), false);
+        memo.insert(key.clone(), (false, depth));
 
         let mut granted = false;
         if let Some(tuples) = self.by_object.get(object) {
@@ -268,7 +277,7 @@ impl CheckSnapshot {
                     break;
                 }
                 if let Some((obj2, rel2)) = parse_userset(&t.subject) {
-                    if self.has_relation(subject, rel2, obj2, depth + 1, memo) {
+                    if self.has_relation(subject, rel2, &tuple_object_key(obj2), depth + 1, memo) {
                         granted = true;
                         break;
                     }
@@ -276,7 +285,7 @@ impl CheckSnapshot {
             }
         }
 
-        memo.insert(key, granted);
+        memo.insert(key, (granted, depth));
         granted
     }
 }
@@ -350,6 +359,7 @@ fn lower_operand(caveat: &CaveatContext, base: &str) -> Option<Expr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tuple_store::{TupleGraph, TupleReadError};
     use myelin_events::{OutboxStore, Timestamp};
     use myelin_identity::{
         FieldId, ObjectId, PrincipalId, PrincipalKind, RelationTuple, TupleDelta,
@@ -592,6 +602,105 @@ mod tests {
         );
     }
 
+    fn chain(length: usize) -> Vec<TupleDelta> {
+        let mut deltas = (0..length)
+            .map(|i| add(&format!("level:{i}"), "m", &format!("level:{}#m", i + 1)))
+            .collect::<Vec<_>>();
+        deltas.push(add(&format!("level:{length}"), "m", "p:deep"));
+        deltas
+    }
+
+    fn chain_read(length: usize) -> Result<TupleGraph, TupleReadError> {
+        let s = scope("acme");
+        let store = TupleStore::new(OutboxStore::new());
+        store
+            .write_tuples(&s, &subject("p-admin"), &chain(length), None, None, now())
+            .expect("seed the chain");
+        store.subgraph_in(
+            &s,
+            SubgraphRoots::Objects(vec!["level:0".into()]),
+            SubgraphSubjects::Only("p:deep".into()),
+            SUBGRAPH_MAX_HOPS,
+        )
+    }
+
+    #[test]
+    fn a_read_reaches_exactly_as_far_as_a_check_can_evaluate() {
+        assert_eq!(SUBGRAPH_MAX_HOPS, 31);
+        let graph = chain_read(SUBGRAPH_MAX_HOPS).expect("a 31-hop chain is read whole");
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.object == "level:31" && edge.subject == "p:deep"),
+            "the grant at the furthest evaluable object is read"
+        );
+        assert_eq!(graph.edges.len(), SUBGRAPH_MAX_HOPS + 1);
+    }
+
+    #[test]
+    fn a_graph_deeper_than_a_check_can_evaluate_is_refused_not_shortened() {
+        let refused = chain_read(SUBGRAPH_MAX_HOPS + 1)
+            .err()
+            .expect("a 32-hop chain is refused");
+        assert!(refused
+            .to_string()
+            .contains(myelin_storage::tuple_subgraph::TOO_DEEP));
+        let s = scope("acme");
+        let mut deltas = chain(SUBGRAPH_MAX_HOPS + 1);
+        deltas.push(add("level:0", "m", "p:shallow"));
+        let eng = engine_with(&s, &deltas);
+        assert_eq!(
+            eng.check(
+                &s,
+                &subject("p:shallow"),
+                &RelName("m".into()),
+                &ArtifactRef("level:0".into()),
+                &latest(),
+                None,
+            ),
+            Decision::Deny,
+            "the whole check fails closed, even for a grant that is near"
+        );
+    }
+
+    #[test]
+    fn a_denial_at_the_depth_bound_is_not_reused_nearer_the_root() {
+        // `top` reaches `x` both through a long chain (where the grant behind `x` falls past the
+        // depth bound) and directly. Visiting the chain first must not leave a false behind.
+        let near_bound = MAX_REWRITE_DEPTH - 3;
+        let mut by_object: HashMap<String, Vec<SnapTuple>> = HashMap::new();
+        let mut link = |object: String, subject: String| {
+            by_object.entry(object).or_default().push(SnapTuple {
+                relation: "m".into(),
+                subject,
+            });
+        };
+        link("top".into(), "c:1#m".into());
+        link("top".into(), "x#m".into());
+        for i in 1..near_bound {
+            link(format!("c:{i}"), format!("c:{}#m", i + 1));
+        }
+        link(format!("c:{near_bound}"), "x#m".into());
+        link("x".into(), "y#m".into());
+        link("y".into(), "z#m".into());
+        link("z".into(), "p:alice".into());
+        let view = CheckSnapshot {
+            by_object,
+            zookie: Zookie(String::new()),
+            subject: None,
+        };
+        assert_eq!(
+            view.check(
+                &subject("p:alice"),
+                &RelName("m".into()),
+                &ArtifactRef("top".into()),
+                None
+            ),
+            Decision::Allow
+        );
+    }
+
     #[test]
     fn check_is_depth_bounded() {
         let s = scope("acme");
@@ -675,7 +784,7 @@ mod tests {
                 ["top".to_string()],
             )
             .expect("relationship snapshot");
-        let mut memo: HashMap<MemoKey, bool> = HashMap::new();
+        let mut memo = HashMap::new();
         let granted = view.has_relation("p:alice", "m", "top", 0, &mut memo);
         assert!(granted, "the diamond grants");
         let base_key = MemoKey {
@@ -684,8 +793,8 @@ mod tests {
             object: "base".into(),
         };
         assert_eq!(
-            memo.get(&base_key),
-            Some(&true),
+            memo.get(&base_key).map(|(granted, _)| *granted),
+            Some(true),
             "the convergent subproblem was memoised (computed once, reused on the second arm)"
         );
     }

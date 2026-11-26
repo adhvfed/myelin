@@ -4,6 +4,32 @@ A running log of autonomous product work: what changed, why, and what the
 evidence was. Newest entries first. Every entry names its proof — if a claim
 here has no test or drill behind it, treat it as wrong.
 
+## 2026-11-26 — Relationship objects are stored only under their key
+
+The subgraph read fetches an object by its key, so a tuple stored under another spelling (an
+artifact reference, an anchored or padded id) was invisible to it. Under an exclusion such as
+`confidential` that fails open.
+
+- `rebac_tuple` and `rebac_object_revision` carry a check constraint that every object is its own
+  key. Migration `0196` rewrites older rows to their keys first (merging rows that meet: the
+  longer lifetime, the higher revision), then validates the constraint, so boot refuses while any
+  row is left. A row with no key at all stops the migration instead of being guessed at.
+- Writes in both stores key their objects or refuse them, so the in-memory store sees what the
+  durable one sees.
+- A relationship graph deeper than a check can evaluate (31 hops, derived from the evaluator's
+  depth bounds) is refused instead of read short. The direct-check memo reuses a denial only at
+  the same depth or deeper, and hops come back in key order, so answers no longer depend on
+  visit order.
+- One undecodable pull request no longer hides every review request on an inbox page, and an
+  issue key can never take over another issue's id.
+
+Proof: `integration_check_subgraph_durable` writes a reference-spelled `confidential` row the old
+way, shows the inherited view allowed, migrates, and shows it denied. It also checks that the SQL
+constraint and the Rust rule agree on padded, anchored and Unicode-whitespace objects, and that a
+keyless row stops the migration. Unit tests cover the 31- and 32-hop chains and the depth-bound
+memo; each fails with its fix removed. A new system test shows a fresh recipient only the
+issue and pull request it can read, with an unreadable issue, pull request and CI run hidden.
+
 ## 2026-11-26 — Permission checks read only what they can reach; the inbox reads a page at once
 
 Every permission check loaded all of its tenant's relationship tuples and rebuilt a lookup map.

@@ -1,4 +1,10 @@
+import { randomUUID } from "node:crypto";
+
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+
+import { SystemTestClient } from "../src/client.js";
+import { awaitAuthorizedIssue } from "../src/issues.js";
+import { operatorBootstrap } from "../src/operator.js";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { ExternalEventBus } from "../src/event-bus.js";
@@ -13,8 +19,24 @@ import {
   readInboxPage,
   snoozeInboxItem,
 } from "../src/journeys/inbox.js";
-import { string } from "../src/json.js";
+import { record, string } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
+
+async function createIssue(projectId: string, title: string): Promise<string> {
+  const created = await systemClient.json("/v1/issues", {
+    method: "POST",
+    body: { project_id: projectId, title: uniqueName(title) },
+    idempotencyKey: randomUUID(),
+    expectedStatus: 202,
+  });
+  const authorization = record(created.body.authorization, "issue authorization");
+  const issue = await awaitAuthorizedIssue(
+    systemClient,
+    string(authorization.request_event_id, "issue authorization id"),
+    "the issue to become visible work",
+  );
+  return string(issue.key, "issue key");
+}
 
 describe.sequential("notification delivery lifecycle", () => {
   const slug = uniqueName("system-notif");
@@ -281,5 +303,61 @@ describe.sequential("notification delivery lifecycle", () => {
       cursors.add(cursor);
     }
     expect(foundSubjects).toEqual(new Set(subjects));
+  });
+  test("shows only the notifications whose subjects the recipient can read", async () => {
+    const recipient = uniqueName("inbox-reader");
+    const recipientClient = new SystemTestClient({
+      ...systemTestConfig,
+      token: await operatorBootstrap(systemTestConfig.tenant, recipient, "Inbox Reader"),
+      principal: recipient,
+    });
+    const ownSlug = uniqueName("reader-own");
+    await new GitProject(ownSlug, recipientClient).create();
+
+    // The recipient reads the shared Issues project (the operator bootstrap grants it) and
+    // nothing systemClient keeps to itself.
+    const readableIssue = await createIssue(systemTestConfig.issues.projectId, "Shared work");
+    const privateProject = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: {
+        name: uniqueName("Private project"),
+        issue_prefix: `P${randomUUID().replaceAll("-", "").slice(0, 8).toUpperCase()}`,
+      },
+      idempotencyKey: randomUUID(),
+      expectedStatus: 201,
+    });
+    const unreadableIssue = await createIssue(
+      string(record(privateProject.body.project, "private project").id, "private project id"),
+      "Private work",
+    );
+    const issueSubject = (key: string) =>
+      `myelin://${systemTestConfig.tenant}/issue/issue/${key}`;
+
+    const unreadable = [
+      pullRequestSubject(slug, 41),
+      issueSubject(unreadableIssue),
+      `myelin://${systemTestConfig.tenant}/ci/run/${randomUUID()}`,
+    ];
+    const readable = [pullRequestSubject(ownSlug, 1), issueSubject(readableIssue)];
+    // Hidden items are published first: the router delivers in order, so once the later
+    // readable items are visible the hidden ones have been written too.
+    for (const subject of [...unreadable, ...readable]) {
+      await bus.publish(notificationSignalEnvelope({
+        actor: systemTestConfig.principal,
+        recipient,
+        dedupKey: `visibility-${randomUUID()}`,
+        subject,
+      }));
+    }
+
+    const page = await eventually(async () => {
+      const current = await readInboxPage(recipientClient, null, 100);
+      const subjects = current.items.map((item) => string(item.subject, "inbox subject"));
+      return readable.every((subject) => subjects.includes(subject)) ? subjects : undefined;
+    }, { description: "the readable notifications to reach a fresh recipient" });
+    expect(new Set(page)).toEqual(new Set(readable));
+    for (const subject of unreadable) {
+      expect(await findInboxItem(recipientClient, subject)).toBeUndefined();
+    }
   });
 });

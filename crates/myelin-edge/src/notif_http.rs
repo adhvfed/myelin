@@ -121,14 +121,7 @@ impl DurableNotifHttpApi {
                 })
             },
         ))?;
-        let mut objects = HashMap::new();
-        for (id, _) in &rows {
-            objects.insert(id.to_string(), ArtifactRef(format!("issue:{id}")));
-        }
-        for (id, key) in rows {
-            objects.insert(key, ArtifactRef(format!("issue:{id}")));
-        }
-        Ok(objects)
+        Ok(issue_objects_by_reference(rows))
     }
 
     fn run_repositories(
@@ -153,7 +146,7 @@ impl DurableNotifHttpApi {
             .map_err(|_| PgInboxError::Database)
     }
 
-    /// A pull request that cannot be read stays hidden, so a failed read hides it too.
+    /// A pull request that cannot be read is hidden; only a failed batch read hides them all.
     fn reviewing(&self, principal: &Principal, needs: &[ReadNeed]) -> BTreeSet<(String, u64)> {
         let coordinates = needs
             .iter()
@@ -168,8 +161,27 @@ impl DurableNotifHttpApi {
             .collect::<Vec<_>>();
         self.git
             .pull_requests_reviewed_by(principal, &coordinates)
-            .unwrap_or_default()
+            .unwrap_or_else(|error| {
+                eprintln!("notification inbox: review relationships unavailable: {error}");
+                BTreeSet::new()
+            })
     }
+}
+
+/// Maps the references an inbox names issues by (an id, or a key) to the issue they name. An id
+/// always names its own issue: a key that happens to spell another issue's id never takes it
+/// over, matching how Issues events name issues by id.
+fn issue_objects_by_reference(rows: Vec<(Uuid, String)>) -> HashMap<String, ArtifactRef> {
+    let mut objects = rows
+        .iter()
+        .map(|(id, _)| (id.to_string(), ArtifactRef(format!("issue:{id}"))))
+        .collect::<HashMap<_, _>>();
+    for (id, key) in rows {
+        objects
+            .entry(key)
+            .or_insert_with(|| ArtifactRef(format!("issue:{id}")));
+    }
+    objects
 }
 
 /// What showing one inbox item to its recipient takes.
@@ -1094,6 +1106,21 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn an_issue_key_never_takes_over_another_issues_id() {
+        let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        for rows in [
+            vec![(a, b.to_string()), (b, "MYL-2".to_string())],
+            vec![(b, "MYL-2".to_string()), (a, b.to_string())],
+        ] {
+            let objects = issue_objects_by_reference(rows);
+            assert_eq!(objects[&b.to_string()], ArtifactRef(format!("issue:{b}")));
+            assert_eq!(objects[&a.to_string()], ArtifactRef(format!("issue:{a}")));
+            assert_eq!(objects["MYL-2"], ArtifactRef(format!("issue:{b}")));
+        }
     }
 
     #[test]

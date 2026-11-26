@@ -275,6 +275,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::identity_durable::human_session_migrations(),
         crate::work_wake::agent_trigger_work_wake_migrations(),
         crate::tuple_subgraph::rebac_tuple_subgraph_migrations(),
+        crate::tuple_subgraph::relationship_object_key_migrations(),
     ]
 }
 

@@ -8,8 +8,9 @@ use myelin_events::{
 use myelin_events::{EmitContextBase, OutboxStore, OutboxTransaction, OutboxTx};
 use myelin_identity::iam_events::IDENTITY_TUPLE_WRITTEN;
 use myelin_identity::{DataRole, Precondition, Principal, RelationTuple, TupleDelta, Zookie};
+use myelin_storage::tuple_subgraph::canonical_tuple_object;
 #[cfg(any(test, feature = "test-support"))]
-use myelin_storage::tuple_subgraph::{tuple_object_key, SubgraphFrontier};
+use myelin_storage::tuple_subgraph::{SubgraphFrontier, TOO_DEEP};
 use myelin_storage::{
     SubgraphEdge, SubgraphRoots, SubgraphSubjects, TenantQuery, TenantScope, TenantTable,
 };
@@ -66,6 +67,7 @@ pub enum WriteError {
     InvalidExpiry { detail: &'static str },
     PreconditionFailed { expected: Zookie, actual: Zookie },
     CrossTenant { detail: String },
+    InvalidObject { object: String },
     CommitFailed(String),
 }
 
@@ -85,6 +87,10 @@ impl core::fmt::Display for WriteError {
                 f,
                 "write_tuples rejected a cross-tenant relationship write: {detail} (there is no cross-tenant \
                  tuple and no cross-tenant query path, identity §6)"
+            ),
+            WriteError::InvalidObject { object } => write!(
+                f,
+                "write_tuples rejected object {object:?}: it has no key a check could find it by"
             ),
             WriteError::CommitFailed(why) => {
                 write!(
@@ -268,13 +274,14 @@ impl TupleStore {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
+                let key = canonical_tuple_object(object);
                 let inner = Self::mem_lock(inner_arc);
                 Ok(inner
                     .partitions
                     .get(&part_key)
                     .and_then(|p| {
                         p.values()
-                            .filter(|t| t.tuple.object.0 == object)
+                            .filter(|t| Some(&t.tuple.object.0) == key.as_ref())
                             .max_by(|a, b| a.zookie.0.cmp(&b.zookie.0))
                             .map(|t| t.zookie.clone())
                     })
@@ -382,7 +389,7 @@ impl TupleStore {
                 let zookie = self.current_zookie();
                 drop(inner);
                 Ok(TupleGraph {
-                    edges: memory_subgraph(live, &roots, &subjects, max_hops),
+                    edges: memory_subgraph(live, &roots, &subjects, max_hops)?,
                     zookie,
                 })
             }
@@ -431,6 +438,7 @@ impl TupleStore {
             lifetime.expires_at.as_ref(),
             &lifetime.occurred_at,
         )?;
+        let deltas = &keyed_deltas(deltas)?;
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             TupleBackend::Memory(inner_arc) => {
@@ -776,15 +784,37 @@ impl TupleDeltaObject for RelationTuple {
     }
 }
 
-/// The in-memory twin of the durable subgraph read: the same walk over the same live tuples.
-/// Stored objects are matched by key, as the durable store keys them on write.
+/// The deltas with every object at the key it is stored and read under, in both backends.
+fn keyed_deltas(deltas: &[TupleDelta]) -> Result<Vec<TupleDelta>, WriteError> {
+    deltas
+        .iter()
+        .map(|delta| {
+            let (tuple, rebuild): (&RelationTuple, fn(RelationTuple) -> TupleDelta) = match delta {
+                TupleDelta::Add(tuple) => (tuple, TupleDelta::Add),
+                TupleDelta::Remove(tuple) => (tuple, TupleDelta::Remove),
+            };
+            let object = canonical_tuple_object(&tuple.object.0).ok_or_else(|| {
+                WriteError::InvalidObject {
+                    object: tuple.object.0.clone(),
+                }
+            })?;
+            Ok(rebuild(RelationTuple {
+                object: myelin_identity::ObjectId(object),
+                ..tuple.clone()
+            }))
+        })
+        .collect()
+}
+
+/// The in-memory twin of the durable subgraph read: the same walk over the same live tuples,
+/// which `write_tuples` keyed exactly as the durable store keys them.
 #[cfg(any(test, feature = "test-support"))]
 fn memory_subgraph(
     live: Vec<SubgraphEdge>,
     roots: &SubgraphRoots,
     subjects: &SubgraphSubjects,
     max_hops: usize,
-) -> Vec<SubgraphEdge> {
+) -> Result<Vec<SubgraphEdge>, TupleReadError> {
     let keeps = |edge: &SubgraphEdge| match subjects {
         SubgraphSubjects::All => true,
         SubgraphSubjects::Only(subject) => {
@@ -792,19 +822,15 @@ fn memory_subgraph(
                 || myelin_storage::tuple_subgraph::userset_object(&edge.subject).is_some()
         }
     };
-    let mut by_object: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut by_object: HashMap<&str, Vec<usize>> = HashMap::new();
     for (index, edge) in live.iter().enumerate() {
-        let key = tuple_object_key(&edge.object);
-        if key != edge.object {
-            by_object
-                .entry(edge.object.clone())
-                .or_default()
-                .push(index);
-        }
-        by_object.entry(key).or_default().push(index);
+        by_object
+            .entry(edge.object.as_str())
+            .or_default()
+            .push(index);
     }
-    let mut taken = vec![false; live.len()];
     let mut frontier = SubgraphFrontier::default();
+    let mut distances_read = 0;
     let mut hop: Vec<usize> = Vec::new();
     match roots {
         SubgraphRoots::Objects(objects) => {
@@ -815,33 +841,35 @@ fn memory_subgraph(
         SubgraphRoots::ObjectType(object_type) => {
             let prefix = format!("{object_type}:");
             for (index, edge) in live.iter().enumerate() {
-                let key = tuple_object_key(&edge.object);
-                if (key.starts_with(&prefix) || key == *object_type) && keeps(edge) {
+                if (edge.object.starts_with(&prefix) || edge.object == *object_type) && keeps(edge)
+                {
                     frontier.mark_read(&edge.object);
-                    taken[index] = true;
                     hop.push(index);
                 }
             }
+            distances_read = 1;
         }
     }
     let mut edges = Vec::new();
-    for _ in 0..=max_hops {
+    loop {
         frontier.push_usersets(hop.iter().map(|index| live[*index].subject.as_str()));
         edges.extend(hop.drain(..).map(|index| live[index].clone()));
         let objects = frontier.take();
         if objects.is_empty() {
-            break;
+            return Ok(edges);
         }
+        if distances_read > max_hops {
+            return Err(TupleReadError(TOO_DEEP.into()));
+        }
+        distances_read += 1;
         for object in objects {
-            for index in by_object.get(&object).into_iter().flatten() {
-                if !taken[*index] && keeps(&live[*index]) {
-                    taken[*index] = true;
+            for index in by_object.get(object.as_str()).into_iter().flatten() {
+                if keeps(&live[*index]) {
                     hop.push(*index);
                 }
             }
         }
     }
-    edges
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -951,6 +979,62 @@ mod tests {
             Zookie("zk-00000000000000000000".into())
         );
         assert_eq!(outbox.outbox_depth(), 0);
+    }
+
+    #[test]
+    fn writes_store_objects_under_their_key_like_the_durable_store() {
+        let store = TupleStore::new(OutboxStore::new());
+        let s = scope("acme");
+        store
+            .write_tuples(
+                &s,
+                &actor(),
+                &[TupleDelta::Add(tuple(
+                    "myelin://acme/issue/issue/secret",
+                    "confidential",
+                    "p:alice",
+                ))],
+                None,
+                None,
+                now(),
+            )
+            .expect("a reference spelling is keyed");
+        let stored = store.tuples_in(&s).expect("inspect state");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].tuple.object.0, "issue:secret");
+
+        store
+            .write_tuples(
+                &s,
+                &actor(),
+                &[TupleDelta::Remove(tuple(
+                    "issue:secret",
+                    "confidential",
+                    "p:alice",
+                ))],
+                None,
+                None,
+                now(),
+            )
+            .expect("removed by its key");
+        assert!(store.tuples_in(&s).expect("inspect state").is_empty());
+
+        for keyless in ["#anchor-only", "myelin://acme/issue", "  "] {
+            assert_eq!(
+                store.write_tuples(
+                    &s,
+                    &actor(),
+                    &[TupleDelta::Add(tuple(keyless, "reader", "p:alice"))],
+                    None,
+                    None,
+                    now(),
+                ),
+                Err(WriteError::InvalidObject {
+                    object: keyless.into()
+                }),
+                "{keyless:?} has no key a check could find"
+            );
+        }
     }
 
     #[test]
