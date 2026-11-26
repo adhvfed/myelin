@@ -47,10 +47,11 @@ export function safeAuthReturnTo(value: unknown): string {
 export function authFailureDestination(
   error: string,
   returnTo: unknown,
-  retryAfterSecs?: number,
+  lock: { retryAfterSecs?: number; fromDevice?: boolean } = {},
 ): string {
   const params = new URLSearchParams({ error });
-  if (retryAfterSecs) params.set("retry_after", String(retryAfterSecs));
+  if (lock.retryAfterSecs) params.set("retry_after", String(lock.retryAfterSecs));
+  if (lock.fromDevice) params.set("device", "1");
   const safeReturnTo = safeAuthReturnTo(returnTo);
   if (safeReturnTo !== DEFAULT_AUTH_RETURN_TO) params.set("return_to", safeReturnTo);
   return `/login?${params.toString()}`;

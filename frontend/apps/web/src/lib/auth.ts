@@ -50,7 +50,13 @@ import {
   SIGNED_OUT_DESTINATION,
 } from "./auth-return";
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
-import { deviceTokenForEmail, rememberDevice } from "../server/device-trust";
+import {
+  deviceTokenForEmail,
+  deviceTokenForViewer,
+  forgetDevice,
+  rememberDevice,
+  viewerEmail,
+} from "../server/device-trust";
 import {
   toAuthConfig,
 } from "./auth-config";
@@ -221,17 +227,25 @@ export const loginWithPassword = action(async (formData: FormData) => {
   const returnTo = formData.get("return_to");
   let failure: AccountFailure | null = null;
   let retryAfterSecs: number | undefined;
+  const deviceToken = email ? deviceTokenForEmail(email) : undefined;
   if (!email || !password || email.length > 320 || password.length > 4_096) {
     failure = "credentials";
   } else {
     try {
-      await signInWithGrant(await edgePasswordLogin(email, password, deviceTokenForEmail(email)));
+      await signInWithGrant(await edgePasswordLogin(email, password, deviceToken));
     } catch (error) {
       failure = accountFailure(error);
       if (error instanceof AccountError) retryAfterSecs = error.retryAfterSecs;
     }
   }
-  if (failure) throw redirect(authFailureDestination(failure, returnTo, retryAfterSecs));
+  if (failure) {
+    throw redirect(
+      authFailureDestination(failure, returnTo, {
+        retryAfterSecs,
+        fromDevice: failure === "rate_limited" && Boolean(deviceToken),
+      }),
+    );
+  }
   throw redirect(safeAuthReturnTo(returnTo));
 }, "login-with-password");
 
@@ -377,15 +391,20 @@ export const logoutEverywhere = action(async (): Promise<{ ok: false }> => {
 
 export type PasswordChangeResult = { ok: true } | { ok: false; reason: AccountFailure };
 
-/** The device token this browser holds for the signed-in person's email, if it has one. */
-async function ownDeviceToken(): Promise<string | undefined> {
-  try {
-    const email = (await edgeWhoami()).email;
-    return email ? deviceTokenForEmail(email) : undefined;
-  } catch {
-    return undefined;
-  }
-}
+/** Whether this browser is remembered for the signed-in person's sign-ins. */
+export const getBrowserRemembered = query(async (): Promise<boolean> => {
+  "use server";
+  return Boolean(await deviceTokenForViewer());
+}, "browser-remembered");
+
+/** Forget this browser for the signed-in person: its next sign-in counts as a new browser's. */
+export const forgetThisBrowser = action(async (): Promise<{ ok: boolean }> => {
+  "use server";
+  const email = await viewerEmail();
+  if (!email) return { ok: false };
+  forgetDevice(email);
+  return { ok: true };
+}, "forget-this-browser");
 
 /** Where a browser goes when its password changed but its fresh session could not be installed. */
 const PASSWORD_CHANGED_DESTINATION = "/login?signed_out=password_changed";
@@ -405,7 +424,7 @@ export const changePassword = action(
     if (next !== confirm) return { ok: false, reason: "password_mismatch" };
     let grant: EdgeSessionGrant;
     try {
-      grant = await edgeChangePassword(current, next, await ownDeviceToken());
+      grant = await edgeChangePassword(current, next, await deviceTokenForViewer());
     } catch (error) {
       const reason = accountFailure(error);
       // The gateway has already cleared the session the edge refused.

@@ -1,8 +1,8 @@
 #![cfg(feature = "integration")]
 
 //! The human-session migrations on a fresh schema: people erased before 0183 are disabled by
-//! 0185, only a permanent principal-wide revocation disables anyone, and (0186) nothing enables
-//! an erased person again.
+//! 0185, only a permanent principal-wide revocation disables anyone, and (0186, 0187) nothing
+//! enables or re-creates an erased person.
 
 use std::str::FromStr;
 
@@ -11,7 +11,7 @@ mod common;
 use myelin_storage::migration::Migrations;
 use myelin_storage::{
     all_durable_migrations, foundation_migrations, human_session_migrations, PgMigrator,
-    ERASED_PRINCIPAL_STAYS_DISABLED,
+    ERASED_PRINCIPAL_SQLSTATE,
 };
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 
@@ -146,6 +146,13 @@ async fn people_erased_before_0183_are_disabled_and_only_permanent_revocations_d
         .expect("drop the fresh schema");
 }
 
+fn sqlstate(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .map(|code| code.into_owned())
+}
+
 async fn set_status(pool: &PgPool, id: &str, status: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE principal SET status = $1 WHERE principal_id = $2")
         .bind(status)
@@ -191,10 +198,9 @@ async fn an_erased_person_can_never_be_enabled_again() {
         let refused = set_status(&pool, "erased", status)
             .await
             .expect_err("an erased person stays disabled");
-        assert!(
-            refused
-                .to_string()
-                .contains(ERASED_PRINCIPAL_STAYS_DISABLED),
+        assert_eq!(
+            sqlstate(&refused),
+            Some(ERASED_PRINCIPAL_SQLSTATE.to_string()),
             "{refused}"
         );
     }
@@ -207,7 +213,38 @@ async fn an_erased_person_can_never_be_enabled_again() {
     .bind(REGION)
     .execute(&pool)
     .await;
-    assert!(upsert.is_err(), "nor does an upsert enable them");
+    assert_eq!(
+        sqlstate(&upsert.expect_err("nor does an upsert enable them")),
+        Some(ERASED_PRINCIPAL_SQLSTATE.to_string())
+    );
+
+    // Nor can an erased id come back as a new row.
+    sqlx::query("DELETE FROM principal WHERE principal_id = 'erased'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recreated = sqlx::query(
+        "INSERT INTO principal (tenant_id, region, principal_id, kind, data_role, status) \
+         VALUES ($1, $2, 'erased', '\"Human\"', '\"Controller\"', '\"Active\"')",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .execute(&pool)
+    .await
+    .expect_err("an erased id cannot be inserted active");
+    assert_eq!(
+        sqlstate(&recreated),
+        Some(ERASED_PRINCIPAL_SQLSTATE.to_string())
+    );
+    sqlx::query(
+        "INSERT INTO principal (tenant_id, region, principal_id, kind, data_role, status) \
+         VALUES ($1, $2, 'erased', '\"Human\"', '\"Controller\"', '\"Disabled\"')",
+    )
+    .bind(TENANT)
+    .bind(REGION)
+    .execute(&pool)
+    .await
+    .expect("an erased id may exist disabled");
     set_status(&pool, "erased", "\"Disabled\"")
         .await
         .expect("writing Disabled again is fine");

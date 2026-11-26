@@ -6,7 +6,9 @@ import { useAppViewer } from "~/components/AppShell";
 import {
   changePassword,
   createInvitation,
+  forgetThisBrowser,
   getAuthConfig,
+  getBrowserRemembered,
   logout,
   logoutEverywhere,
   type InvitationResult,
@@ -44,7 +46,7 @@ export default function Profile() {
         <ProfileCard icon="settings" title="Appearance" copy="Choose a mode for this browser. The setting persists without changing your organization profile."><div class="profile-theme-options" role="radiogroup" aria-label="Appearance"><For each={THEMES}>{(option) => <button type="button" role="radio" aria-checked={theme() === option} disabled={!interactive()} onClick={() => chooseTheme(option)}><span class={`profile-theme-swatch ${option}`} aria-hidden="true" /><strong>{THEME_COPY[option].label}</strong><small>{THEME_COPY[option].copy}</small></button>}</For></div></ProfileCard>
         <InviteCard />
         <PasswordCard interactive={interactive()} />
-        <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><div class="profile-signout-actions"><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button><SignOutEverywhere disabled={!interactive()} /></div></ProfileCard>
+        <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><div class="profile-signout-actions"><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button><SignOutEverywhere disabled={!interactive()} /></div><RememberedBrowser /></ProfileCard>
       </div>
     </div>
   </>;
@@ -318,6 +320,43 @@ function SignOutEverywhere(props: { disabled: boolean }) {
           </p>
         </Show>
       </form>
+    </Show>
+  );
+}
+
+/** This browser's sign-in protection, and a way to give it up. */
+function RememberedBrowser() {
+  const remembered = createAsync(() => getBrowserRemembered());
+  const forgetting = useSubmission(forgetThisBrowser);
+  return (
+    <Show when={remembered() || forgetting.result}>
+      <div class="profile-remembered" data-testid="remembered-browser">
+        <Show
+          when={forgetting.result?.ok}
+          fallback={
+            <>
+              <p>
+                This browser is remembered for sign-in protection: strangers guessing at your
+                email can't lock it out. Signing out keeps it remembered.
+              </p>
+              <form action={forgetThisBrowser} method="post">
+                <button type="submit" disabled={forgetting.pending} data-testid="forget-browser">
+                  {forgetting.pending ? "Forgetting…" : "Forget this browser"}
+                </button>
+              </form>
+              <Show when={forgetting.result && !forgetting.result.ok}>
+                <p role="alert" class="profile-invite-error">
+                  This browser couldn't be forgotten just now. Try again in a moment.
+                </p>
+              </Show>
+            </>
+          }
+        >
+          <p role="status" data-testid="browser-forgotten">
+            This browser is forgotten. Its next sign-in counts as a new browser's.
+          </p>
+        </Show>
+      </div>
     </Show>
   );
 }

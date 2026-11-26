@@ -110,6 +110,23 @@ test.describe("signing in", () => {
     await stranger.context().close();
   });
 
+  test("a browser locked out on its own allowance is told it is this device", async ({ page }) => {
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL("**/git/repos");
+    await page.context().clearCookies({ name: "myelin_session" });
+    await setEdgeConfig({ loginRateLimited: true });
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL(/error=rate_limited&retry_after=60&device=1/);
+    await expect(page.getByTestId("login-error")).toHaveText(
+      "Too many attempts from this device. Try again in 1 minute or reset your password.",
+    );
+  });
+
+  test("a lock's wait is shown no longer than a day, whatever the link says", async ({ page }) => {
+    await page.goto("/login?error=rate_limited&retry_after=999999999");
+    await expect(page.getByTestId("login-error")).toContainText("Try again in 24 hours,");
+  });
+
   test("a failed sign-in keeps the page the person was heading to", async ({ page }) => {
     await page.goto("/login?return_to=%2Fprofile");
     await page.waitForLoadState("networkidle");
@@ -336,6 +353,23 @@ test.describe("password and sessions", () => {
     await setEdgeConfig({ strangersLockedOut: true });
     await changePassword(page, ADA.password, "a newer passphrase");
     await expect(page.getByText("Password changed. Your other sessions were signed out.")).toBeVisible();
+  });
+
+  test("a person can forget this browser, after which strangers' guesses lock it out too", async ({ page }) => {
+    await openProfileSignedIn(page);
+    await expect(page.getByTestId("remembered-browser")).toContainText(
+      "This browser is remembered for sign-in protection",
+    );
+    await expect(page.getByTestId("remembered-browser")).toContainText("Signing out keeps it remembered.");
+    await page.getByTestId("forget-browser").click();
+    await expect(page.getByTestId("browser-forgotten")).toBeVisible();
+    const cookies = await page.context().cookies();
+    expect(cookies.some((cookie) => cookie.name === "myelin_device"), "the last entry takes the cookie with it").toBe(false);
+
+    await page.context().clearCookies({ name: "myelin_session" });
+    await setEdgeConfig({ strangersLockedOut: true });
+    await signIn(page, ADA.email, ADA.password);
+    await page.waitForURL(/error=rate_limited&retry_after=540$/);
   });
 
   test("a change another device beat says so and keeps the person signed in", async ({ page }) => {

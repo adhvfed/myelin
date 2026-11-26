@@ -886,7 +886,7 @@ async fn settle_queue(cell: &Cell, expected: i64) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn strangers_filling_an_allowance_mail_the_owner_once_a_window_and_say_nothing_more() {
+async fn strangers_filling_an_allowance_mail_the_owner_once_an_episode_and_say_nothing_more() {
     let _turn = ONE_AT_A_TIME.lock().await;
     let cell = cell().await;
     let smtp = FakeSmtp::start().await;
@@ -945,17 +945,182 @@ async fn strangers_filling_an_allowance_mail_the_owner_once_a_window_and_say_not
     }
     settle_queue(&cell, 0).await;
 
+    // The lock is one episode: filling again in the next window warns no one.
     clock.fetch_add(15 * 60, Ordering::Relaxed);
-    for _ in 0..10 {
-        assert_eq!(shape(&login(&gateway, &ada, "a stranger's guess")).0, 401);
-    }
+    fill(&gateway, &ada);
+    settle_queue(&cell, 0).await;
+
+    // A day on, an episode that never ended warns again.
+    clock.fetch_add(24 * 60 * 60, Ordering::Relaxed);
+    fill(&gateway, &ada);
+    settle_queue(&cell, 1).await;
+    assert_eq!(deliver(&worker).await.sent, 1);
+    assert_eq!(smtp.delivered_to(&ada).len(), 2, "one notice a day at most");
+
+    // The owner signing in ends the episode, so the next lock warns at once.
+    clock.fetch_add(15 * 60, Ordering::Relaxed);
+    accounts.login(&ada, PASSWORD.into(), None).unwrap();
+    fill(&gateway, &ada);
     settle_queue(&cell, 1).await;
     assert_eq!(deliver(&worker).await.sent, 1);
     assert_eq!(
         smtp.delivered_to(&ada).len(),
-        2,
-        "one notice for the next window"
+        3,
+        "a new episode warns again"
     );
+}
+
+/// Ten wrong guesses from a browser without a device token: the last fills the allowance.
+fn fill(gateway: &Gateway, email: &str) {
+    for _ in 0..10 {
+        assert_eq!(shape(&login(gateway, email, "a stranger's guess")).0, 401);
+    }
+}
+
+/// A mail-on service on a clock the test moves, its gateway, and a worker delivering to `smtp`.
+struct LockCell {
+    cell: Cell,
+    smtp: FakeSmtp,
+    clock: Arc<AtomicI64>,
+    worker: MailWorker,
+    tenant: String,
+}
+
+impl LockCell {
+    async fn start() -> Self {
+        let cell = cell().await;
+        let smtp = FakeSmtp::start().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let worker = cell.worker(&smtp, quick_retries());
+        Self {
+            cell,
+            smtp,
+            clock: Arc::new(AtomicI64::new(now)),
+            worker,
+            tenant: unique("t-mail-lock"),
+        }
+    }
+
+    fn accounts(&self) -> AccountService {
+        let clock = self.clock.clone();
+        self.cell
+            .accounts(true)
+            .with_clock(move || clock.load(Ordering::Relaxed))
+    }
+
+    async fn person(&self, name: &str) -> String {
+        let email = format!("{}@example.com", unique(name));
+        self.cell
+            .person(&self.accounts(), &self.tenant, &email)
+            .await;
+        email
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lock_notices_across_the_cell_are_capped_and_a_dropped_one_is_not_spent() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let lock = LockCell::start().await;
+    let accounts = lock.accounts().with_lock_notice_cap(1);
+    let gateway = gateway(accounts.clone());
+    let (ada, grace) = (lock.person("ada").await, lock.person("grace").await);
+
+    fill(&gateway, &ada);
+    settle_queue(&lock.cell, 1).await;
+    fill(&gateway, &grace);
+    settle_queue(&lock.cell, 1).await;
+    assert_eq!(deliver(&lock.worker).await.sent, 1);
+    assert_eq!(lock.smtp.delivered_to(&ada).len(), 1);
+    assert!(
+        lock.smtp.delivered_to(&grace).is_empty(),
+        "the cell's notices for the minute are used up"
+    );
+
+    // Grace's episode was not spent on the dropped notice: her next lock warns her.
+    lock.clock.fetch_add(15 * 60, Ordering::Relaxed);
+    fill(&gateway, &grace);
+    settle_queue(&lock.cell, 1).await;
+    assert_eq!(deliver(&lock.worker).await.sent, 1);
+    assert_eq!(lock.smtp.delivered_to(&grace).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_that_fails_to_queue_gives_back_its_slots() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let lock = LockCell::start().await;
+    let ada = lock.person("ada").await;
+    let failing = lock.accounts().with_lock_notice_cap(1);
+    fill(&gateway(failing.clone().with_failing_lock_notices()), &ada);
+    settle_queue(&lock.cell, 0).await;
+
+    // Neither the episode nor the cell's minute was spent, so the next lock warns.
+    lock.clock.fetch_add(15 * 60, Ordering::Relaxed);
+    fill(&gateway(failing), &ada);
+    settle_queue(&lock.cell, 1).await;
+    assert_eq!(deliver(&lock.worker).await.sent, 1);
+    assert_eq!(lock.smtp.delivered_to(&ada).len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_fills_its_own_allowance_mails_nobody_and_leaves_strangers_allowance_alone() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let lock = LockCell::start().await;
+    let accounts = lock.accounts();
+    let ada = lock.person("ada").await;
+    let device = accounts
+        .login(&ada, PASSWORD.into(), None)
+        .unwrap()
+        .device_token;
+
+    for _ in 0..10 {
+        assert_eq!(
+            accounts
+                .login(&ada, "a stolen token's guess".into(), Some(&device))
+                .unwrap_err(),
+            AccountError::LoginFailed
+        );
+    }
+    assert!(matches!(
+        accounts.login(&ada, PASSWORD.into(), Some(&device)),
+        Err(AccountError::RateLimited { .. })
+    ));
+    assert_eq!(
+        accounts.device_allowances_filled(),
+        1,
+        "the fill is counted"
+    );
+    settle_queue(&lock.cell, 0).await;
+
+    for attempt in 1..=10 {
+        assert_eq!(
+            accounts
+                .login(&ada, "a stranger's guess".into(), None)
+                .unwrap_err(),
+            AccountError::LoginFailed,
+            "attempt {attempt}: the device's failures used none of strangers' allowance"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_notice_goes_out_when_the_attempt_that_fills_the_allowance_succeeds() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let lock = LockCell::start().await;
+    let accounts = lock.accounts();
+    let gateway = gateway(accounts.clone());
+    let ada = lock.person("ada").await;
+    for _ in 0..9 {
+        assert_eq!(shape(&login(&gateway, &ada, "a typo, twice over")).0, 401);
+    }
+    accounts
+        .login(&ada, PASSWORD.into(), None)
+        .expect("the tenth attempt fills the allowance and succeeds");
+    settle_queue(&lock.cell, 0).await;
+    fill(&gateway, &ada);
+    settle_queue(&lock.cell, 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

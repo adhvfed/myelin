@@ -85,6 +85,10 @@ pub enum PrincipalError {
     StoredPrincipal {
         principal_id: String,
     },
+    /// The person was erased, so they stay disabled.
+    Erased {
+        principal_id: String,
+    },
     Storage(String),
 }
 
@@ -127,6 +131,9 @@ impl core::fmt::Display for PrincipalError {
                 "subject key discard refused: principal `{principal_id}` is stored in this tenant, \
                  and destroying its key would erase its profile"
             ),
+            PrincipalError::Erased { principal_id } => {
+                write!(f, "principal `{principal_id}` was erased and stays disabled")
+            }
             PrincipalError::Storage(why) => write!(
                 f,
                 "principal store durable backing error (the read/write did NOT succeed - never a \
@@ -200,6 +207,8 @@ impl From<KmsError> for PrincipalError {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 struct Inner {
+    /// Where erasures are recorded, so an erased person stays disabled as in Postgres.
+    revocations: Option<crate::revocation::RevocationStore>,
     partitions: HashMap<(String, String), HashMap<String, PrincipalRow>>,
     profiles: HashMap<(String, String), HashMap<String, EncryptedProfile>>,
     credential_links: HashMap<(String, String), HashMap<String, String>>,
@@ -231,6 +240,34 @@ impl PrincipalStore {
             backend: PrincipalBackend::Memory(Arc::new(Mutex::new(Inner::default()))),
             kms,
         }
+    }
+
+    /// An in-memory store that keeps people `revocations` erased disabled, as the database does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_revocations(self, revocations: crate::revocation::RevocationStore) -> Self {
+        if let PrincipalBackend::Memory(inner) = &self.backend {
+            inner.lock().unwrap_or_else(|e| e.into_inner()).revocations = Some(revocations);
+        }
+        self
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn refuse_if_erased(
+        inner: &Inner,
+        scope: &TenantScope,
+        principal_id: &PrincipalId,
+        status: &PrincipalStatus,
+    ) -> Result<(), PrincipalError> {
+        let erased = inner
+            .revocations
+            .as_ref()
+            .is_some_and(|revocations| revocations.erases(scope, principal_id));
+        if erased && *status != PrincipalStatus::Disabled {
+            return Err(PrincipalError::Erased {
+                principal_id: principal_id.0.clone(),
+            });
+        }
+        Ok(())
     }
 
     pub fn with_pg(
@@ -291,6 +328,7 @@ impl PrincipalStore {
             #[cfg(any(test, feature = "test-support"))]
             PrincipalBackend::Memory(inner_arc) => {
                 let mut inner = inner_arc.lock().unwrap_or_else(|e| e.into_inner());
+                Self::refuse_if_erased(&inner, scope, &principal_id, &row.status)?;
                 let partition = inner.partitions.entry(part_key.clone()).or_default();
                 let mut row = row;
                 // As the database trigger does: a status change ends the person's sessions.
@@ -331,7 +369,7 @@ impl PrincipalStore {
                     sessions_not_before: None,
                 };
                 pg.block(pg.backing.put_principal(&scope.tenant().0, drow))
-                    .map_err(|e| PrincipalError::Storage(e.to_string()))?;
+                    .map_err(|error| write_error(&principal_id, error))?;
                 Ok(row)
             }
         }
@@ -367,6 +405,7 @@ impl PrincipalStore {
             PrincipalBackend::Memory(inner_arc) => {
                 let part_key = Self::part_key(scope);
                 let mut inner = inner_arc.lock().unwrap_or_else(|error| error.into_inner());
+                Self::refuse_if_erased(&inner, scope, &principal_id, &row.status)?;
                 inner
                     .partitions
                     .entry(part_key.clone())
@@ -395,7 +434,7 @@ impl PrincipalStore {
                     durable,
                     &link_key,
                 ))
-                .map_err(|error| PrincipalError::Storage(error.to_string()))?;
+                .map_err(|error| write_error(&principal_id, error))?;
                 Ok(row)
             }
         }
@@ -906,10 +945,69 @@ impl PgPrincipalBacking {
     }
 }
 
+/// A failed principal write, with the database's refusal to re-enable an erased person kept apart.
+fn write_error(principal_id: &PrincipalId, error: myelin_storage::ProviderError) -> PrincipalError {
+    match error {
+        myelin_storage::ProviderError::Pg(myelin_storage::PgError::ErasedPrincipal(_)) => {
+            PrincipalError::Erased {
+                principal_id: principal_id.0.clone(),
+            }
+        }
+        other => PrincipalError::Storage(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use myelin_identity::{DataRole, Principal};
+
+    #[test]
+    fn an_erased_person_stays_disabled_in_memory_as_in_postgres() {
+        let revocations = crate::revocation::RevocationStore::new();
+        let store =
+            PrincipalStore::new(Arc::new(KmsEngine::new())).with_revocations(revocations.clone());
+        let scope = TenantScope::from_verified_token(
+            &Principal::stub(
+                PrincipalId("admin".into()),
+                PrincipalKind::Human,
+                TenantId("acme".into()),
+            ),
+            Region("eu-west".into()),
+        );
+        let put = |id: &str, status| {
+            store.put_principal(
+                &scope,
+                PrincipalId(id.into()),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                status,
+                None,
+            )
+        };
+        let now = myelin_events::Timestamp("2026-11-26T00:00:00Z".into());
+        put("erased", PrincipalStatus::Active).unwrap();
+        revocations
+            .revoke_until(
+                &scope,
+                &myelin_identity::RevokeTarget::Principal(PrincipalId("erased".into())),
+                now.clone(),
+                myelin_events::Timestamp("2099-01-01T00:00:00Z".into()),
+            )
+            .unwrap();
+        put("erased", PrincipalStatus::Active).expect("a time-limited revocation is no erasure");
+        revocations
+            .disable_principal(&scope, &PrincipalId("erased".into()), now)
+            .unwrap();
+        for status in [PrincipalStatus::Active, PrincipalStatus::Suspended] {
+            assert!(matches!(
+                put("erased", status),
+                Err(PrincipalError::Erased { principal_id }) if principal_id == "erased"
+            ));
+        }
+        put("erased", PrincipalStatus::Disabled).expect("writing Disabled is fine");
+        put("someone-else", PrincipalStatus::Active).unwrap();
+    }
 
     fn kms() -> Arc<KmsEngine> {
         Arc::new(KmsEngine::new())

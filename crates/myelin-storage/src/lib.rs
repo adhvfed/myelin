@@ -248,7 +248,7 @@ pub use identity_durable::{
     DurablePrincipalBacking, DurablePrincipalRow, DurableProfileBlob, DurableReplayBacking,
     DurableRevocationBacking, DurableRevocationRow, DurableSessionState, DurableTupleBacking,
     DurableTupleDelta, DurableTupleEdge, DurableTupleSnapshot, DurableTupleWriteOutcome,
-    TupleEdgeOp, ACTIVE_PRINCIPAL_STATUS_JSON, ERASED_PRINCIPAL_STAYS_DISABLED,
+    TupleEdgeOp, ACTIVE_PRINCIPAL_STATUS_JSON, ERASED_PRINCIPAL_SQLSTATE,
     HUMAN_PRINCIPAL_KIND_JSON, IDENTITY_AGENT_RECENT_LIST_INDEX_MIGRATION,
     IDENTITY_AGENT_WORKSPACE_PROFILE_BACKFILL_MIGRATION,
     IDENTITY_AGENT_WORKSPACE_PROFILE_EXPAND_MIGRATION,

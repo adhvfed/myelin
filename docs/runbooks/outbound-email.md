@@ -35,12 +35,17 @@ other new browsers, never the person's own devices. A device that keeps failing 
 refused on that device only. A successful sign-in clears the allowance it was charged to, and a
 password reset clears the new-browser one.
 
-The first time the new-browser allowance fills in a window, the account's owner gets one email
-saying so, with a link to reset their password. Emails without an account get none, and the
-sign-in page answers the same either way. A reset is never blocked by the lock.
+When the new-browser allowance fills, the account's owner gets one email saying so, with a link
+to reset their password. It is one email per lock episode, which ends when the owner next signs
+in or accepts a reset, and never more than one a day. Across all edges at most 60 such emails go
+out a minute; past that they are dropped and logged as `edge.accounts.lock_notices_dropped`.
+Emails without an account get none, and the sign-in page answers the same either way. A reset is
+never blocked by the lock. A device that fills its own allowance mails nobody; it is logged as
+`edge.accounts.device_allowance_filled`, with a running count and nothing about the account.
 
 Device tokens carry no authority and outlive password changes and signing out everywhere: they
-only decide which allowance an attempt is charged to.
+only decide which allowance an attempt is charged to. A person can drop this browser's token with
+"Forget this browser" on their profile page.
 
 ## Settings
 

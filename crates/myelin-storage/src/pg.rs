@@ -22,6 +22,8 @@ pub enum PgError {
     Migrate(String),
     Query(String),
     Publish(String),
+    /// A write tried to give an erased person a status other than Disabled.
+    ErasedPrincipal(String),
 }
 
 impl core::fmt::Display for PgError {
@@ -31,6 +33,7 @@ impl core::fmt::Display for PgError {
             PgError::Migrate(e) => write!(f, "postgres migration failed: {e}"),
             PgError::Query(e) => write!(f, "postgres query failed: {e}"),
             PgError::Publish(e) => write!(f, "outbox relay publish failed: {e}"),
+            PgError::ErasedPrincipal(e) => write!(f, "an erased principal stays disabled: {e}"),
         }
     }
 }

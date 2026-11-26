@@ -1901,3 +1901,97 @@ async fn a_reset_lifts_strangers_lock_and_a_known_device_can_change_the_password
         "the reset kept the device's trust"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reissued_device_token_shares_its_original_allowance() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-device-reissue");
+    let email = format!("{}@example.com", unique("johnson"));
+    cell.join_person(&tenant, &email, "Katherine").await;
+    let first = cell.device_token(&email);
+    cell.clock.fetch_add(1, Ordering::Relaxed);
+    let reissued = cell
+        .accounts
+        .login(&email, PASSWORD.into(), Some(&first))
+        .unwrap()
+        .device_token;
+    assert_ne!(reissued, first);
+    for _ in 0..10 {
+        let _ = cell
+            .accounts
+            .login(&email, "a typo!!!!!".into(), Some(&first));
+    }
+    assert!(
+        matches!(
+            cell.accounts
+                .login(&email, PASSWORD.into(), Some(&reissued)),
+            Err(AccountError::RateLimited { .. })
+        ),
+        "the reissued token names the same device"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_refusals_give_back_device_and_password_change_slots() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-device-busy");
+    let email = format!("{}@example.com", unique("vaughan"));
+    let person = cell.join_person(&tenant, &email, "Dorothy").await;
+    let device = cell.device_token(&email);
+    let saturated = cell
+        .service(Some("https://myelin.example"))
+        .with_hash_capacity(0);
+
+    let answers = burst_of_logins(&saturated, &email, "a typo!!!!!", Some(&device), 10).await;
+    assert!(answers
+        .iter()
+        .all(|answer| matches!(answer, Err(AccountError::Busy))));
+    for attempt in 1..=10 {
+        assert_eq!(
+            cell.accounts
+                .login(&email, "a typo!!!!!".into(), Some(&device))
+                .unwrap_err(),
+            AccountError::LoginFailed,
+            "device attempt {attempt}: the busy refusals used none of its slots"
+        );
+    }
+    assert!(matches!(
+        cell.accounts.login(&email, PASSWORD.into(), Some(&device)),
+        Err(AccountError::RateLimited { .. })
+    ));
+
+    for _ in 0..10 {
+        assert_eq!(
+            saturated
+                .change_password(
+                    &person,
+                    "not it at all".into(),
+                    "a new passphrase".into(),
+                    None
+                )
+                .unwrap_err(),
+            AccountError::Busy
+        );
+    }
+    for attempt in 1..=10 {
+        assert_eq!(
+            cell.accounts
+                .change_password(
+                    &person,
+                    "not it at all".into(),
+                    "a new passphrase".into(),
+                    None
+                )
+                .unwrap_err(),
+            AccountError::WrongPassword,
+            "change attempt {attempt}: the busy refusals used none of the shared slots"
+        );
+    }
+    assert!(matches!(
+        cell.accounts
+            .change_password(&person, PASSWORD.into(), "a new passphrase".into(), None),
+        Err(AccountError::RateLimited { .. })
+    ));
+}

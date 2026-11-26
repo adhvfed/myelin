@@ -58,11 +58,20 @@ const LOGIN_FAILURES_PER_DEVICE: Limit = Limit {
     hits: 10,
     window_secs: 15 * 60,
 };
-/// Emails telling a person that strangers' sign-ins to their account are being turned away.
+/// Emails telling a person that strangers' sign-ins to their account are being turned away: one
+/// per lock episode, which ends when the owner next signs in or accepts a reset, and never more
+/// than one a day.
 const LOCK_NOTICES_PER_EMAIL: Limit = Limit {
     name: "login.lock_notice",
     hits: 1,
-    window_secs: 15 * 60,
+    window_secs: 24 * 60 * 60,
+};
+/// Lock notices across every Edge sharing the database, so guessing at many emails cannot turn
+/// the outbox into a mail cannon. Past it a notice is dropped.
+const LOCK_NOTICES_PER_CELL: Limit = Limit {
+    name: "login.lock_notice.cell",
+    hits: 60,
+    window_secs: 60,
 };
 const INVITES_PER_MEMBER: Limit = Limit {
     name: "invitation.create",
@@ -200,11 +209,22 @@ pub enum MemberInvitation {
 /// A person whose password was just confirmed, and the moment the session made for them counts
 /// as issued: by the database clock, and never before the person's session cutoff.
 /// `device_token` lets this browser's later sign-ins to the email skip strangers' allowance.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignedIn {
     pub principal: Principal,
     pub issued_at_unix: i64,
     pub device_token: String,
+}
+
+impl core::fmt::Debug for SignedIn {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SignedIn")
+            .field("principal", &self.principal)
+            .field("issued_at_unix", &self.issued_at_unix)
+            .field("device_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The allowance an attempt for one email is charged to: its device's, when it brought a good
@@ -285,6 +305,9 @@ pub struct AccountService {
     mail: Option<MailOutbox>,
     reset_requests: Arc<Semaphore>,
     dropped_resets: Arc<DroppedRequests>,
+    lock_notice_cap: Arc<NoticeCap>,
+    dropped_notices: Arc<DroppedRequests>,
+    device_allowances_filled: Arc<AtomicU64>,
     region: String,
     runtime: Handle,
     hashing: Arc<HashGate>,
@@ -315,6 +338,14 @@ impl AccountService {
             mail: None,
             reset_requests: Arc::new(Semaphore::new(RESET_REQUESTS_IN_FLIGHT)),
             dropped_resets: Arc::default(),
+            lock_notice_cap: Arc::new(NoticeCap {
+                hits: LOCK_NOTICES_PER_CELL.hits,
+                key: b"cell".to_vec(),
+                #[cfg(any(test, feature = "test-support"))]
+                fail_queue: false,
+            }),
+            dropped_notices: Arc::default(),
+            device_allowances_filled: Arc::default(),
             region: region.into(),
             runtime,
             hashing: Arc::new(HashGate::sized_for_host()),
@@ -342,6 +373,33 @@ impl AccountService {
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.now = Arc::new(move || Ok(now()));
         self
+    }
+
+    /// A cell-wide lock notice cap of `hits` a minute, counted apart from every other service's.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_lock_notice_cap(mut self, hits: u32) -> Self {
+        self.lock_notice_cap = Arc::new(NoticeCap {
+            hits,
+            key: self.ids.mint().0.into_bytes(),
+            fail_queue: self.lock_notice_cap.fail_queue,
+        });
+        self
+    }
+
+    /// Every lock notice fails to queue, as if the outbox were unreachable.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_failing_lock_notices(mut self) -> Self {
+        self.lock_notice_cap = Arc::new(NoticeCap {
+            hits: self.lock_notice_cap.hits,
+            key: self.lock_notice_cap.key.clone(),
+            fail_queue: true,
+        });
+        self
+    }
+
+    /// How many times a device's own allowance has filled since this service started.
+    pub fn device_allowances_filled(&self) -> u64 {
+        self.device_allowances_filled.load(Ordering::Relaxed)
     }
 
     /// A hash gate that admits `capacity` hashes at once; 0 refuses every hash as busy.
@@ -500,23 +558,47 @@ impl AccountService {
         };
         match (signed_in, slot, charge, digest) {
             (Some((principal, issued_at)), Some(slot), Some(charge), Some(digest)) => {
-                self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
+                self.clear_after_success(slot, &digest)?;
                 self.signed_in(principal, issued_at, &digest, charge.device)
             }
             // The failure was already counted when its slot was taken.
-            (_, slot, charge, _) => {
-                let strangers_locked_out = slot.is_some_and(|slot| slot.filled)
-                    && charge.is_some_and(|charge| charge.device.is_none());
-                if let (true, Some(email), Some(account)) = (strangers_locked_out, email, account) {
-                    self.send_lock_notice(email, account);
+            (_, Some(slot), Some(charge), _) if slot.filled => {
+                match (charge.device, email, account) {
+                    (Some(_), _, _) => self.note_device_allowance_filled(),
+                    (None, Some(email), Some(account)) => self.send_lock_notice(email, account),
+                    (None, _, None) | (None, None, _) => {}
                 }
                 Err(AccountError::LoginFailed)
             }
+            _ => Err(AccountError::LoginFailed),
         }
     }
 
+    /// After the owner proves their password: the allowance the attempt was charged to is clear,
+    /// and the lock episode is over, so the next lock warns them again.
+    fn clear_after_success(&self, slot: Slot, email: &EmailDigest) -> Result<(), AccountError> {
+        let episode = Self::bucket(&LOCK_NOTICES_PER_EMAIL, email);
+        self.block(async { Ok(self.store.clear_hits(&[slot.bucket, episode]).await?) })
+    }
+
+    /// A device kept failing until its own allowance filled: a mistyping owner, or a stolen token
+    /// being tried. Nobody is mailed; it is counted and logged, without the email or device.
+    fn note_device_allowance_filled(&self) {
+        let total = self
+            .device_allowances_filled
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "edge.accounts.device_allowance_filled",
+                "total": total,
+            })
+        );
+    }
+
     /// Tells the account's owner, off the request path so the attempt's timing says nothing about
-    /// whether the account exists. At most one notice per window goes to an email.
+    /// whether the account exists. See `LOCK_NOTICES_PER_EMAIL` and `LOCK_NOTICES_PER_CELL`.
     fn send_lock_notice(&self, email: Email, account: AccountRow) {
         let Some(outbox) = self.mail.clone() else {
             return;
@@ -551,19 +633,65 @@ impl AccountService {
             to: email.as_str().to_string(),
             reset: self.reset_help(),
         };
+        let cap = Limit {
+            hits: self.lock_notice_cap.hits,
+            ..LOCK_NOTICES_PER_CELL
+        };
         self.block(async {
             let bucket = Self::bucket(&LOCK_NOTICES_PER_EMAIL, &account.email_digest);
-            let slot = match self.reserve(&LOCK_NOTICES_PER_EMAIL, bucket).await {
+            let episode = match self.reserve(&LOCK_NOTICES_PER_EMAIL, bucket).await {
                 Ok(slot) => slot,
                 Err(AccountError::RateLimited { .. }) => return Ok(()),
                 Err(error) => return Err(error),
             };
-            let queued = self.store.queue(outbox, &letter).await;
+            let cell = match self
+                .reserve(&cap, Self::bucket(&cap, &self.lock_notice_cap.key))
+                .await
+            {
+                Ok(slot) => slot,
+                Err(refused) => {
+                    // The episode is not spent on a notice that was never sent.
+                    self.give_back(&[episode]).await;
+                    if !matches!(refused, AccountError::RateLimited { .. }) {
+                        return Err(refused);
+                    }
+                    self.log_dropped_notice();
+                    return Ok(());
+                }
+            };
+            let queued = self.queue_notice(outbox, &letter).await;
             if queued.is_err() {
-                self.give_back(&[slot]).await;
+                self.give_back(&[episode, cell]).await;
             }
-            Ok(queued?)
+            queued
         })
+    }
+
+    async fn queue_notice(&self, outbox: &MailOutbox, letter: &Letter) -> Result<(), AccountError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.lock_notice_cap.fail_queue {
+            return Err(AccountError::Unavailable(
+                "lock notices fail in this test".into(),
+            ));
+        }
+        Ok(self.store.queue(outbox, letter).await?)
+    }
+
+    fn log_dropped_notice(&self) {
+        if let Some(dropped) = self
+            .now_unix()
+            .ok()
+            .and_then(|now| self.dropped_notices.record(now))
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "edge.accounts.lock_notices_dropped",
+                    "reason": "too many lock notices across the cell",
+                    "dropped": dropped,
+                })
+            );
+        }
     }
 
     /// Verifies against the stored hash, or against the dummy when there is none or the
@@ -744,8 +872,13 @@ impl AccountService {
         let password = Password::new(acceptance.password)?;
         let password_phc = self.hashing(|| password.hash())?;
         let notice = self.password_changed_notice(live.email.as_str());
-        // A reset proves the owner, so strangers' failed attempts no longer hold them back.
-        let unlock = Self::bucket(&LOGIN_FAILURES_PER_EMAIL, &live.invitation.email_digest);
+        // A reset proves the owner, so strangers' failed attempts no longer hold them back, and
+        // the lock episode is over.
+        let digest = &live.invitation.email_digest;
+        let unlock = vec![
+            Self::bucket(&LOGIN_FAILURES_PER_EMAIL, digest),
+            Self::bucket(&LOCK_NOTICES_PER_EMAIL, digest),
+        ];
         let outcome = self.block(async {
             Ok(self
                 .store
@@ -825,7 +958,12 @@ impl AccountService {
         }) {
             Ok(password_phc) => password_phc,
             // A wrong guess keeps the slot it took; that is the point of taking it first.
-            Err(AccountError::WrongPassword) => return Err(AccountError::WrongPassword),
+            Err(AccountError::WrongPassword) => {
+                if slot.filled && device.is_some() {
+                    self.note_device_allowance_filled();
+                }
+                return Err(AccountError::WrongPassword);
+            }
             Err(refused) => return Err(self.refund(slot, refused)),
         };
         let notice = match self.mail.as_ref().map(|_| self.profile(person)) {
@@ -851,7 +989,7 @@ impl AccountService {
             }
             Err(error) => return Err(self.refund(slot, error)),
         };
-        self.block(async { Ok(self.store.clear_hits(slot.bucket).await?) })?;
+        self.clear_after_success(slot, &account.email_digest)?;
         self.signed_in(person.clone(), cutoff, &account.email_digest, device)
     }
 
@@ -1178,7 +1316,15 @@ fn scope_for(tenant: &str, region: &str) -> TenantScope {
     )
 }
 
-/// Counts dropped reset requests so a flood of them is logged once a minute, not once each.
+/// The cell-wide lock notice cap and the bucket key it counts under.
+struct NoticeCap {
+    hits: u32,
+    key: Vec<u8>,
+    #[cfg(any(test, feature = "test-support"))]
+    fail_queue: bool,
+}
+
+/// Counts dropped requests so a flood of them is logged once a minute, not once each.
 #[derive(Default)]
 struct DroppedRequests {
     minute: AtomicI64,

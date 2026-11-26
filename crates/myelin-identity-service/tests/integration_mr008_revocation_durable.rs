@@ -564,3 +564,87 @@ async fn the_sign_out_sweep_drops_only_expired_session_denials() {
 
     cleanup(&admin, &[&tenant, &other_tenant]).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_permanent_principal_revocation_replaces_a_time_limited_one_and_disables() {
+    let admin = migrate().await;
+    admin
+        .migrate(
+            &myelin_storage::human_session_migrations(),
+            &HotTables::none(),
+        )
+        .await
+        .expect("human-session migrations");
+    let app = common::app_provider(6).await;
+    let region = app.config().region.clone();
+    let tenant = format!("mr008-upgrade-{}", uniq());
+    let s = scope(&tenant, &region);
+    let store = RevocationStore::with_pg(
+        DurableRevocationBacking::new(app.clone()),
+        tokio::runtime::Handle::current(),
+    );
+    sqlx::query(
+        "INSERT INTO principal (tenant_id, region, principal_id, kind, data_role, status) \
+         VALUES ($1, $2, 'p:bob', '\"Human\"', '\"Controller\"', '\"Active\"')",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .execute(admin.db_pool())
+    .await
+    .unwrap();
+    let status = || async {
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM principal WHERE tenant_id = $1 AND principal_id = 'p:bob'",
+        )
+        .bind(&tenant)
+        .fetch_one(admin.db_pool())
+        .await
+        .unwrap()
+    };
+    let bob = PrincipalId("p:bob".into());
+    store
+        .revoke_until(
+            &s,
+            &RevokeTarget::Principal(bob.clone()),
+            ts("2026-06-26T00:00:00Z"),
+            ts("2099-01-01T00:00:00Z"),
+        )
+        .unwrap();
+    assert_eq!(status().await, "\"Active\"");
+    store
+        .disable_principal(&s, &bob, ts("2026-06-26T01:00:00Z"))
+        .unwrap();
+    let expires_at: Option<String> = sqlx::query_scalar(
+        "SELECT expires_at FROM revocation WHERE tenant_id = $1 AND handle = 'p:bob'",
+    )
+    .bind(&tenant)
+    .fetch_one(admin.db_pool())
+    .await
+    .unwrap();
+    assert_eq!(expires_at, None, "the erasure is permanent");
+    assert_eq!(status().await, "\"Disabled\"", "and disables the person");
+
+    // A time-limited revocation never shortens a permanent one.
+    store
+        .revoke_until(
+            &s,
+            &RevokeTarget::Principal(bob),
+            ts("2026-06-26T02:00:00Z"),
+            ts("2099-01-01T00:00:00Z"),
+        )
+        .unwrap();
+    let still: Option<String> = sqlx::query_scalar(
+        "SELECT expires_at FROM revocation WHERE tenant_id = $1 AND handle = 'p:bob'",
+    )
+    .bind(&tenant)
+    .fetch_one(admin.db_pool())
+    .await
+    .unwrap();
+    assert_eq!(still, None);
+
+    let _ = sqlx::query("DELETE FROM principal WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(admin.db_pool())
+        .await;
+    cleanup(&admin, &[&tenant]).await;
+}

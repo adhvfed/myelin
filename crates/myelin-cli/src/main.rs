@@ -624,7 +624,8 @@ enum ServerSignOut {
 }
 
 impl ServerSignOut {
-    /// The line to print about the server side, if any. An expiry already past is not shown.
+    /// The line to print about the server side, if any. A session's expiry is printed only while
+    /// it is still ahead; once past, the line says the session has expired.
     fn describe(self, now: Option<myelin_events::clock::ClockReading>) -> Option<String> {
         let now = now.map(|reading| reading.unix_seconds());
         let expiry = |expires_at_unix: Option<i64>| match expires_at_unix {

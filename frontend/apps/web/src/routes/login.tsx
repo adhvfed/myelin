@@ -25,11 +25,15 @@ function errorCopy(code: string): string {
   }
 }
 
+/** No lock lasts longer than this, whatever the query string says. */
+const MAX_WAIT_SECS = 24 * 60 * 60;
+
 /** How long a locked sign-in waits, from the edge's retry-after in seconds. */
 function waitCopy(retryAfter: unknown): string {
   const seconds = Number(retryAfter);
   if (!Number.isSafeInteger(seconds) || seconds <= 0) return "a few minutes";
-  const minutes = Math.ceil(seconds / 60);
+  const minutes = Math.ceil(Math.min(seconds, MAX_WAIT_SECS) / 60);
+  if (minutes >= 120) return `${Math.ceil(minutes / 60)} hours`;
   return minutes === 1 ? "1 minute" : `${minutes} minutes`;
 }
 
@@ -102,12 +106,25 @@ export default function Login() {
         <Show when={error()}>
           <p role="alert" id="login-error-msg" class="auth-alert" data-testid="login-error">
             <Show when={error() === "rate_limited"} fallback={errorCopy(error())}>
-              Too many attempts. Try again in {waitCopy(params.retry_after)}, sign in from a device
-              you've used before, or{" "}
-              <a href={resetHelpHref()} data-testid="locked-reset">
-                reset your password
-              </a>
-              .
+              <Show
+                when={params.device === "1"}
+                fallback={
+                  <>
+                    Too many attempts. Try again in {waitCopy(params.retry_after)}, sign in from a
+                    device you've used before, or{" "}
+                    <a href={resetHelpHref()} data-testid="locked-reset">
+                      reset your password
+                    </a>
+                    .
+                  </>
+                }
+              >
+                Too many attempts from this device. Try again in {waitCopy(params.retry_after)} or{" "}
+                <a href={resetHelpHref()} data-testid="locked-reset">
+                  reset your password
+                </a>
+                .
+              </Show>
             </Show>
           </p>
         </Show>

@@ -128,9 +128,6 @@ UPDATE principal AS person
    AND person.status <> '"Disabled"';
 "#;
 
-/// What the database says when something tries to re-enable an erased person.
-pub const ERASED_PRINCIPAL_STAYS_DISABLED: &str = "an erased principal stays disabled";
-
 /// A person with a permanent principal-wide revocation (an erasure) stays disabled: no write,
 /// an operator's re-bootstrap included, may give them another status.
 pub const ERASED_PRINCIPAL_STAYS_DISABLED_MIGRATION: &str = r#"
@@ -151,6 +148,52 @@ $$;
 DROP TRIGGER IF EXISTS principal_erasure_sticks ON principal;
 CREATE TRIGGER principal_erasure_sticks BEFORE UPDATE OF status ON principal
   FOR EACH ROW EXECUTE FUNCTION principal_erasure_sticks();
+"#;
+
+/// A failed principal write, telling the erased-person refusal apart from any other failure.
+fn principal_write_error(error: sqlx::Error) -> crate::pg::PgError {
+    let erased = error
+        .as_database_error()
+        .and_then(|db| db.code())
+        .is_some_and(|code| code == ERASED_PRINCIPAL_SQLSTATE);
+    if erased {
+        crate::pg::PgError::ErasedPrincipal(error.to_string())
+    } else {
+        crate::pg::PgError::Query(error.to_string())
+    }
+}
+
+/// The SQLSTATE the database raises when a write would give an erased person (one with a
+/// permanent principal-wide revocation) any status but Disabled.
+pub const ERASED_PRINCIPAL_SQLSTATE: &str = "MY001";
+
+/// Widens 0186: a new principal row is refused too, the refusal carries its own SQLSTATE, and a
+/// permanent principal-wide revocation that replaces a time-limited one disables the person, as
+/// a fresh one does.
+pub const ERASED_PRINCIPAL_INSERT_AND_UPGRADE_MIGRATION: &str = r#"
+CREATE OR REPLACE FUNCTION principal_erasure_sticks() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.status IS DISTINCT FROM '"Disabled"' AND EXISTS (
+       SELECT 1 FROM revocation
+        WHERE kind = 'principal' AND expires_at IS NULL
+          AND tenant_id = NEW.tenant_id AND region = NEW.region AND handle = NEW.principal_id)
+  THEN
+    RAISE EXCEPTION 'an erased principal stays disabled: %', NEW.principal_id
+      USING ERRCODE = 'MY001';
+  END IF;
+  RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS principal_erasure_sticks ON principal;
+CREATE TRIGGER principal_erasure_sticks BEFORE INSERT OR UPDATE OF status ON principal
+  FOR EACH ROW EXECUTE FUNCTION principal_erasure_sticks();
+
+DROP TRIGGER IF EXISTS principal_revocation_made_permanent ON revocation;
+CREATE TRIGGER principal_revocation_made_permanent AFTER UPDATE OF expires_at ON revocation
+  FOR EACH ROW WHEN (NEW.kind = 'principal' AND OLD.expires_at IS NOT NULL
+                     AND NEW.expires_at IS NULL)
+  EXECUTE FUNCTION principal_revocation_ends_sessions();
 "#;
 
 pub const REVOCATION_MIGRATION: &str = "\
@@ -446,6 +489,11 @@ pub fn human_session_migrations() -> Migrations {
         Migration::plain_on(
             "0186_erased_principal_stays_disabled",
             ERASED_PRINCIPAL_STAYS_DISABLED_MIGRATION,
+            "principal",
+        ),
+        Migration::plain_on(
+            "0187_erased_principal_insert_and_upgrade",
+            ERASED_PRINCIPAL_INSERT_AND_UPGRADE_MIGRATION,
             "principal",
         ),
     ])
@@ -913,7 +961,7 @@ impl DurablePrincipalBacking {
                     .bind(ciphertext)
                     .execute(&mut *conn)
                     .await
-                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    .map_err(principal_write_error)?;
                     Ok(())
                 })
             })
@@ -962,7 +1010,7 @@ impl DurablePrincipalBacking {
                     .bind(ciphertext)
                     .execute(&mut *conn)
                     .await
-                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                    .map_err(principal_write_error)?;
                     sqlx::query(
                         "INSERT INTO credential_link (tenant_id, region, link_key, principal_id) \
                          VALUES ($1, $2, $3, $4) \
@@ -1527,7 +1575,10 @@ impl DurableRevocationBacking {
                     sqlx::query(
                         "INSERT INTO revocation \
                            (tenant_id, region, kind, handle, revoked_at, expires_at) \
-                         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                         VALUES ($1, $2, $3, $4, $5, $6) \
+                         ON CONFLICT (tenant_id, region, kind, handle) DO UPDATE SET expires_at = NULL \
+                          WHERE revocation.kind = 'principal' AND revocation.expires_at IS NOT NULL \
+                            AND EXCLUDED.expires_at IS NULL",
                     )
                     .bind(&tenant_owned)
                     .bind(&region)

@@ -355,11 +355,17 @@ impl RevocationStore {
                     expires_at,
                 };
                 let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .mirror
-                    .entry(key.clone())
-                    .or_insert_with(|| entry.clone());
-                guard.fast.entry(key).or_insert(entry);
+                let guard = &mut *guard;
+                // As the database does: a permanent principal revocation replaces a
+                // time-limited one; anything else keeps the first.
+                let permanent_principal =
+                    kind == RevokedKind::Principal && entry.expires_at.is_none();
+                for table in [&mut guard.mirror, &mut guard.fast] {
+                    let stored = table.entry(key.clone()).or_insert_with(|| entry.clone());
+                    if permanent_principal {
+                        stored.expires_at = None;
+                    }
+                }
             }
             RevocationBackend::Pg(pg) => {
                 pg.block(pg.backing.insert_revocation(
@@ -372,6 +378,23 @@ impl RevocationStore {
             }
         }
         Ok(())
+    }
+
+    /// Whether `principal` has a permanent principal-wide revocation (is erased). Memory only: it
+    /// lets an in-memory principal store keep an erased person disabled, as Postgres does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn erases(&self, scope: &TenantScope, principal: &PrincipalId) -> bool {
+        match &self.backend {
+            RevocationBackend::Memory(inner) => {
+                let key = self.key(scope, RevokedKind::Principal, principal.0.clone());
+                let guard = inner.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .fast
+                    .get(&key)
+                    .is_some_and(|entry| entry.expires_at.is_none())
+            }
+            RevocationBackend::Pg(_) => false,
+        }
     }
 
     #[cfg(any(test, feature = "test-support"))]

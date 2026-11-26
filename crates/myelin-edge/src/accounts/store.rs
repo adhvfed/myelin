@@ -441,9 +441,9 @@ impl AccountStore {
         Ok(())
     }
 
-    pub(crate) async fn clear_hits(&self, bucket: [u8; 32]) -> Result<(), StoreError> {
+    pub(crate) async fn clear_hits(&self, buckets: &[[u8; 32]]) -> Result<(), StoreError> {
         let mut conn = self.pool.acquire().await.map_err(StoreError::database)?;
-        clear_hits_in(&mut conn, bucket)
+        clear_hits_in(&mut conn, buckets)
             .await
             .map_err(StoreError::database)
     }
@@ -671,14 +671,14 @@ impl AccountStore {
 
     /// Consumes a reset invitation and replaces the password of the active account it names,
     /// ending the person's sessions and other reset links and withdrawing any mail still carrying
-    /// them, and clears the `unlock` counter. `notice`, the letter telling the owner, is queued
+    /// them, and clears the `unlock` counters. `notice`, the letter telling the owner, is queued
     /// only if the password changes.
     pub(crate) async fn accept_reset(
         &self,
         code: &CodeDigest,
         invitation: &Invitation,
         password_phc: String,
-        unlock: [u8; 32],
+        unlock: Vec<[u8; 32]>,
         notice: Option<(MailOutbox, Letter)>,
     ) -> Result<AcceptOutcome, StoreError> {
         let Some(principal_id) = invitation.principal_id.clone() else {
@@ -758,7 +758,7 @@ impl AccountStore {
                         if let Some(hook) = &checkpoint {
                             hook(super::Checkpoint::SessionsEnded);
                         }
-                        clear_hits_in(conn, unlock).await?;
+                        clear_hits_in(conn, &unlock).await?;
                         if let Some((outbox, letter)) = notice {
                             outbox.enqueue(conn, &letter, None).await?;
                         }
@@ -1025,10 +1025,14 @@ async fn end_sessions(
         .ok_or(Abort::Gone)
 }
 
-async fn clear_hits_in(conn: &mut sqlx::PgConnection, bucket: [u8; 32]) -> Result<(), sqlx::Error> {
+async fn clear_hits_in(
+    conn: &mut sqlx::PgConnection,
+    buckets: &[[u8; 32]],
+) -> Result<(), sqlx::Error> {
+    let buckets: Vec<&[u8]> = buckets.iter().map(|bucket| bucket.as_slice()).collect();
     // @tenant-cross-scope: counters are opaque and keyed by digest.
-    sqlx::query("DELETE FROM auth_rate_limit WHERE bucket = $1")
-        .bind(bucket.as_slice())
+    sqlx::query("DELETE FROM auth_rate_limit WHERE bucket = ANY($1)")
+        .bind(buckets)
         .execute(conn)
         .await?;
     Ok(())
