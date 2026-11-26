@@ -24,8 +24,8 @@ use myelin_storage::hitl_gate_durable::{
     HitlVerdictStore,
 };
 use myelin_storage::{
-    identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, HotTables,
-    SubstrateProvider, TenantScope,
+    human_session_migrations, identity_durable_migrations, DurablePrincipalBacking,
+    DurablePrincipalRow, HotTables, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 use registry_support::registry_for_subsystems;
@@ -246,6 +246,10 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity migration");
+    admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
     let app1 = SubstrateProvider::connect(test_config(), 4)
         .await
         .expect("app provider one");

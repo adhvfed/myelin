@@ -1078,7 +1078,7 @@ impl Gateway {
         let _ = self
             .authn
             .revocations()
-            .sweep_ended_sessions(&identity.scope, &now.timestamp());
+            .sweep_ended_sessions(&identity.scope);
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({ "signed_out": "session" }),

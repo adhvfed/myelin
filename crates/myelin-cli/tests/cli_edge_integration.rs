@@ -353,15 +353,34 @@ async fn a_logout_that_cannot_reach_the_edge_says_until_when_the_session_lives()
         format!("http://{}", listener.local_addr().unwrap())
     };
     let (_gateway, token) = person_with_session();
-    let printed = run_logout(&unreachable, &token, 1_900_000_000, false);
+    let expires_at = now() + 3_600;
+    let printed = run_logout(&unreachable, &token, expires_at, false);
     assert!(
         printed.contains("Removed the selected profile's stored credential"),
         "{printed}"
     );
+    let until = chrono::DateTime::from_timestamp(expires_at, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M UTC")
+        .to_string();
     assert!(
-        printed.contains(
-            "The server could not be reached, so the session stays valid until 2030-03-17 17:46 UTC."
-        ),
+        printed.contains(&format!(
+            "The server could not be reached, so the session may stay valid until {until}."
+        )),
         "{printed}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logout_of_a_session_the_edge_already_ended_says_so() {
+    let (gateway, token) = person_with_session();
+    let addr = spawn(gateway).await;
+    let edge = format!("http://{addr}");
+    run_logout(&edge, &token, now() + 3_600, false);
+    let printed = run_logout(&edge, &token, now() + 3_600, false);
+    assert!(
+        printed.contains("The server had already ended this session, or it had expired."),
+        "{printed}"
+    );
+    assert!(!printed.contains("may stay valid"), "{printed}");
 }

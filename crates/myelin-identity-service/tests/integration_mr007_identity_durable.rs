@@ -22,8 +22,8 @@ use myelin_identity_service::{
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    identity_durable_migrations, identity_tuple_revision_migrations, DurablePrincipalBacking,
-    DurableTupleBacking, KmsEngine,
+    human_session_migrations, identity_durable_migrations, identity_tuple_revision_migrations,
+    DurablePrincipalBacking, DurableTupleBacking, KmsEngine,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -110,6 +110,10 @@ async fn durable_principal_and_tuple_round_trip_across_a_fresh_store_instance() 
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations execute against the live DB");
+    admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
     admin
         .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
         .await
@@ -284,6 +288,10 @@ async fn every_principal_directory_read_reports_a_closed_pool_without_panicking(
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("the durable identity directory is migrated before the outage");
+    admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
 
     let app = common::app_provider(1).await;
     let region = app.config().region.clone();
@@ -339,6 +347,10 @@ async fn corrupt_durable_principal_fields_never_become_identity_authority() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations execute against the live DB");
+    admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
 
     let app = common::app_provider(6).await;
     let region = app.config().region.clone();
@@ -438,6 +450,10 @@ async fn relationship_expiry_survives_restart_without_lingering_authority() {
         .await
         .expect("identity durable migrations");
     admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
+    admin
         .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
         .await
         .expect("relationship revision and expiry migrations");
@@ -517,6 +533,10 @@ async fn tenant_a_writes_are_invisible_to_tenant_b_and_no_guc_bleeds() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations");
+    admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
     admin
         .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
         .await
@@ -660,6 +680,10 @@ async fn durable_tuple_write_co_commits_exactly_one_outbox_event() {
         .await
         .expect("identity durable migrations");
     admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
+    admin
         .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
         .await
         .expect("durable relationship revisions migrate");
@@ -795,6 +819,10 @@ async fn two_identity_instances_share_one_monotonic_relationship_clock() {
         .await
         .expect("identity durable migrations");
     admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
+    admin
         .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
         .await
         .expect("durable relationship revisions migrate");
@@ -898,6 +926,10 @@ async fn a_restarted_identity_serves_strong_relationship_reads_before_its_projec
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity durable migrations");
+    admin
+        .migrate(&human_session_migrations(), &HotTables::none())
+        .await
+        .expect("human session migrations");
     admin
         .migrate(&identity_tuple_revision_migrations(), &HotTables::none())
         .await

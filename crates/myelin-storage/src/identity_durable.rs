@@ -101,6 +101,33 @@ CREATE INDEX IF NOT EXISTS revocation_session_expiry_idx \
     ON revocation (tenant_id, region, expires_at) \
  WHERE kind = 'jti' AND handle LIKE 'session-%';";
 
+/// Only a permanent principal-wide revocation disables the person; a time-limited one
+/// (`expires_at` set) leaves them as they are. People erased before 0183 are disabled now, which
+/// also moves their cutoff through the status trigger.
+pub const PERMANENT_PRINCIPAL_REVOCATION_DISABLES_MIGRATION: &str = r#"
+CREATE OR REPLACE FUNCTION principal_revocation_ends_sessions() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.expires_at IS NOT NULL THEN
+    RETURN NULL;
+  END IF;
+  UPDATE principal
+     SET status = '"Disabled"',
+         sessions_not_before = principal_cutoff_after(sessions_not_before)
+   WHERE tenant_id = NEW.tenant_id AND region = NEW.region AND principal_id = NEW.handle;
+  RETURN NULL;
+END
+$$;
+
+UPDATE principal AS person
+   SET status = '"Disabled"'
+  FROM revocation AS revoked
+ WHERE revoked.kind = 'principal' AND revoked.expires_at IS NULL
+   AND revoked.tenant_id = person.tenant_id AND revoked.region = person.region
+   AND revoked.handle = person.principal_id
+   AND person.status <> '"Disabled"';
+"#;
+
 pub const REVOCATION_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS revocation (
     tenant_id  text NOT NULL,
@@ -385,6 +412,11 @@ pub fn human_session_migrations() -> Migrations {
             "0184_revocation_session_expiry_index",
             SESSION_DENIAL_EXPIRY_INDEX_MIGRATION,
             "revocation",
+        ),
+        Migration::plain_on(
+            "0185_permanent_principal_revocation_disables",
+            PERMANENT_PRINCIPAL_REVOCATION_DISABLES_MIGRATION,
+            "principal",
         ),
     ])
 }
@@ -1483,19 +1515,17 @@ impl DurableRevocationBacking {
     }
 
     /// Deletes up to `limit` of the tenant's per-session denials (jti `session-…`, written by a
-    /// sign-out) whose session expired before `now`, an RFC 3339 UTC time. Such a row decides
+    /// sign-out) whose session has expired by the database clock. Such a row decides
     /// nothing: the session it names is refused for its expiry anyway. Other jti rows, such as an
     /// agent run's registered life, are never touched. The scan uses the partial expiry index, so
     /// it reads only expired rows.
     pub async fn sweep_ended_sessions(
         &self,
         tenant: &str,
-        now: &str,
         limit: i64,
     ) -> Result<u64, ProviderError> {
         let tenant_owned = tenant.to_string();
         let region = self.region();
-        let now = now.to_string();
         self.provider
             .with_tenant_tx(tenant, move |conn| {
                 Box::pin(async move {
@@ -1503,13 +1533,14 @@ impl DurableRevocationBacking {
                         "DELETE FROM revocation WHERE ctid IN ( \
                            SELECT ctid FROM revocation \
                             WHERE tenant_id = $1 AND region = $2 AND kind = 'jti' \
-                              AND handle LIKE 'session-%' AND expires_at <= $3 \
+                              AND handle LIKE 'session-%' \
+                              AND expires_at <= to_char(statement_timestamp() AT TIME ZONE 'UTC', \
+                                                        'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') \
                             ORDER BY expires_at \
-                            LIMIT $4 FOR UPDATE SKIP LOCKED)",
+                            LIMIT $3 FOR UPDATE SKIP LOCKED)",
                     )
                     .bind(&tenant_owned)
                     .bind(&region)
-                    .bind(&now)
                     .bind(limit)
                     .execute(&mut *conn)
                     .await

@@ -241,7 +241,7 @@ pub use external_agent_run_durable::{
     EXTERNAL_AGENT_RUN_RLS_POLICY,
 };
 pub use identity_durable::{
-    auth_replay_durable_migrations, identity_agent_durable_migrations,
+    auth_replay_durable_migrations, human_session_migrations, identity_agent_durable_migrations,
     identity_agent_recent_list_migrations, identity_agent_workspace_profile_migrations,
     identity_durable_migrations, identity_project_durable_migrations,
     identity_project_recent_list_migrations, identity_tuple_revision_migrations,

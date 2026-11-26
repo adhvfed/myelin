@@ -8,10 +8,10 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use myelin_storage::identity_durable_migrations;
 use myelin_storage::kms_durable::kms_durable_migrations;
 use myelin_storage::migration::HotTables;
 use myelin_storage::placement_durable::placement_durable_migrations;
+use myelin_storage::{human_session_migrations, identity_durable_migrations};
 
 const DEFAULT_SEAL_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 
@@ -40,6 +40,10 @@ fn ensure_migrated() {
             .migrate(&identity_durable_migrations(), &HotTables::none())
             .await
             .expect("identity+revocation durable migrations");
+        admin
+            .migrate(&human_session_migrations(), &HotTables::none())
+            .await
+            .expect("human session migrations");
         admin
             .migrate_foundation()
             .await

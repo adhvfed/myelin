@@ -138,20 +138,17 @@ impl RevocationStore {
     }
 
     /// Best effort: drops a bounded batch of the tenant's sign-out denials whose sessions have
-    /// expired by `now`, so signing out does not grow the table forever.
+    /// expired by the database clock, so signing out does not grow the table forever.
     pub fn sweep_ended_sessions(
         &self,
         scope: &TenantScope,
-        now: &Timestamp,
     ) -> Result<u64, myelin_storage::ProviderError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
             RevocationBackend::Memory(_) => Ok(0),
-            RevocationBackend::Pg(pg) => pg.block(pg.backing.sweep_ended_sessions(
-                &scope.tenant().0,
-                &now.0,
-                64,
-            )),
+            RevocationBackend::Pg(pg) => {
+                pg.block(pg.backing.sweep_ended_sessions(&scope.tenant().0, 64))
+            }
         }
     }
 
