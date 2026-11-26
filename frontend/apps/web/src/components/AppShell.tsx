@@ -207,12 +207,14 @@ export function AppShell(props: AppShellProps) {
     { id: "issue:new", label: "Create issue", icon: "issue", run: () => navigate("/issues?new=1") },
     { id: "inbox", label: "Open inbox", icon: "inbox", run: () => setInboxOpen(true) },
     { id: "profile", label: "Open profile", icon: "human", run: () => navigate("/profile") },
+    { id: "members", label: "Open members", icon: "team", run: () => navigate("/members") },
     { id: "theme", label: "Toggle theme", icon: "settings", run: cycleTheme },
     { id: "logout", label: "Sign out", icon: "human", run: () => void doLogout() },
   ];
 
   const identityItems: MenuItemSpec[] = [
     { label: "Profile", icon: "human", onSelect: () => navigate("/profile") },
+    { label: "Members", icon: "team", onSelect: () => navigate("/members") },
     { label: "Toggle theme", icon: "settings", onSelect: cycleTheme },
     { label: "Sign out", icon: "close", onSelect: () => void doLogout() },
   ];

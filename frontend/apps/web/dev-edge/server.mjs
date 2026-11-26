@@ -1750,11 +1750,40 @@ const server = createServer((req, res) => {
     return;
   }
 
-  // A signed-in member creates an invitation link for a teammate.
+  // A signed-in person's organization: in this contract a password session is its only owner and
+  // the development login is not a member.
+  if (method === "GET" && path === "/v1/members") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (!state.signedInEmail) {
+      return send(res, 403, { error: { code: "role_required", message: "not a member" } });
+    }
+    const invitations = [...state.invitations]
+      .filter(([, invitation]) => invitation.kind === "join")
+      .map(([id, invitation]) => ({
+        id,
+        email: invitation.email,
+        role: invitation.role ?? "member",
+        expires_at: Math.floor(Date.now() / 1_000) + 7 * 24 * 60 * 60,
+      }));
+    return send(res, 200, {
+      role: "owner",
+      people: [{
+        id: DEV_PRINCIPAL.principalId,
+        display_name: state.signedInDisplayName ?? DEV_PRINCIPAL.displayName,
+        email: state.signedInEmail,
+        role: "owner",
+        joined_at: 1_764_000_000,
+      }],
+      invitations,
+    });
+  }
+
+  // A signed-in owner creates an invitation link for a teammate.
   if (method === "POST" && path === "/v1/invitations") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     void readJson(req).then((body) => {
-      if (!exactKeys(body, ["email"]) || !/^[^@\s]+@[^@\s]+$/.test(body.email)) {
+      if (!exactKeys(body, ["email"], ["role"]) || !/^[^@\s]+@[^@\s]+$/.test(body.email) ||
+        !["owner", "admin", "member", undefined].includes(body.role)) {
         return send(res, 400, { error: { message: "bad request" } });
       }
       const email = body.email.trim().toLowerCase();
@@ -1790,6 +1819,7 @@ const server = createServer((req, res) => {
       ...whoamiJson(),
       display_name: state.signedInDisplayName ?? DEV_PRINCIPAL.displayName,
       email: state.signedInEmail,
+      role: state.signedInEmail ? "owner" : null,
     });
   }
 

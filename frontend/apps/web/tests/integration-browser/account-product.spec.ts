@@ -1,10 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 
 // A person's account, start to finish, against the real stack: the operator's first invitation
-// link, a chosen password, an ordinary sign-in, an emailed invitation for a teammate, and a
-// forgotten password reset from an emailed link, a password change on one of two devices, and
-// signing out of all of them, and a stranger's guesses that lock out only new browsers. Mail is
-// read from the stack's Mailpit inbox.
+// link (which makes its owner), a chosen password, an ordinary sign-in, an emailed invitation for
+// a teammate, the members page (a role change, a revoked invitation, a removal), a forgotten
+// password reset from an emailed link, a password change on one of two devices, and signing out
+// of all of them, and a stranger's guesses that lock out only new browsers. Mail is read from the
+// stack's Mailpit inbox.
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -49,7 +50,7 @@ test("an invited person creates an account, invites a teammate by email, and res
   page,
   browser,
 }) => {
-  test.setTimeout(60_000);
+  test.setTimeout(120_000);
   await page.goto(new URL(inviteUrl).pathname);
   await page.waitForLoadState("networkidle");
   await expect(page.getByTestId("join-email")).toHaveValue(inviteEmail);
@@ -59,10 +60,14 @@ test("an invited person creates an account, invites a teammate by email, and res
   await page.getByTestId("join-submit").click();
   await page.waitForURL("**/git/repos");
 
-  // The session belongs to a named person, not a token.
+  // The session belongs to a named person, not a token, and the operator's link made her owner.
   await page.goto("/profile");
   await page.waitForLoadState("networkidle");
   await expect(page.getByRole("heading", { level: 1, name: "Ada Lovelace" })).toBeVisible();
+  await expect(page.getByTestId("profile-role")).toHaveText("Owner");
+  await page.getByTestId("profile-members-link").click();
+  await page.waitForURL("**/members");
+  await page.waitForLoadState("networkidle");
 
   const teammate = inviteEmail.replace("account-", "teammate-");
   await page.getByTestId("invite-email").fill(teammate);
@@ -74,6 +79,8 @@ test("an invited person creates an account, invites a teammate by email, and res
   await expect(page.getByTestId("invite-error")).toContainText(/already has an account/i);
 
   // The link worked once; from here on the password is the way in.
+  await page.goto("/profile");
+  await page.waitForLoadState("networkidle");
   await page.getByRole("button", { name: "Sign out of Myelin" }).click();
   await page.waitForURL("**/login");
   await page.goto(new URL(inviteUrl).pathname);
@@ -94,6 +101,55 @@ test("an invited person creates an account, invites a teammate by email, and res
   await teammatePage.getByTestId("join-password").fill("another real password");
   await teammatePage.getByTestId("join-submit").click();
   await teammatePage.waitForURL("**/git/repos");
+
+  // Grace joined as a member: she sees who is here but cannot invite.
+  await teammatePage.goto("/members");
+  await teammatePage.waitForLoadState("networkidle");
+  await expect(teammatePage.getByTestId("invite-owners-only")).toBeVisible();
+  await expect(teammatePage.getByTestId("invite-email")).toHaveCount(0);
+  await expect(teammatePage.getByTestId("member-remove")).toHaveCount(0);
+
+  // Ada makes Grace an admin; Grace's very next page shows it.
+  await page.goto("/members");
+  await page.waitForLoadState("networkidle");
+  const graceRow = page.locator(`[data-testid="member-row"][data-member-email="${teammate}"]`);
+  await expect(graceRow).toContainText("Grace Hopper");
+  await graceRow.getByTestId("member-role").selectOption("admin");
+  await expect(page.getByText("Role changed")).toBeVisible();
+  await teammatePage.goto("/profile");
+  await expect(teammatePage.getByTestId("profile-role")).toHaveText("Admin");
+  await teammatePage.goto("/members");
+  await teammatePage.waitForLoadState("networkidle");
+  await expect(teammatePage.getByTestId("invite-email")).toBeVisible();
+  await expect(teammatePage.getByTestId("invite-role")).toHaveCount(0);
+
+  // Ada invites someone, then thinks better of it and revokes the invitation.
+  const unwanted = inviteEmail.replace("account-", "unwanted-");
+  await page.getByTestId("invite-email").fill(unwanted);
+  await page.getByTestId("invite-role").selectOption("admin");
+  await page.getByTestId("invite-submit").click();
+  await expect(page.getByTestId("invite-sent")).toContainText(`to ${unwanted} to join as admin`);
+  const unwantedRow = page.locator(`[data-testid="invitation-row"][data-invitation-email="${unwanted}"]`);
+  await expect(unwantedRow).toContainText("Joins as admin");
+  await unwantedRow.getByTestId("invitation-revoke").click();
+  const revokeDialog = page.getByRole("alertdialog");
+  await expect(revokeDialog).toContainText(`Revoke the invitation for ${unwanted}?`);
+  await revokeDialog.getByRole("button", { name: "Revoke" }).click();
+  await expect(page.getByText("Invitation revoked")).toBeVisible();
+  await expect(unwantedRow).toHaveCount(0);
+
+  // Ada removes Grace, after confirming; Grace is signed out at once.
+  await graceRow.getByTestId("member-remove").click();
+  const removeDialog = page.getByRole("alertdialog");
+  await expect(removeDialog).toContainText("Remove Grace Hopper?");
+  await removeDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(graceRow).toHaveCount(1);
+  await graceRow.getByTestId("member-remove").click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Remove" }).click();
+  await expect(page.getByText("Removed from the organization")).toBeVisible();
+  await expect(graceRow).toHaveCount(0);
+  await teammatePage.goto("/profile");
+  await teammatePage.waitForURL(/\/login\?signed_out=session$/);
   await other.close();
 
   // Ada forgets her password and resets it from the emailed link.

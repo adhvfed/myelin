@@ -241,10 +241,10 @@ test.describe("invitation links", () => {
     await page.waitForURL("**/login");
   });
 
-  test("a member invites a teammate by email; the invitee opens the emailed link", async ({ page }) => {
+  test("an owner invites a teammate by email; the invitee opens the emailed link", async ({ page }) => {
     await signIn(page, ADA.email, ADA.password);
     await page.waitForURL("**/git/repos");
-    await page.goto("/profile");
+    await page.goto("/members");
     await page.waitForLoadState("networkidle");
 
     await page.getByTestId("invite-email").fill("linus@acme.dev");
@@ -261,7 +261,7 @@ test.describe("invitation links", () => {
   test("one address can be invited only a few times an hour", async ({ page }) => {
     await signIn(page, ADA.email, ADA.password);
     await page.waitForURL("**/git/repos");
-    await page.goto("/profile");
+    await page.goto("/members");
     await page.waitForLoadState("networkidle");
     for (let sent = 1; sent <= 3; sent += 1) {
       await page.getByTestId("invite-email").fill("linus@acme.dev");
@@ -276,11 +276,11 @@ test.describe("invitation links", () => {
     );
   });
 
-  test("without mail, a member invites a teammate and gets a link to pass on", async ({ page }) => {
+  test("without mail, an owner invites a teammate and gets a link to pass on", async ({ page }) => {
     await setEdgeConfig({ mailDeliveryEnabled: false });
     await signIn(page, ADA.email, ADA.password);
     await page.waitForURL("**/git/repos");
-    await page.goto("/profile");
+    await page.goto("/members");
     await page.waitForLoadState("networkidle");
 
     await page.getByTestId("invite-email").fill("linus@acme.dev");

@@ -31,6 +31,7 @@ export type AccountFailure =
   | "password_maybe_changed" // the edge may have committed the change; its answer was lost
   | "no_password" // the person signs in another way and has no password here
   | "signed_out" // the edge refused the session that asked
+  | "role_required" // the person's role does not allow inviting this way
   | "unavailable";
 
 export class AccountError extends Error {
@@ -52,6 +53,9 @@ export interface EdgeInvitation {
 export type EdgeCreatedInvitation =
   | { delivery: "email"; email: string; expiresAt: number }
   | { delivery: "link"; url: string; email: string; expiresAt: number };
+
+/** The roles an invitation can grant. */
+export type InvitedRole = "owner" | "admin" | "member";
 
 /** Invitation codes travel in a URL path; anything outside this alphabet is not one of ours. */
 export function validInvitationCode(value: unknown): value is string {
@@ -194,13 +198,19 @@ export async function edgeForgotPassword(email: string): Promise<void> {
   throw new AccountError("unavailable");
 }
 
-/** Invite a teammate, as the signed-in member. */
-export async function edgeCreateInvitation(email: string): Promise<EdgeCreatedInvitation> {
+/** Invite a teammate to join with `role`, as the signed-in owner or admin. */
+export async function edgeCreateInvitation(
+  email: string,
+  role: InvitedRole,
+): Promise<EdgeCreatedInvitation> {
   let json: unknown;
   try {
-    json = await edgePost<unknown>("/v1/invitations", { email });
+    json = await edgePost<unknown>("/v1/invitations", { email, role });
   } catch (error) {
     if (error instanceof GatewayError) {
+      if (error.status === 403 && error.code === "role_required") {
+        throw new AccountError("role_required");
+      }
       if (error.status === 409) throw new AccountError("account_exists");
       if (error.status === 400 || error.status === 422) throw new AccountError("invalid_email");
       if (error.status === 429 && error.code === "recipient_rate_limited") {

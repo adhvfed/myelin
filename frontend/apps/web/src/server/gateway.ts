@@ -97,6 +97,8 @@ export interface EdgeWhoami {
   /** The person's profile name; absent on older edges and for non-human principals. */
   display_name?: string;
   email?: string;
+  /** The person's role in the organization; `null` for anyone who is not one of its members. */
+  role?: string | null;
 }
 
 function validEdgeWhoami(value: unknown): value is EdgeWhoami {

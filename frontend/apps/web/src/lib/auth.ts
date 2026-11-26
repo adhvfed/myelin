@@ -18,6 +18,7 @@ import {
 } from "../server/gateway";
 import type { EdgeWhoami } from "../server/gateway";
 import { beginOidcLogin, interactiveOidcConfigured } from "../server/oidc";
+import { orgRole, type OrgRole } from "./member-rules";
 import {
   DEV_ACCESS_TOKEN,
   DEV_PRINCIPAL,
@@ -29,7 +30,6 @@ import {
   AccountError,
   edgeAcceptInvitation,
   edgeChangePassword,
-  edgeCreateInvitation,
   edgeForgotPassword,
   edgeGetInvitation,
   edgePasswordLogin,
@@ -38,7 +38,6 @@ import {
 } from "../server/account-gateway";
 import type {
   AccountFailure,
-  EdgeCreatedInvitation,
   EdgeInvitation,
   EdgeSessionGrant,
 } from "../server/account-gateway";
@@ -71,6 +70,9 @@ export interface Viewer {
   displayName: string;
   tenant: string;
   region: string;
+  /** The person's role in the organization, as the edge said when the viewer was verified; `null`
+   * for a principal who is not one of its members (an operator's development login). */
+  role: OrgRole | null;
 }
 
 /** Read the current viewer from the httpOnly-cookie session (server-only). */
@@ -83,6 +85,7 @@ export const getViewer = query(async (): Promise<Viewer | null> => {
     displayName: rec.displayName,
     tenant: rec.tenant,
     region: rec.region,
+    role: null,
   };
 }, "viewer");
 
@@ -116,6 +119,7 @@ export const requireViewer = query(async (): Promise<Viewer | null> => {
     displayName: rec.displayName,
     tenant: rec.tenant,
     region: rec.region,
+    role: orgRole(who.role),
   };
 }, "require-viewer");
 
@@ -288,27 +292,6 @@ export const acceptInvitation = action(async (formData: FormData) => {
   if (failure) throw redirect(`/join/${code}?${new URLSearchParams({ error: failure })}`);
   throw redirect(DEFAULT_AUTH_RETURN_TO);
 }, "accept-invitation");
-
-export type InvitationResult =
-  | ({ ok: true } & EdgeCreatedInvitation)
-  | { ok: false; reason: AccountFailure; retryAfterSecs?: number };
-
-/** Invite a teammate. With mail on the edge emails the link; otherwise it is shown once, to be
- * passed on by hand. */
-export const createInvitation = action(async (formData: FormData): Promise<InvitationResult> => {
-  "use server";
-  const email = String(formData.get("email") ?? "").trim();
-  if (!email || email.length > 320 || !email.includes("@")) {
-    return { ok: false, reason: "invalid_email" };
-  }
-  try {
-    return { ok: true, ...(await edgeCreateInvitation(email)) };
-  } catch (error) {
-    if (isUnauthorized(error)) throw redirect(loginAfter(error));
-    const retryAfterSecs = error instanceof AccountError ? error.retryAfterSecs : undefined;
-    return { ok: false, reason: accountFailure(error), ...(retryAfterSecs ? { retryAfterSecs } : {}) };
-  }
-}, "create-invitation");
 
 export type PasswordResetRequest =
   | { ok: true; email: string }
