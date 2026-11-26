@@ -271,9 +271,19 @@ pub struct GatewayBuilder {
     device_authorization: Option<DeviceAuthorizationBroker>,
     accounts: Option<AccountService>,
     shed: EdgeShed,
+    #[cfg(any(test, feature = "test-support"))]
+    approval_checkpoint: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GatewayBuilder {
+    /// Runs `hook` during a CLI approval, after the approving session was authenticated and
+    /// before the approval time is read, so a test can end that session in between.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_approval_checkpoint(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.approval_checkpoint = Some(Arc::new(hook));
+        self
+    }
+
     pub fn with_shed(mut self, shed: EdgeShed) -> GatewayBuilder {
         self.shed = shed;
         self
@@ -431,6 +441,8 @@ impl GatewayBuilder {
             device_authorization: self.device_authorization,
             accounts: self.accounts,
             shed: self.shed,
+            #[cfg(any(test, feature = "test-support"))]
+            approval_checkpoint: self.approval_checkpoint,
         }
     }
 }
@@ -502,6 +514,8 @@ pub struct Gateway {
     device_authorization: Option<DeviceAuthorizationBroker>,
     accounts: Option<AccountService>,
     shed: EdgeShed,
+    #[cfg(any(test, feature = "test-support"))]
+    approval_checkpoint: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 enum PublicEndpoint {
@@ -600,6 +614,8 @@ impl Gateway {
             device_authorization: None,
             accounts: None,
             shed: EdgeShed::v1_floor(),
+            #[cfg(any(test, feature = "test-support"))]
+            approval_checkpoint: None,
         }
     }
 
@@ -1059,7 +1075,10 @@ impl Gateway {
             )
             .map_err(|_| EdgeError::Unavailable("sign-out is temporarily unavailable".into()))?;
         // Best effort, like the rate-limit sweep: sign-outs clear away denials that expired.
-        let _ = self.authn.revocations().sweep_expired(&identity.scope);
+        let _ = self
+            .authn
+            .revocations()
+            .sweep_ended_sessions(&identity.scope, &now.timestamp());
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({ "signed_out": "session" }),
@@ -1155,6 +1174,10 @@ impl Gateway {
             CredentialPurpose::HumanSession => identity.capability().issued_at_unix,
             _ => None,
         };
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hook) = &self.approval_checkpoint {
+            hook();
+        }
         let approved_at = self
             .session_issue_time(&identity.principal, vouched_at)?
             .ok_or_else(|| EdgeError::Unauthorized("authentication failed".into()))?;

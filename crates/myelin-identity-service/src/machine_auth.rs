@@ -648,8 +648,13 @@ impl CapabilityAuthenticator {
             return false;
         }
         if capability.purpose.is_run_scoped() {
-            // A run credential's jti row records its life, not a denial; its run tears it down.
-            return true;
+            // A run credential's jti row records its life, not a denial; it holds while its run
+            // has not been torn down and that life has not ended.
+            return self.revocations.run_token_state(
+                &identity.scope,
+                &RevokeTarget::Jti(capability.jti.clone()),
+                &(self.now)(),
+            ) == RunTokenState::LiveWithinRunLife;
         }
         let denied = state.jti_denied.unwrap_or_else(|| {
             self.revocations.is_revoked(
@@ -748,6 +753,65 @@ fn validate_capability_expiry(exp_unix: i64) -> myelin_identity::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_open_run_scoped_stream_ends_when_its_run_is_torn_down() {
+        use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
+
+        let store = PrincipalStore::new(std::sync::Arc::new(myelin_storage::KmsEngine::new()));
+        let agent = PrincipalId("agent:reviewer".into());
+        let principal = Principal::new(
+            TenantId("acme".into()),
+            Region("eu-west".into()),
+            agent.clone(),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+        store
+            .put_principal(
+                &scope,
+                agent,
+                PrincipalKind::Service,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        let authn = CapabilityAuthenticator::new(store);
+        let now = crate::clock::timestamp();
+        let later =
+            myelin_events::clock::clock_reading_from_unix(crate::clock::unix_seconds() + 600)
+                .unwrap()
+                .timestamp();
+        authn
+            .revocations()
+            .register_run_token_ttl(&scope, "run-jti", now, later)
+            .unwrap();
+        let identity = RequestIdentity {
+            principal,
+            scope: scope.clone(),
+            credential: CredentialContext::Capability(VerifiedCapabilityContext {
+                purpose: CredentialPurpose::AgentRun {
+                    run_id: "run-1".into(),
+                    delegation_snapshot: Some(1),
+                },
+                audience: CredentialAudience::Mcp,
+                jti: "run-jti".into(),
+                effective_authority: Authority::of(["agent.tools.read"]),
+                issued_at_unix: None,
+                expires_at_unix: crate::clock::unix_seconds() + 600,
+                dpop: DpopState::Unbound,
+            }),
+        };
+        assert!(authn.still_live(&identity), "a live run keeps its stream");
+        authn
+            .revocations()
+            .tear_down_run_token(&scope, "run-jti")
+            .unwrap();
+        assert!(!authn.still_live(&identity), "a torn-down run ends it");
+    }
     use super::*;
     use myelin_identity::{iam_events::signals, Credential, DataRole};
     use myelin_storage::KmsEngine;

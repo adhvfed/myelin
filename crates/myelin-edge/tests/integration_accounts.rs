@@ -1568,3 +1568,61 @@ async fn a_change_that_loses_a_race_says_so_and_costs_no_attempt() {
         Err(AccountError::RateLimited { .. })
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_and_a_concurrent_status_write_take_turns_instead_of_deadlocking() {
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let cell = cell().await;
+    let tenant = unique("t-change-lock");
+    let email = format!("{}@example.com", unique("hamilton"));
+    let person = cell.join_person(&tenant, &email, "Margaret").await;
+
+    let gate = Arc::new(PauseGate::default());
+    let changing = cell
+        .service(Some("https://myelin.example"))
+        .with_checkpoint({
+            let gate = gate.clone();
+            move |checkpoint| {
+                if checkpoint == Checkpoint::PersonLocked {
+                    gate.hold();
+                }
+            }
+        });
+    let change = {
+        let person = person.clone();
+        tokio::task::spawn_blocking(move || {
+            changing.change_password(&person, PASSWORD.into(), "an uncontended passphrase".into())
+        })
+    };
+    tokio::task::spawn_blocking({
+        let gate = gate.clone();
+        move || gate.wait_until_held()
+    })
+    .await
+    .unwrap();
+
+    // Another writer queues on the person row while the change holds it: an erasure's
+    // principal-wide revocation, whose trigger updates that row.
+    let write = {
+        let revocations = myelin_identity_service::RevocationStore::with_pg(
+            myelin_storage::DurableRevocationBacking::new(cell.provider.clone()),
+            tokio::runtime::Handle::current(),
+        );
+        let person = person.clone();
+        tokio::task::spawn_blocking(move || {
+            revocations.disable_principal(
+                &myelin_storage::TenantScope::from_verified_token(&person, person.region.clone()),
+                &person.principal_id,
+                myelin_events::Timestamp("2026-11-26T00:00:00Z".into()),
+            )
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!write.is_finished(), "the writer waits for the change");
+    gate.release();
+    change
+        .await
+        .unwrap()
+        .expect("the change goes through, not into a deadlock");
+    write.await.unwrap().expect("then the writer goes through");
+}

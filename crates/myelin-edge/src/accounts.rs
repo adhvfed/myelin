@@ -232,6 +232,9 @@ pub enum Checkpoint {
     ResetPasswordReplaced,
     /// Inside a reset's transaction: the other reset links are ended; nothing is committed yet.
     ResetLinksEnded,
+    /// Inside a change's transaction: the account and person rows are locked; nothing is
+    /// written yet.
+    PersonLocked,
     /// Inside a reset's or change's transaction: the person's sessions are ended; nothing is
     /// committed yet.
     SessionsEnded,

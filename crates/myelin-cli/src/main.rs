@@ -563,7 +563,7 @@ async fn logout(
     read_file: &dyn Fn(&std::path::Path) -> Option<String>,
 ) -> Result<(), CliError> {
     reject_auth_mutation_flags(cli)?;
-    let session_ended = end_stored_session(cli, getenv, read_file).await;
+    let server = end_stored_session(cli, getenv, read_file).await;
     let removed = remove_profile_credential(cli.profile.as_deref(), getenv)?;
     let environment_active = cli.token.as_deref().is_some_and(|value| !value.is_empty())
         || getenv(config::env::TOKEN).is_some_and(|value| !value.is_empty());
@@ -572,13 +572,15 @@ async fn logout(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "logged_out": true,
-                "session_ended": session_ended,
+                "session_ended": server == ServerSignOut::Ended,
                 "stored_credential_removed": removed,
                 "environment_credential_active": environment_active,
             }))
             .expect("logout JSON is serializable")
         );
-    } else if environment_active {
+        return Ok(());
+    }
+    if environment_active {
         println!(
             "Removed the selected profile's stored credential. A --token or $MYELIN_TOKEN credential is still active for this process."
         );
@@ -587,7 +589,32 @@ async fn logout(
     } else {
         println!("No stored credentials were present on this device.");
     }
+    match server {
+        ServerSignOut::Ended => println!("The session is signed out on the server too."),
+        ServerSignOut::Failed { expires_at_unix } => println!(
+            "The server could not be reached, so the session stays valid until {}.",
+            expires_at_unix
+                .and_then(|unix| chrono::DateTime::from_timestamp(unix, 0))
+                .map_or_else(
+                    || "it expires".to_string(),
+                    |at| at.format("%Y-%m-%d %H:%M UTC").to_string()
+                )
+        ),
+        ServerSignOut::NotASession => {}
+    }
     Ok(())
+}
+
+/// What became of the stored session at the Edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerSignOut {
+    Ended,
+    /// The Edge could not end it; it stays valid until it expires.
+    Failed {
+        expires_at_unix: Option<i64>,
+    },
+    /// Nothing stored was a session (a token, or nothing at all), so there was nothing to end.
+    NotASession,
 }
 
 /// Asks the Edge to end the stored session before it is forgotten here. Only a stored session is
@@ -597,14 +624,14 @@ async fn end_stored_session(
     cli: &Cli,
     getenv: &dyn Fn(&str) -> Option<String>,
     read_file: &dyn Fn(&std::path::Path) -> Option<String>,
-) -> bool {
+) -> ServerSignOut {
     let Ok(Some(stored)) = load_profile_credential(cli.profile.as_deref(), getenv, read_file)
     else {
-        return false;
+        return ServerSignOut::NotASession;
     };
     let credential = stored.credential;
     if credential.scheme != SESSION_SCHEME {
-        return false;
+        return ServerSignOut::NotASession;
     }
     let edge = resolve_edge(
         cli.edge.as_deref(),
@@ -625,7 +652,13 @@ async fn end_stored_session(
         execute(&edge, &credential.token, &call),
     )
     .await;
-    matches!(ended, Ok(Ok(_)))
+    if matches!(ended, Ok(Ok(_))) {
+        ServerSignOut::Ended
+    } else {
+        ServerSignOut::Failed {
+            expires_at_unix: credential.expires_at_unix,
+        }
+    }
 }
 
 fn reject_auth_mutation_flags(cli: &Cli) -> Result<(), CliError> {

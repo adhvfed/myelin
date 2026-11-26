@@ -269,9 +269,9 @@ fn person_with_session() -> (Arc<Gateway>, String) {
     (Arc::new(gateway), token)
 }
 
-/// Runs `myelin auth logout --json` against a config directory holding `token` as a stored
-/// session for `edge`.
-fn logout_with_stored_session(edge: &str, token: &str) -> serde_json::Value {
+/// Runs `myelin auth logout` (with `--json` when asked) against a config directory holding
+/// `token` as a stored session for `edge` that expires at `expires_at`, and returns its output.
+fn run_logout(edge: &str, token: &str, expires_at: i64, json: bool) -> String {
     let config = tempfile::tempdir().expect("config dir");
     let config_dir = config.path().to_path_buf();
     let getenv = |name: &str| match name {
@@ -279,14 +279,19 @@ fn logout_with_stored_session(edge: &str, token: &str) -> serde_json::Value {
         "MYELIN_TEST_CREDENTIAL_STORE" => Some("file".into()),
         _ => None,
     };
-    myelin_cli::config::store_credential(token, "session", Some(edge), Some(now() + 3600), &getenv)
+    myelin_cli::config::store_credential(token, "session", Some(edge), Some(expires_at), &getenv)
         .expect("store the session");
+    let args: &[&str] = if json {
+        &["--json", "auth", "logout"]
+    } else {
+        &["auth", "logout"]
+    };
     let out = Command::new(env!("CARGO_BIN_EXE_myelin"))
         .env("MYELIN_CONFIG_DIR", &config_dir)
         .env("MYELIN_TEST_CREDENTIAL_STORE", "file")
         .env_remove("MYELIN_TOKEN")
         .env_remove("MYELIN_EDGE")
-        .args(["--json", "auth", "logout"])
+        .args(args)
         .output()
         .expect("spawn myelin");
     assert!(
@@ -294,7 +299,11 @@ fn logout_with_stored_session(edge: &str, token: &str) -> serde_json::Value {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    serde_json::from_slice(&out.stdout).expect("logout JSON")
+    String::from_utf8(out.stdout).expect("UTF-8 output")
+}
+
+fn logout_with_stored_session(edge: &str, token: &str) -> serde_json::Value {
+    serde_json::from_str(&run_logout(edge, token, now() + 3600, true)).expect("logout JSON")
 }
 
 fn whoami_status(gateway: &Gateway, token: &str) -> u16 {
@@ -335,4 +344,24 @@ async fn logging_out_forgets_the_session_even_when_the_edge_cannot_be_reached() 
     let outcome = logout_with_stored_session(&unreachable, &token);
     assert_eq!(outcome["session_ended"], false, "{outcome}");
     assert_eq!(outcome["stored_credential_removed"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_logout_that_cannot_reach_the_edge_says_until_when_the_session_lives() {
+    let unreachable = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let (_gateway, token) = person_with_session();
+    let printed = run_logout(&unreachable, &token, 1_900_000_000, false);
+    assert!(
+        printed.contains("Removed the selected profile's stored credential"),
+        "{printed}"
+    );
+    assert!(
+        printed.contains(
+            "The server could not be reached, so the session stays valid until 2030-03-17 17:46 UTC."
+        ),
+        "{printed}"
+    );
 }

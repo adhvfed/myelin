@@ -738,6 +738,19 @@ async fn disabling_a_person_ends_their_sessions_for_good() {
         )
         .unwrap();
     assert_eq!(stack.whoami(&fresh), 401);
+    assert_eq!(
+        stack.sign_in_status(&email, PASSWORD),
+        401,
+        "an erased person cannot sign in again"
+    );
+    assert_eq!(
+        stack
+            .principals
+            .session_issue_time(&scope_of(&person), &person.principal_id, None)
+            .unwrap(),
+        None,
+        "nor get a session any other way"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -761,21 +774,103 @@ async fn signing_out_sweeps_denials_whose_sessions_have_expired() {
             clock(now() - 3_600),
         )
         .unwrap();
-    assert_eq!(stack.jti_revocation_expiries(&person).await.len(), 1);
+    // An agent run's registered life is a jti row too; once ended it still says `Expired`.
+    stack
+        .authn
+        .revocations()
+        .register_run_token_ttl(
+            &scope,
+            "run-ended",
+            clock(now() - 7_200),
+            clock(now() - 3_600),
+        )
+        .unwrap();
+    assert_eq!(stack.jti_revocation_expiries(&person).await.len(), 2);
 
     let (status, _) = stack.call("POST", "/v1/auth/logout", Some(&session), json!({}));
     assert_eq!(status, 200);
-    let left = stack.jti_revocation_expiries(&person).await;
-    assert_eq!(
-        left.len(),
-        1,
-        "only the denial that still matters is kept: {left:?}"
-    );
-    let expiry = chrono::DateTime::parse_from_rfc3339(left[0].as_deref().unwrap())
-        .unwrap()
-        .timestamp();
+    let mut left = stack.jti_revocation_expiries(&person).await;
+    left.sort();
+    assert_eq!(left.len(), 2, "the expired sign-out is gone: {left:?}");
+    let expiry = |at: &Option<String>| {
+        chrono::DateTime::parse_from_rfc3339(at.as_deref().unwrap())
+            .unwrap()
+            .timestamp()
+    };
+    assert!(expiry(&left[0]) < now(), "the ended run's row is kept");
     assert!(
-        expiry > now(),
-        "the kept one is the session just signed out"
+        expiry(&left[1]) > now(),
+        "and so is the session just signed out"
     );
+    assert_eq!(
+        stack.authn.revocations().run_token_state(
+            &scope,
+            &RevokeTarget::Jti("run-ended".into()),
+            &clock(now()),
+        ),
+        myelin_identity_service::RunTokenState::Expired
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cli_approval_by_a_session_ended_mid_approval_is_refused() {
+    let base = stack().await;
+    let email = email();
+    let (person, browser) = base.person(&email).await;
+    // The same edge, except that the person signs out everywhere while it approves.
+    let gateway = {
+        let principals = base.principals.clone();
+        let scope = scope_of(&person);
+        let id = person.principal_id.clone();
+        Gateway::builder(
+            base.authn.clone(),
+            Arc::new(HumanSsoAuthenticator::production(base.principals.clone())),
+            Arc::new(AllowAll),
+        )
+        .default_token_scheme("session")
+        .with_human_session_issuer(base.cell.clone())
+        .with_device_authorization(
+            DeviceAuthorizationBroker::with_pg(
+                base.provider.db_pool().clone(),
+                tokio::runtime::Handle::current(),
+                "https://myelin.example/cli/auth",
+            )
+            .unwrap(),
+        )
+        .with_approval_checkpoint(move || {
+            principals.end_sessions(&scope, &id).unwrap();
+        })
+        .build()
+    };
+    let stack = Stack { gateway, ..base };
+
+    use base64::Engine as _;
+    let verifier =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let (status, started) = stack.call(
+        "POST",
+        "/v1/auth/device/authorization",
+        None,
+        json!({ "code_challenge": challenge }),
+    );
+    assert_eq!(status, 201, "{started}");
+    let (status, body) = stack.call(
+        "POST",
+        "/v1/auth/device/approval",
+        Some(&browser),
+        json!({ "user_code": started["user_code"] }),
+    );
+    assert_eq!(
+        status, 401,
+        "the vouching session ended before it vouched: {body}"
+    );
+    let (status, _) = stack.call(
+        "POST",
+        "/v1/auth/device/token",
+        None,
+        json!({ "device_code": started["device_code"], "code_verifier": verifier }),
+    );
+    assert_eq!(status, 202, "no CLI session was approved");
 }

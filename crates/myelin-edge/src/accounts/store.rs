@@ -701,7 +701,18 @@ impl AccountStore {
                         if consumed != 1 {
                             return Err(Abort::Gone);
                         }
-                        if !is_active(conn, &tenant, &region, &principal_id).await? {
+                        let account = AccountRow {
+                            email_digest,
+                            tenant: tenant.clone(),
+                            region: region.clone(),
+                            principal_id: principal_id.clone(),
+                            password_phc: String::new(),
+                        };
+                        if locked_password(conn, &account, "FOR UPDATE")
+                            .await?
+                            .is_none()
+                            || !lock_active_person(conn, &tenant, &region, &principal_id).await?
+                        {
                             return Err(Abort::Gone);
                         }
                         if !set_password(
@@ -746,33 +757,31 @@ impl AccountStore {
     /// password hash that was just verified and its person is still active; `None` otherwise.
     /// Sign-in asks this last, so a password replaced while the old one was being verified does
     /// not sign anyone in. It is the database's present moment, raised to the person's session
-    /// cutoff. Both rows are locked for share, so a reset or change that has replaced the hash but
-    /// not yet committed is waited for, and then the hash no longer matches.
+    /// cutoff. The rows are locked for share in the order a reset or change locks them for update
+    /// (account, then person), so a change in flight is waited for and then the hash no longer
+    /// matches, and the two can never deadlock.
     pub(crate) async fn still_signs_in(
         &self,
         account: &AccountRow,
     ) -> Result<Option<i64>, StoreError> {
-        let email_digest = account.email_digest;
-        let tenant = account.tenant.clone();
-        let region = account.region.clone();
-        let principal_id = account.principal_id.clone();
-        let password_phc = account.password_phc.clone();
-        with_tenant_tx_error(&self.pool, &account.tenant, &account.region, move |conn| {
+        let account = account.clone();
+        let (tenant, region) = (account.tenant.clone(), account.region.clone());
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
             Box::pin(async move {
+                let current = locked_password(conn, &account, "FOR SHARE")
+                    .await
+                    .map_err(StoreError::database)?;
+                if current.as_deref() != Some(account.password_phc.as_str()) {
+                    return Ok(None);
+                }
                 sqlx::query_scalar(&format!(
-                    "SELECT GREATEST({DB_NOW}, COALESCE(person.sessions_not_before, 0)) \
-                       FROM auth_password_account account \
-                       JOIN principal person USING (tenant_id, region, principal_id) \
-                      WHERE account.email_digest = $1 AND account.tenant_id = $2 \
-                        AND account.region = $3 AND account.principal_id = $4 \
-                        AND account.password_phc = $5 AND person.status = $6 \
+                    "SELECT GREATEST({DB_NOW}, COALESCE(sessions_not_before, 0)) FROM principal \
+                      WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 AND status = $4 \
                       FOR SHARE"
                 ))
-                .bind(email_digest.as_slice())
-                .bind(&tenant)
-                .bind(&region)
-                .bind(&principal_id)
-                .bind(&password_phc)
+                .bind(&account.tenant)
+                .bind(&account.region)
+                .bind(&account.principal_id)
                 .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                 .fetch_optional(&mut *conn)
                 .await
@@ -831,8 +840,16 @@ impl AccountStore {
                 let (tenant, region) = (&account.tenant, &account.region);
                 let principal_id = &account.principal_id;
                 lock_email(conn, tenant, region, &account.email_digest).await?;
-                if !is_active(conn, tenant, region, principal_id).await? {
+                let current = locked_password(conn, &account, "FOR UPDATE").await?;
+                if !lock_active_person(conn, tenant, region, principal_id).await? {
                     return Err(Abort::Gone);
+                }
+                if current.as_deref() != Some(account.password_phc.as_str()) {
+                    return Err(Abort::Replaced);
+                }
+                #[cfg(any(test, feature = "test-support"))]
+                if let Some(hook) = &checkpoint {
+                    hook(super::Checkpoint::PersonLocked);
                 }
                 if !set_password(
                     conn,
@@ -882,7 +899,31 @@ impl AccountStore {
     }
 }
 
-async fn is_active(
+/// The account's stored password hash, with its row locked (`lock` is `FOR SHARE` or
+/// `FOR UPDATE`). Every transaction that locks both the account and its person locks the account
+/// first, so none can wait on another in a cycle.
+async fn locked_password(
+    conn: &mut sqlx::PgConnection,
+    account: &AccountRow,
+    lock: &'static str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT password_phc FROM auth_password_account \
+          WHERE email_digest = $1 AND tenant_id = $2 AND region = $3 AND principal_id = $4 \
+          {lock}"
+    ))
+    .bind(account.email_digest.as_slice())
+    .bind(&account.tenant)
+    .bind(&account.region)
+    .bind(&account.principal_id)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// Whether the person is active, with their row locked for update: the transactions that ask
+/// go on to move the person's session cutoff, and locking for share first would let two of them
+/// (or one and any other writer) each wait to upgrade a lock the other holds.
+async fn lock_active_person(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
@@ -891,7 +932,7 @@ async fn is_active(
     let status: Option<String> = sqlx::query_scalar(
         "SELECT status FROM principal \
           WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
-          FOR SHARE",
+          FOR UPDATE",
     )
     .bind(tenant)
     .bind(region)
